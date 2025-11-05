@@ -486,13 +486,25 @@ if not price_df_filtered.empty:
 
         # Get the single-day snapshot
         try:
-            curve_snapshot_original = historical_outrights_df.filter(regex='\(Original\)$').loc[analysis_dt].T.rename(columns={analysis_dt: 'Original'}).droplevel(1)
-            curve_snapshot_pca = historical_outrights_df.filter(regex='\(PCA\)$').loc[analysis_dt].T.rename(columns={analysis_dt: 'PCA Fair'}).droplevel(1)
+            # FIX: Use .loc[[key]] to select the single row as a DataFrame, not a Series,
+            # which prevents the subsequent chained method failure (TypeError/AttributeError).
             
+            # 1. Select the single day's data, ensuring DataFrame structure
+            curve_snapshot_original = historical_outrights_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
+            curve_snapshot_pca = historical_outrights_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
+            
+            # 2. Rename column (which is the datetime key) and clean the index labels
+            curve_snapshot_original.columns = ['Original']
+            curve_snapshot_original.index = curve_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
+
+            curve_snapshot_pca.columns = ['PCA Fair']
+            curve_snapshot_pca.index = curve_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
+
+            # 3. Concatenate and drop NaNs (if any value is missing for a contract)
             curve_comparison = pd.concat([curve_snapshot_original, curve_snapshot_pca], axis=1).dropna()
             
             if curve_comparison.empty:
-                st.warning(f"No complete data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')}.")
+                st.warning(f"No complete data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
             else:
                 # --- Plot the Curve ---
                 fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
@@ -607,9 +619,9 @@ if not price_df_filtered.empty:
                 original_line_for_legend = ax.lines[-len(pca_cols) - 1]
                 
                 all_lines = [original_line_for_legend] + pca_legend_lines
-                all_labels = [original_legend_label] + [col.replace(' (PCA)', ' (PCA Fair)') for col in pca_cols]
+                all_labels = [col.replace(' (PCA)', ' (PCA Fair)') for col in pca_cols]
                 
-                ax.legend(all_lines, all_labels, loc='best', ncol=4, fontsize='small')
+                ax.legend(all_lines, ['Original Market Data'] + all_labels, loc='best', ncol=4, fontsize='small')
                     
             ax.set_title(title, fontsize=16)
             ax.set_xlabel('Date')
