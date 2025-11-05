@@ -15,11 +15,12 @@ def load_data(uploaded_file):
     """Loads CSV data into a DataFrame, adapting to price or expiry file formats."""
     if uploaded_file is not None:
         try:
-            # Load as a generic CSV first to inspect columns
-            df = pd.read_csv(uploaded_file)
-
+            # Read the uploaded file into a temporary buffer/string to inspect
+            file_content = uploaded_file.getvalue().decode("utf-8")
+            
             # --- Case 1: Expiry File (EXPIRY (2).csv format: MATURITY, DATE) ---
-            if 'MATURITY' in df.columns and 'DATE' in df.columns:
+            if 'MATURITY,DATE' in file_content.split('\n')[0].upper():
+                df = pd.read_csv(uploaded_file)
                 df = df.rename(columns={'MATURITY': 'Contract', 'DATE': 'ExpiryDate'})
                 df['ExpiryDate'] = pd.to_datetime(df['ExpiryDate'])
                 df = df.set_index('Contract')
@@ -27,17 +28,40 @@ def load_data(uploaded_file):
                 return df
 
             # --- Case 2: Price File (sofr rates.csv format: Date as index) ---
-            # Reload, setting the first column ('Date') as the index and parsing it as dates.
-            df = pd.read_csv(uploaded_file, index_col=0, parse_dates=True)
+            # Try to infer the separator, but explicitly set index_col=0 and parse_dates=True
+            
+            # We must reset the file pointer for the second read attempt
+            uploaded_file.seek(0)
+            
+            # Use 'sep=None, engine='python'' to let Python infer the separator, 
+            # which is often necessary if the separator is not a comma.
+            # However, since the snippet shows commas, let's explicitly use comma 
+            # and rely on standard parsing first, but with error handling.
+            
+            df = pd.read_csv(
+                uploaded_file, 
+                index_col=0, 
+                parse_dates=True,
+                sep=',', # Explicitly specify comma as separator
+                header=0 # Ensure the first row is used as the header
+            )
+            
             df.index.name = 'Date'
             
-            # Drop columns that are entirely NaN (often empty columns at the end of CSVs)
+            # Drop columns that are entirely NaN
             df = df.dropna(axis=1, how='all')
             
             # Convert all price columns to numeric, coercing errors to NaN
             for col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+            # Filter out any remaining rows where the index date is NaT or the row is entirely NaN
+            df = df.dropna(how='all')
+            df = df[df.index.notna()]
 
+            if df.empty or df.shape[1] == 0:
+                 raise ValueError("DataFrame is empty after processing or has no data columns.")
+                 
             return df
             
         except Exception as e:
