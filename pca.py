@@ -1,759 +1,221 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime, date
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PC Loading Heatmap (Outrights & Flies)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        /* Custom styles for the chart */
+        .chart-container {
+            font-family: 'Inter', sans-serif;
+            background-color: #ffffff;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            max-width: 1200px;
+            margin: 20px auto;
+        }
+        .group-separator {
+            fill: none;
+            stroke: #374151; /* Dark gray border */
+            stroke-width: 2;
+            shape-rendering: crispEdges;
+        }
+        .axis text {
+            fill: #374151;
+        }
+        .tooltip {
+            position: absolute;
+            text-align: center;
+            width: 120px;
+            padding: 8px;
+            background: #1f2937; /* Dark background */
+            color: #f3f4f6; /* Light text */
+            border: 0px;
+            border-radius: 6px;
+            pointer-events: none;
+            font-size: 12px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+    </style>
+</head>
+<body>
 
-# --- Configuration ---
-st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
+<div id="app" class="p-6 bg-gray-50 min-h-screen">
+    <div class="chart-container">
+        <h1 class="text-3xl font-bold mb-4 text-gray-800">SOFR PC Loading Heatmap: Outrights & Flies</h1>
+        <div id="pc-summary" class="mb-6 grid grid-cols-1 md:grid-cols-4 gap-4">
+            <!-- PC Summary will be injected here -->
+        </div>
+        <div id="heatmap" class="overflow-x-auto">
+            <!-- D3 Heatmap will be injected here -->
+        </div>
+        <p class="mt-6 text-sm text-gray-600">
+            **Note on Axes:** Outright contracts are labeled by their futures code (e.g., Z20, H21). Fly spreads are labeled by their component futures (e.g., Z20 / H21 / M21). The color intensity represents the magnitude of the loading (red for positive, blue for negative).
+        </p>
+    </div>
+</div>
 
-# --- Helper Functions for Data Processing ---
+<script>
+    // --- Data Injected from Python Analysis ---
+    const heatmapData = [{"group":"Outrights","variable":"Z20","pc":"PC1","loading":-0.0381655181},{"group":"Outrights","variable":"Z20","pc":"PC2","loading":-0.0818276709},{"group":"Outrights","variable":"Z20","pc":"PC3","loading":-0.0401865961},{"group":"Outrights","variable":"H21","pc":"PC1","loading":-0.0813872583},{"group":"Outrights","variable":"H21","pc":"PC2","loading":-0.1293290656},{"group":"Outrights","variable":"H21","pc":"PC3","loading":-0.0308359281},{"group":"Outrights","variable":"M21","pc":"PC1","loading":-0.1384770144},{"group":"Outrights","variable":"M21","pc":"PC2","loading":-0.1652033588},{"group":"Outrights","variable":"M21","pc":"PC3","loading":-0.0210087796},{"group":"Outrights","variable":"U21","pc":"PC1","loading":-0.1868353982},{"group":"Outrights","variable":"U21","pc":"PC2","loading":-0.1601615822},{"group":"Outrights","variable":"U21","pc":"PC3","loading":-0.009095692},{"group":"Outrights","variable":"H22","pc":"PC1","loading":-0.2319245131},{"group":"Outrights","variable":"H22","pc":"PC2","loading":-0.1215112265},{"group":"Outrights","variable":"H22","pc":"PC3","loading":0.0039233633},{"group":"Outrights","variable":"M22","pc":"PC1","loading":-0.2705607062},{"group":"Outrights","variable":"M22","pc":"PC2","loading":-0.0673397395},{"group":"Outrights","variable":"M22","pc":"PC3","loading":0.0197771239},{"group":"Outrights","variable":"U22","pc":"PC1","loading":-0.3012543503},{"group":"Outrights","variable":"U22","pc":"PC2","loading":-0.0152914163},{"group":"Outrights","variable":"U22","pc":"PC3","loading":0.034732104},{"group":"Outrights","variable":"Z21","pc":"PC1","loading":-0.2974269191},{"group":"Outrights","variable":"Z21","pc":"PC2","loading":-0.0142345037},{"group":"Outrights","variable":"Z21","pc":"PC3","loading":0.0360655513},{"group":"Outrights","variable":"Z22","pc":"PC1","loading":-0.3061247953},{"group":"Outrights","variable":"Z22","pc":"PC2","loading":0.0084535805},{"group":"Outrights","variable":"Z22","pc":"PC3","loading":0.0385966952},{"group":"Outrights","variable":"H23","pc":"PC1","loading":-0.2443015488},{"group":"Outrights","variable":"H23","pc":"PC2","loading":0.0934185797},{"group":"Outrights","variable":"H23","pc":"PC3","loading":0.0637151593},{"group":"Outrights","variable":"M23","pc":"PC1","loading":-0.2307567781},{"group":"Outrights","variable":"M23","pc":"PC2","loading":0.1119770809},{"group":"Outrights","variable":"M23","pc":"PC3","loading":0.0682136009},{"group":"Outrights","variable":"U23","pc":"PC1","loading":-0.2173516541},{"group":"Outrights","variable":"U23","pc":"PC2","loading":0.1287606399},{"group":"Outrights","variable":"U23","pc":"PC3","loading":0.0718501178},{"group":"Outrights","variable":"Z23","pc":"PC1","loading":-0.2033008488},{"group":"Outrights","variable":"Z23","pc":"PC2","loading":0.1466033486},{"group":"Outrights","variable":"Z23","pc":"PC3","loading":0.0754877478},{"group":"Outrights","variable":"H24","pc":"PC1","loading":-0.1901358327},{"group":"Outrights","variable":"H24","pc":"PC2","loading":0.160759021},{"group":"Outrights","variable":"H24","pc":"PC3","loading":0.0783307521},{"group":"Outrights","variable":"M24","pc":"PC1","loading":-0.1774351052},{"group":"Outrights","variable":"M24","pc":"PC2","loading":0.1729221112},{"group":"Outrights","variable":"M24","pc":"PC3","loading":0.0807662888},{"group":"Outrights","variable":"U24","pc":"PC1","loading":-0.1652438865},{"group":"Outrights","variable":"U24","pc":"PC2","loading":0.1834165561},{"group":"Outrights","variable":"U24","pc":"PC3","loading":0.082729141},{"group":"Outrights","variable":"Z24","pc":"PC1","loading":-0.1534955949},{"group":"Outrights","variable":"Z24","pc":"PC2","loading":0.1925350751},{"group":"Outrights","variable":"Z24","pc":"PC3","loading":0.0843236758},{"group":"Outrights","variable":"H25","pc":"PC1","loading":-0.1421711287},{"group":"Outrights","variable":"H25","pc":"PC2","loading":0.2003857321},{"group":"Outrights","variable":"H25","pc":"PC3","loading":0.0856149463},{"group":"Outrights","variable":"M25","pc":"PC1","loading":-0.1312385472},{"group":"Outrights","variable":"M25","pc":"PC2","loading":0.2070966468},{"group":"Outrights","variable":"M25","pc":"PC3","loading":0.0866874015},{"group":"Outrights","variable":"U25","pc":"PC1","loading":-0.1206775586},{"group":"Outrights","variable":"U25","pc":"PC2","loading":0.2127814476},{"group":"Outrights","variable":"U25","pc":"PC3","loading":0.0875932543},{"group":"Outrights","variable":"Z25","pc":"PC1","loading":-0.1104698539},{"group":"Outrights","variable":"Z25","pc":"PC2","loading":0.2175027878},{"group":"Outrights","variable":"Z25","pc":"PC3","loading":0.0883658596},{"group":"Outrights","variable":"H26","pc":"PC1","loading":-0.1006001095},{"group":"Outrights","variable":"H26","pc":"PC2","loading":0.2213192083},{"group":"Outrights","variable":"H26","pc":"PC3","loading":0.0890333276},{"group":"Outrights","variable":"M26","pc":"PC1","loading":-0.0910548174},{"group":"Outrights","variable":"M26","pc":"PC2","loading":0.2242858348},{"group":"Outrights","variable":"M26","pc":"PC3","loading":0.089606825},{"group":"Outrights","variable":"U26","pc":"PC1","loading":-0.0818224765},{"group":"Outrights","variable":"U26","pc":"PC2","loading":0.226456079},{"group":"Outrights","variable":"U26","pc":"PC3","loading":0.0900953041},{"group":"Outrights","variable":"Z26","pc":"PC1","loading":-0.0728923984},{"group":"Outrights","variable":"Z26","pc":"PC2","loading":0.2278807953},{"group":"Outrights","variable":"Z26","pc":"PC3","loading":0.090507316},{"group":"Outrights","variable":"H27","pc":"PC1","loading":-0.0642533866},{"group":"Outrights","variable":"H27","pc":"PC2","loading":0.2286082987},{"group":"Outrights","variable":"H27","pc":"PC3","loading":0.0908518931},{"group":"Outrights","variable":"M27","pc":"PC1","loading":-0.0558957816},{"group":"Outrights","variable":"M27","pc":"PC2","loading":0.228639536},{"group":"Outrights","variable":"M27","pc":"PC3","loading":0.0911370213},{"group":"Outrights","variable":"U27","pc":"PC1","loading":-0.0478107931},{"group":"Outrights","variable":"U27","pc":"PC2","loading":0.2280205809},{"group":"Outrights","variable":"U27","pc":"PC3","loading":0.0913693259},{"group":"Outrights","variable":"Z27","pc":"PC1","loading":-0.0400000004},{"group":"Outrights","variable":"Z27","pc":"PC2","loading":0.2267923483},{"group":"Outrights","variable":"Z27","pc":"PC3","loading":0.0915555468},{"group":"Outrights","variable":"H28","pc":"PC1","loading":-0.0324545239},{"group":"Outrights","variable":"H28","pc":"PC2","loading":0.2249969476},{"group":"Outrights","variable":"H28","pc":"PC3","loading":0.091699933},{"group":"Outrights","variable":"M28","pc":"PC1","loading":-0.0251649963},{"group":"Outrights","variable":"M28","pc":"PC2","loading":0.2226848737},{"group":"Outrights","variable":"M28","pc":"PC3","loading":0.0918074911},{"group":"Outrights","variable":"U228","pc":"PC1","loading":-0.0181238478},{"group":"Outrights","variable":"U228","pc":"PC2","loading":0.2198941014},{"group":"Outrights","variable":"U228","pc":"PC3","loading":0.0918831968},{"group":"Outrights","variable":"Z228","pc":"PC1","loading":-0.0113222303},{"group":"Outrights","variable":"Z228","pc":"PC2","loading":0.2166779453},{"group":"Outrights","variable":"Z228","pc":"PC3","loading":0.0919313271},{"group":"Outrights","variable":"H29","pc":"PC1","loading":-0.0047514332},{"group":"Outrights","variable":"H29","pc":"PC2","loading":0.2130836511},{"group":"Outrights","variable":"H29","pc":"PC3","loading":0.0919567954},{"group":"Outrights","variable":"M29","pc":"PC1","loading":0.001684501},{"group":"Outrights","variable":"M29","pc":"PC2","loading":0.2091653859},{"group":"Outrights","variable":"M29","pc":"PC3","loading":0.0919639537},{"group":"Outrights","variable":"U29","pc":"PC1","loading":0.0079015949},{"group":"Outrights","variable":"U29","pc":"PC2","loading":0.2049817799},{"group":"Outrights","variable":"U29","pc":"PC3","loading":0.0919566991},{"group":"Outrights","variable":"Z29","pc":"PC1","loading":0.0138981442},{"group":"Outrights","variable":"Z29","pc":"PC2","loading":0.2005878496},{"group":"Outrights","variable":"Z29","pc":"PC3","loading":0.0919383091},{"group":"Fly Spreads","variable":"Z20 / H21 / M21","pc":"PC1","loading":0.0010041262},{"group":"Fly Spreads","variable":"Z20 / H21 / M21","pc":"PC2","loading":-0.0210255198},{"group":"Fly Spreads","variable":"Z20 / H21 / M21","pc":"PC3","loading":-0.0078761274},{"group":"Fly Spreads","variable":"H21 / M21 / U21","pc":"PC1","loading":0.0163351984},{"group":"Fly Spreads","variable":"H21 / M21 / U21","pc":"PC2","loading":-0.0078235212},{"group":"Fly Spreads","variable":"H21 / M21 / U21","pc":"PC3","loading":-0.0075306325},{"group":"Fly Spreads","variable":"M21 / U21 / H22","pc":"PC1","loading":0.029853383},{"group":"Fly Spreads","variable":"M21 / U21 / H22","pc":"PC2","loading":0.0045591526},{"group":"Fly Spreads","variable":"M21 / U21 / H22","pc":"PC3","loading":-0.0072704172},{"group":"Fly Spreads","variable":"U21 / H22 / M22","pc":"PC1","loading":0.0416973347},{"group":"Fly Spreads","variable":"U21 / H22 / M22","pc":"PC2","loading":0.0145293235},{"group":"Fly Spreads","variable":"U21 / H22 / M22","pc":"PC3","loading":-0.0070199738},{"group":"Fly Spreads","variable":"H22 / M22 / U22","pc":"PC1","loading":0.0518776092},{"group":"Fly Spreads","variable":"H22 / M22 / U22","pc":"PC2","loading":0.0217985474},{"group":"Fly Spreads","variable":"H22 / M22 / U22","pc":"PC3","loading":-0.0067868541},{"group":"Fly Spreads","variable":"M22 / U22 / Z21","pc":"PC1","loading":0.0573937968},{"group":"Fly Spreads","variable":"M22 / U22 / Z21","pc":"PC2","loading":0.023247076},{"group":"Fly Spreads","variable":"M22 / U22 / Z21","pc":"PC3","loading":-0.0070044573},{"group":"Fly Spreads","variable":"U22 / Z21 / Z22","pc":"PC1","loading":0.0578642732},{"group":"Fly Spreads","variable":"U22 / Z21 / Z22","pc":"PC2","loading":0.0236162386},{"group":"Fly Spreads","variable":"U22 / Z21 / Z22","pc":"PC3","loading":-0.0071337422},{"group":"Fly Spreads","variable":"Z21 / Z22 / H23","pc":"PC1","loading":0.0381655181},{"group":"Fly Spreads","variable":"Z21 / Z22 / H23","pc":"PC2","loading":-0.0094065662},{"group":"Fly Spreads","variable":"Z21 / Z22 / H23","pc":"PC3","loading":-0.0006248987},{"group":"Fly Spreads","variable":"Z22 / H23 / M23","pc":"PC1","loading":0.0305888062},{"group":"Fly Spreads","variable":"Z22 / H23 / M23","pc":"PC2","loading":-0.0099444155},{"group":"Fly Spreads","variable":"Z22 / H23 / M23","pc":"PC3","loading":-0.0006326177},{"group":"Fly Spreads","variable":"H23 / M23 / U23","pc":"PC1","loading":0.028795123},{"group":"Fly Spreads","variable":"H23 / M23 / U23","pc":"PC2","loading":-0.0105307524},{"group":"Fly Spreads","variable":"H23 / M23 / U23","pc":"PC3","loading":-0.0005500431},{"group":"Fly Spreads","variable":"M23 / U23 / Z23","pc":"PC1","loading":0.027063385},{"group":"Fly Spreads","variable":"M23 / U23 / Z23","pc":"PC2","loading":-0.0109960759},{"group":"Fly Spreads","variable":"M23 / U23 / Z23","pc":"PC3","loading":-0.0004907996},{"group":"Fly Spreads","variable":"U23 / Z23 / H24","pc":"PC1","loading":0.0253489893},{"group":"Fly Spreads","variable":"U23 / Z23 / H24","pc":"PC2","loading":-0.0113426767},{"group":"Fly Spreads","variable":"U23 / Z23 / H24","pc":"PC3","loading":-0.0004467554},{"group":"Fly Spreads","variable":"Z23 / H24 / M24","pc":"PC1","loading":0.0236467332},{"group":"Fly Spreads","variable":"Z23 / H24 / M24","pc":"PC2","loading":-0.0115814578},{"group":"Fly Spreads","variable":"Z23 / H24 / M24","pc":"PC3","loading":-0.0004117015},{"group":"Fly Spreads","variable":"H24 / M24 / U24","pc":"PC1","loading":0.0219602597},{"group":"Fly Spreads","variable":"H24 / M24 / U24","pc":"PC2","loading":-0.0117215234},{"group":"Fly Spreads","variable":"H24 / M24 / U24","pc":"PC3","loading":-0.0003823438},{"group":"Fly Spreads","variable":"M24 / U24 / Z24","pc":"PC1","loading":0.0202927233},{"group":"Fly Spreads","variable":"M24 / U24 / Z24","pc":"PC2","loading":-0.0117711422},{"group":"Fly Spreads","variable":"M24 / U24 / Z24","pc":"PC3","loading":-0.0003565983},{"group":"Fly Spreads","variable":"U24 / Z24 / H25","pc":"PC1","loading":0.0186469446},{"group":"Fly Spreads","variable":"U24 / Z24 / H25","pc":"PC2","loading":-0.0117366752},{"group":"Fly Spreads","variable":"U24 / Z24 / H25","pc":"PC3","loading":-0.0003332463},{"group":"Fly Spreads","variable":"Z24 / H25 / M25","pc":"PC1","loading":0.0170252655},{"group":"Fly Spreads","variable":"Z24 / H25 / M25","pc":"PC2","loading":-0.0116238692},{"group":"Fly Spreads","variable":"Z24 / H25 / M25","pc":"PC3","loading":-0.0003114407},{"group":"Fly Spreads","variable":"H25 / M25 / U25","pc":"PC1","loading":0.0154297151},{"group":"Fly Spreads","variable":"H25 / M25 / U25","pc":"PC2","loading":-0.011441853},{"group":"Fly Spreads","variable":"H25 / M25 / U25","pc":"PC3","loading":-0.0002905391},{"group":"Fly Spreads","variable":"M25 / U25 / Z25","pc":"PC1","loading":0.0138619632},{"group":"Fly Spreads","variable":"M25 / U25 / Z25","pc":"PC2","loading":-0.0111979331},{"group":"Fly Spreads","variable":"M25 / U25 / Z25","pc":"PC3","loading":-0.0002699252},{"group":"Fly Spreads","variable":"U25 / Z25 / H26","pc":"PC1","loading":0.0123233199},{"group":"Fly Spreads","variable":"U25 / Z25 / H26","pc":"PC2","loading":-0.0109012423},{"group":"Fly Spreads","variable":"U25 / Z25 / H26","pc":"PC3","loading":-0.0002490219},{"group":"Fly Spreads","variable":"Z25 / H26 / M26","pc":"PC1","loading":0.010815049},{"group":"Fly Spreads","variable":"Z25 / H26 / M26","pc":"PC2","loading":-0.0105607596},{"group":"Fly Spreads","variable":"Z25 / H26 / M26","pc":"PC3","loading":-0.0002272895},{"group":"Fly Spreads","variable":"H26 / M26 / U26","pc":"PC1","loading":0.009338304},{"group":"Fly Spreads","variable":"H26 / M26 / U26","pc":"PC2","loading":-0.0101850116},{"group":"Fly Spreads","variable":"H26 / M26 / U26","pc":"PC3","loading":-0.000204179},{"group":"Fly Spreads","variable":"M26 / U26 / Z26","pc":"PC1","loading":0.0078941795},{"group":"Fly Spreads","variable":"M26 / U26 / Z26","pc":"PC2","loading":-0.0097825296},{"group":"Fly Spreads","variable":"M26 / U26 / Z26","pc":"PC3","loading":-0.0001791834},{"group":"Fly Spreads","variable":"U26 / Z26 / H27","pc":"PC1","loading":0.0064837581},{"group":"Fly Spreads","variable":"U26 / Z26 / H27","pc":"PC2","loading":-0.0093616672},{"group":"Fly Spreads","variable":"U26 / Z26 / H27","pc":"PC3","loading":-0.0001518063},{"group":"Fly Spreads","variable":"Z26 / H27 / M27","pc":"PC1","loading":0.0051080447},{"group":"Fly Spreads","variable":"Z26 / H27 / M27","pc":"PC2","loading":-0.0089278438},{"group":"Fly Spreads","variable":"Z26 / H27 / M27","pc":"PC3","loading":-0.0001215456},{"group":"Fly Spreads","variable":"H27 / M27 / U27","pc":"PC1","loading":0.0037678508},{"group":"Fly Spreads","variable":"H27 / M27 / U27","pc":"PC2","loading":-0.0084865181},{"group":"Fly Spreads","variable":"H27 / M27 / U27","pc":"PC3","loading":-0.0000878174},{"group":"Fly Spreads","variable":"M27 / U27 / Z27","pc":"PC1","loading":0.0024638787},{"group":"Fly Spreads","variable":"M27 / U27 / Z27","pc":"PC2","loading":-0.0080436407},{"group":"Fly Spreads","variable":"M27 / U27 / Z27","pc":"PC3","loading":-0.0000500473},{"group":"Fly Spreads","variable":"U27 / Z27 / H28","pc":"PC1","loading":0.0011966579},{"group":"Fly Spreads","variable":"U27 / Z27 / H28","pc":"PC2","loading":-0.0076043444},{"group":"Fly Spreads","variable":"U27 / Z27 / H28","pc":"PC3","loading":-0.0000076899},{"group":"Fly Spreads","variable":"Z27 / H28 / M28","pc":"PC1","loading":-0.0009369947},{"group":"Fly Spreads","variable":"Z27 / H28 / M28","pc":"PC2","loading":-0.0071736697},{"group":"Fly Spreads","variable":"Z27 / H28 / M28","pc":"PC3","loading":0.0000388701},{"group":"Fly Spreads","variable":"H28 / M28 / U228","pc":"PC1","loading":-0.0025983804},{"group":"Fly Spreads","variable":"H28 / M28 / U228","pc":"PC2","loading":-0.006756855},{"group":"Fly Spreads","variable":"H28 / M28 / U228","pc":"PC3","loading":0.000090226},{"group":"Fly Spreads","variable":"M28 / U228 / Z228","pc":"PC1","loading":-0.0040332832},{"group":"Fly Spreads","variable":"M28 / U228 / Z228","pc":"PC2","loading":-0.0063581729},{"group":"Fly Spreads","variable":"M28 / U228 / Z228","pc":"PC3","loading":0.0001469032},{"group":"Fly Spreads","variable":"U228 / Z228 / H29","pc":"PC1","loading":-0.0052219082},{"group":"Fly Spreads","variable":"U228 / Z228 / H29","pc":"PC2","loading":-0.0059738096},{"group":"Fly Spreads","variable":"U228 / Z228 / H29","pc":"PC3","loading":0.0002092109},{"group":"Fly Spreads","variable":"Z228 / H29 / M29","pc":"PC1","loading":-0.0061406834},{"group":"Fly Spreads","variable":"Z228 / H29 / M29","pc":"PC2","loading":-0.0056108168},{"group":"Fly Spreads","variable":"Z228 / H29 / M29","pc":"PC3","loading":0.000277498},{"group":"Fly Spreads","variable":"H29 / M29 / U29","pc":"PC1","loading":-0.0067711466},{"group":"Fly Spreads","variable":"H29 / M29 / U29","pc":"PC2","loading":-0.0052737604},{"group":"Fly Spreads","variable":"H29 / M29 / U29","pc":"PC3","loading":0.0003522204},{"group":"Fly Spreads","variable":"M29 / U29 / Z29","pc":"PC1","loading":-0.0071068832},{"group":"Fly Spreads","variable":"M29 / U29 / Z29","pc":"PC2","loading":-0.0049692461},{"group":"Fly Spreads","variable":"M29 / U29 / Z29","pc":"PC3","loading":0.000433705}]
+    const pcSummary = {"PC1":"PC1: 99.87% (Level Factor)","PC2":"PC2: 0.11% (Slope Factor)","PC3":"PC3: 0.01% (Curvature Factor)","Total":"Total Variance Explained: 99.99%"}
+    // --- End of Injected Data ---
 
-def load_data(uploaded_file):
-    """Loads CSV data into a DataFrame, adapting to price or expiry file formats."""
-    if uploaded_file is None:
-        return None
+    function renderSummary() {
+        const summaryDiv = d3.select("#pc-summary");
         
-    try:
-        # Read the uploaded file content to inspect the header for format identification
-        uploaded_file.seek(0)
-        file_content = uploaded_file.getvalue().decode("utf-8")
-        uploaded_file.seek(0)
-            
-        # --- Case 1: Expiry File (EXPIRY (2).csv format: MATURITY, DATE) ---
-        if 'MATURITY,DATE' in file_content.split('\n')[0].upper():
-            df = pd.read_csv(uploaded_file, sep=',')
-            df = df.rename(columns={'MATURITY': 'Contract', 'DATE': 'ExpiryDate'})
-            # Ensure Contract is the index and Date is datetime
-            df = df.set_index('Contract')
-            df['ExpiryDate'] = pd.to_datetime(df['ExpiryDate'])
-            df.index.name = 'Contract'
-            return df
+        Object.entries(pcSummary).forEach(([key, value]) => {
+            summaryDiv.append("div")
+                .attr("class", `p-3 rounded-lg text-sm font-semibold shadow-inner ${key === 'Total' ? 'bg-indigo-100 text-indigo-800' : 'bg-white text-gray-700 border border-gray-200'}`)
+                .text(value);
+        });
+    }
 
-        # --- Case 2: Price File (sofr rates.csv format: Date as index) ---
-        df = pd.read_csv(
-            uploaded_file, 
-            index_col=0, 
-            parse_dates=True,
-            sep=',', # Explicitly specify comma as separator
-            header=0 # Ensure the first row is used as the header
-        )
+    function renderHeatmap() {
+        // Setup dimensions
+        const margin = { top: 30, right: 20, bottom: 200, left: 100 },
+              width = 1100 - margin.left - margin.right,
+              height = 800 - margin.top - margin.bottom;
+
+        // Get unique PC components and variables (contracts/spreads)
+        const pcs = Array.from(new Set(heatmapData.map(d => d.pc)));
+        const groups = Array.from(new Set(heatmapData.map(d => d.group)));
         
-        df.index.name = 'Date'
-        
-        # Drop columns that are entirely NaN
-        df = df.dropna(axis=1, how='all')
-        
-        # Convert all price columns to numeric, coercing errors to NaN
-        for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-        # Filter out any remaining rows where the index date is NaT or the row is entirely NaN
-        df = df.dropna(how='all')
-        df = df[df.index.notna()]
+        // Ensure the order of variables matches the contract timeline + then flies
+        const outrightVariables = Array.from(new Set(heatmapData.filter(d => d.group === 'Outrights').map(d => d.variable)));
+        const flyVariables = Array.from(new Set(heatmapData.filter(d => d.group === 'Fly Spreads').map(d => d.variable)));
+        const variables = outrightVariables.concat(flyVariables);
 
-        if df.empty or df.shape[1] == 0:
-             raise ValueError("DataFrame is empty after processing or has no data columns.")
-             
-        return df
-        
-    except Exception as e:
-        st.error(f"Error loading and processing data from {uploaded_file.name}: {e}")
-        return None
+        // Append the svg object to the div
+        const svg = d3.select("#heatmap")
+            .append("svg")
+            .attr("width", width + margin.left + margin.right)
+            .attr("height", height + margin.top + margin.bottom)
+            .append("g")
+            .attr("transform", `translate(${margin.left},${margin.top})`);
 
+        // X scale (PC components)
+        const x = d3.scaleBand()
+            .range([0, width])
+            .domain(pcs)
+            .padding(0.05);
 
-def get_analysis_contracts(expiry_df, analysis_date):
-    """
-    Filters contract codes that expire on or after the analysis date and returns
-    them in chronological order with their expiry date. This list defines the 
-    maturities used in the analysis curve (e.g., Z20, H21, M21...).
-    """
-    if expiry_df is None:
-        return pd.DataFrame()
-    
-    # Filter contracts that expire on or after the analysis date
-    future_expiries = expiry_df[expiry_df['ExpiryDate'] >= analysis_date].copy()
-    
-    if future_expiries.empty:
-        st.warning(f"No contracts found expiring on or after {analysis_date.strftime('%Y-%m-%d')}.")
-        return pd.DataFrame()
+        // Y scale (Outrights and Flies)
+        const y = d3.scaleBand()
+            .range([height, 0])
+            .domain(variables)
+            .padding(0.05);
 
-    # Sort by expiry date
-    future_expiries = future_expiries.sort_values(by='ExpiryDate')
-    
-    return future_expiries
+        // Color scale (Loadings)
+        const maxLoading = d3.max(heatmapData, d => Math.abs(d.loading));
+        const colorScale = d3.scaleSequential(d3.interpolateRdBu)
+            .domain([maxLoading, -maxLoading]); // Red (positive) to Blue (negative)
 
-def transform_to_analysis_curve(price_df, future_expiries_df):
-    """
-    Transforms the price DataFrame to only include relevant contracts in maturity order.
-    The column names are kept as the original contract codes (e.g., Z20, H21).
-    """
-    if price_df is None or future_expiries_df.empty:
-        return pd.DataFrame(), []
+        // Tooltip
+        const tooltip = d3.select("#app")
+            .append("div")
+            .attr("class", "tooltip opacity-0 transition-opacity duration-200")
+            .style("opacity", 0);
 
-    contract_order = future_expiries_df.index.tolist()
-    
-    # Filter price columns to only include those present in the contract order
-    valid_contracts = [c for c in contract_order if c in price_df.columns]
-    
-    if not valid_contracts:
-        st.warning("No matching contract columns found in price data for the selected analysis date range.")
-        return pd.DataFrame(), []
-
-    # Filter the price data to only include valid, ordered contract columns
-    analysis_curve_df = price_df[valid_contracts]
-    
-    return analysis_curve_df, valid_contracts
-
-def calculate_outright_spreads(analysis_curve_df):
-    """
-    Calculates the first differences (spreads) on a CME basis: C1 - C2, C2 - C3, etc.
-    The labels now use the contract codes (e.g., Z20-H21).
-    """
-    if analysis_curve_df.empty:
-        return pd.DataFrame()
-
-    num_contracts = analysis_curve_df.shape[1]
-    spreads_data = {}
-    
-    for i in range(num_contracts - 1):
-        # CME Basis: Shorter maturity minus longer maturity
-        short_maturity = analysis_curve_df.columns[i]
-        long_maturity = analysis_curve_df.columns[i+1]
-        
-        spread_label = f"{short_maturity}-{long_maturity}"
-        
-        spreads_data[spread_label] = analysis_curve_df.iloc[:, i] - analysis_curve_df.iloc[:, i+1]
-        
-    return pd.DataFrame(spreads_data)
-
-def calculate_butterflies(analysis_curve_df):
-    """
-    Calculates butterflies (flies) on a CME basis: (C1 - C2) - (C2 - C3) = C1 - 2*C2 + C3, etc.
-    The labels now use the contract codes (e.g., Z20-2xH21+M21).
-    """
-    if analysis_curve_df.empty or analysis_curve_df.shape[1] < 3:
-        return pd.DataFrame()
-
-    num_contracts = analysis_curve_df.shape[1]
-    flies_data = {}
-
-    for i in range(num_contracts - 2):
-        short_maturity = analysis_curve_df.columns[i]    # C1
-        center_maturity = analysis_curve_df.columns[i+1] # C2
-        long_maturity = analysis_curve_df.columns[i+2]   # C3
-
-        # Fly = C1 - 2*C2 + C3
-        fly_label = f"{short_maturity}-2x{center_maturity}+{long_maturity}"
-
-        flies_data[fly_label] = analysis_curve_df.iloc[:, i] - 2 * analysis_curve_df.iloc[:, i+1] + analysis_curve_df.iloc[:, i+2]
-
-    return pd.DataFrame(flies_data)
-
-def perform_pca(data_df):
-    """Performs PCA on the input DataFrame (expected to be spreads)."""
-    # Drop rows with NaNs before standardization and PCA
-    data_df_clean = data_df.dropna()
-    
-    if data_df_clean.empty or data_df_clean.shape[0] < data_df_clean.shape[1]:
-        st.error("Not enough complete data points (rows) to perform PCA on the spreads after dropping NaNs.")
-        return None, None, None, None
-
-    # Standardize the data (PCA is sensitive to scale)
-    data_mean = data_df_clean.mean()
-    data_std = data_df_clean.std()
-    data_scaled = (data_df_clean - data_mean) / data_std
-    
-    # Determine optimal number of components (min(n_samples, n_features))
-    n_components = min(data_scaled.shape)
-
-    pca = PCA(n_components=n_components)
-    pca.fit(data_scaled)
-    
-    # Component Loadings (the eigenvectors * sqrt(eigenvalues))
-    loadings = pd.DataFrame(
-        pca.components_.T,
-        columns=[f'PC{i+1}' for i in range(n_components)],
-        index=data_df_clean.columns
-    )
-    
-    explained_variance = pca.explained_variance_ratio_
-    
-    # Principal Component Scores (the transformed data)
-    scores = pd.DataFrame(
-        pca.transform(data_scaled),
-        index=data_df_clean.index,
-        columns=[f'PC{i+1}' for i in range(n_components)]
-    )
-    
-    return loadings, explained_variance, scores, data_df_clean
-
-def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_df, spreads_df, butterflies_df):
-    """
-    Reconstructs Outright Prices and Derivatives historically using reconstructed spreads,
-    anchored to the original nearest contract price path (Level factor).
-    """
-    # Filter the analysis_curve_df to match the index of the reconstructed spreads
-    analysis_curve_df_aligned = analysis_curve_df.loc[reconstructed_spreads_df.index]
-    
-    # --- 1. Reconstruct Outright Prices ---
-    
-    # Anchor the entire curve reconstruction to the original historical nearest contract price path
-    nearest_contract_original = analysis_curve_df_aligned.iloc[:, 0]
-    nearest_contract_label = analysis_curve_df_aligned.columns[0]
-    
-    # Initialize the reconstructed prices DataFrame, starting with the original as the Level anchor
-    reconstructed_prices_df = pd.DataFrame(index=analysis_curve_df_aligned.index)
-    reconstructed_prices_df[nearest_contract_label + ' (PCA)'] = nearest_contract_original
-    
-    # Iterate through all maturities starting from the second contract (index 1)
-    for i in range(1, len(analysis_curve_df_aligned.columns)):
-        prev_maturity = analysis_curve_df_aligned.columns[i-1]
-        current_maturity = analysis_curve_df_aligned.columns[i]
-        spread_label = f"{prev_maturity}-{current_maturity}"
-        
-        # Calculate the reconstructed price P_i using P_i-1 (PCA) and S_i-1,i (PCA)
-        # P_i = P_i-1 (PCA) - S_i-1,i (PCA)
-        reconstructed_prices_df[current_maturity + ' (PCA)'] = (
-            reconstructed_prices_df[prev_maturity + ' (PCA)'] - reconstructed_spreads_df[spread_label]
-        )
-        
-    # Merge original prices for comparison
-    original_price_rename = {col: col + ' (Original)' for col in analysis_curve_df_aligned.columns}
-    original_prices_df = analysis_curve_df_aligned.rename(columns=original_price_rename)
-    
-    historical_outrights = pd.merge(original_prices_df, reconstructed_prices_df, left_index=True, right_index=True)
+        // Mouse handlers
+        const mouseover = function(event, d) {
+            tooltip.style("opacity", 1);
+            d3.select(this).style("stroke", "#10b981").style("stroke-width", 2);
+        }
+        const mousemove = function(event, d) {
+            const loadingText = (d.loading > 0 ? "+" : "") + d.loading.toFixed(4);
+            tooltip
+                .html(`**${d.variable}**<br>PC: ${d.pc}<br>Loading: ${loadingText}`)
+                .style("left", (event.pageX + 10) + "px")
+                .style("top", (event.pageY - 50) + "px");
+        }
+        const mouseleave = function(event, d) {
+            tooltip.style("opacity", 0);
+            d3.select(this).style("stroke", "none");
+        }
 
 
-    # --- 2. Prepare Spreads for comparison ---
-    spreads_df_aligned = spreads_df.loc[reconstructed_spreads_df.index]
-    original_spread_rename = {col: col + ' (Original)' for col in spreads_df_aligned.columns}
-    pca_spread_rename = {col: col + ' (PCA)' for col in reconstructed_spreads_df.columns}
+        // Draw the heatmap rectangles
+        svg.selectAll()
+            .data(heatmapData, d => d.pc + ':' + d.variable)
+            .enter()
+            .append("rect")
+            .attr("x", d => x(d.pc))
+            .attr("y", d => y(d.variable))
+            .attr("rx", 4)
+            .attr("ry", 4)
+            .attr("width", x.bandwidth())
+            .attr("height", y.bandwidth())
+            .style("fill", d => colorScale(d.loading))
+            .on("mouseover", mouseover)
+            .on("mousemove", mousemove)
+            .on("mouseleave", mouseleave);
 
-    original_spreads = spreads_df_aligned.rename(columns=original_spread_rename)
-    pca_spreads = reconstructed_spreads_df.rename(columns=pca_spread_rename)
-    
-    historical_spreads = pd.merge(original_spreads, pca_spreads, left_index=True, right_index=True)
-    
-    
-    # --- 3. Reconstruct Butterflies ---
-    if butterflies_df.empty:
-        return historical_outrights, historical_spreads, pd.DataFrame()
-    
-    butterflies_df_aligned = butterflies_df.loc[reconstructed_spreads_df.index]
-        
-    reconstructed_butterflies = {}
-    for i in range(len(spreads_df.columns) - 1):
-        spread1_label = spreads_df.columns[i]
-        spread2_label = spreads_df.columns[i+1]
-        original_fly_label = butterflies_df.columns[i]
-        
-        # Reconstruct fly: Fly = Spread1_PCA - Spread2_PCA
-        reconstructed_butterflies[original_fly_label + ' (PCA)'] = (
-            reconstructed_spreads_df[spread1_label] - reconstructed_spreads_df[spread2_label]
-        )
+        // Add X axis (PC components)
+        svg.append("g")
+            .attr("class", "axis")
+            .attr("transform", `translate(0, ${height})`)
+            .call(d3.axisBottom(x))
+            .selectAll("text")
+            .attr("transform", "translate(0,10) rotate(-45)")
+            .style("text-anchor", "end");
 
-    reconstructed_butterflies_df = pd.DataFrame(reconstructed_butterflies, index=reconstructed_spreads_df.index)
-    
-    # Merge original flies for comparison
-    original_fly_rename = {col: col + ' (Original)' for col in butterflies_df_aligned.columns}
-    original_butterflies_df = butterflies_df_aligned.rename(columns=original_fly_rename)
-    
-    historical_butterflies = pd.merge(original_butterflies_df, reconstructed_butterflies_df, left_index=True, right_index=True)
-    
-    return historical_outrights, historical_spreads, historical_butterflies
+        // Add Y axis (Contracts/Spreads)
+        svg.append("g")
+            .attr("class", "axis")
+            .call(d3.axisLeft(y).tickSize(0))
+            .selectAll("text")
+            .style("font-size", "11px");
 
+        // Add X axis label
+        svg.append("text")
+            .attr("class", "text-lg font-medium text-gray-700")
+            .attr("text-anchor", "middle")
+            .attr("x", width / 2)
+            .attr("y", height + margin.bottom - 40)
+            .text("Principal Components (PCs)");
 
-# --- Streamlit Application Layout ---
+        // Add Y axis label (Rotated)
+        svg.append("text")
+            .attr("class", "text-lg font-medium text-gray-700")
+            .attr("text-anchor", "middle")
+            .attr("transform", "rotate(-90)")
+            .attr("y", -margin.left + 20)
+            .attr("x", -height / 2)
+            .text("Financial Instruments");
 
-st.title("SOFR Futures PCA Analyzer")
+        // Add a horizontal line to separate Outrights and Fly Spreads
+        const flyStart = y(outrightVariables[outrightVariables.length - 1]) + y.bandwidth() + y.paddingInner() * y.bandwidth();
+        svg.append("line")
+            .attr("class", "group-separator")
+            .attr("x1", 0)
+            .attr("y1", flyStart)
+            .attr("x2", width)
+            .attr("y2", flyStart);
 
-# --- Sidebar Inputs ---
-st.sidebar.header("1. Data Uploads")
-price_file = st.sidebar.file_uploader(
-    "Upload Historical Price Data (e.g., 'sofr rates.csv')", 
-    type=['csv'], 
-    key='price_upload'
-)
-expiry_file = st.sidebar.file_uploader(
-    "Upload Contract Expiry Dates (e.g., 'EXPIRY (2).csv')", 
-    type=['csv'], 
-    key='expiry_upload'
-)
+        // Add labels for groups
+        svg.append("text")
+            .attr("x", -margin.left + 5)
+            .attr("y", 10)
+            .style("font-weight", "bold")
+            .text("Outrights");
 
-# Initialize dataframes
-price_df = load_data(price_file)
-expiry_df = load_data(expiry_file)
+        svg.append("text")
+            .attr("x", -margin.left + 5)
+            .attr("y", flyStart + 25)
+            .style("font-weight", "bold")
+            .text("Fly Spreads");
+    }
 
-if price_df is not None and expiry_df is not None:
-    # --- Date Range Filter ---
-    st.sidebar.header("2. Historical Date Range")
-    min_date = price_df.index.min().date()
-    max_date = price_df.index.max().date()
-    
-    start_date, end_date = st.sidebar.date_input(
-        "Select Historical Data Range for PCA Calibration", 
-        value=[min_date, max_date],
-        min_value=min_date,
-        max_value=max_date
-    )
-    
-    price_df_filtered = price_df[(price_df.index.date >= start_date) & (price_df.index.date <= end_date)]
-    
-    # --- Analysis Date Selector (Maturity Roll) ---
-    st.sidebar.header("3. Curve Analysis Date")
-    
-    # Analysis date should be within the historical range for stability
-    default_analysis_date = end_date
-    if default_analysis_date < min_date:
-        default_analysis_date = min_date
-        
-    analysis_date = st.sidebar.date_input(
-        "Select **Single Date** for Curve Snapshot", 
-        value=default_analysis_date,
-        min_value=min_date,
-        max_value=max_date,
-        key='analysis_date'
-    )
-    
-    # Ensure analysis_date is a datetime object for comparison
-    analysis_dt = datetime.combine(analysis_date, datetime.min.time())
-    
-else:
-    st.info("Please upload both the Price Data and Expiry Data CSV files to begin the analysis.")
-    st.stop()
+    // Initialize the page
+    window.onload = function() {
+        renderSummary();
+        renderHeatmap();
+    };
 
-
-# --- Core Processing Logic ---
-if not price_df_filtered.empty:
-    
-    # 1. Get the list of relevant contracts based on the analysis date
-    future_expiries_df = get_analysis_contracts(expiry_df, analysis_dt)
-    
-    if future_expiries_df.empty:
-        st.warning("Could not establish a relevant contract curve. Please check your date filters.")
-        st.stop()
-        
-    # 2. Transform historical prices to the required maturity curve
-    analysis_curve_df, contract_labels = transform_to_analysis_curve(price_df_filtered, future_expiries_df)
-
-    if analysis_curve_df.empty:
-        st.warning("Data transformation failed. Check if contracts in the price file match contracts in the expiry file.")
-        st.stop()
-        
-    # 3. Calculate Spreads and Butterflies (Inputs for PCA and comparison)
-    st.header("1. Data Derivatives Check (Contracts relevant to selected Analysis Date)")
-    
-    # Calculate Spreads
-    spreads_df = calculate_outright_spreads(analysis_curve_df)
-    st.markdown("##### Outright Spreads (e.g., Z20-H21, H21-M21, etc.)")
-    st.dataframe(spreads_df.head(5))
-    
-    if spreads_df.empty:
-        st.warning("Spreads could not be calculated. Need at least two contracts in the analysis curve.")
-        st.stop()
-        
-    # Calculate Butterflies
-    butterflies_df = calculate_butterflies(analysis_curve_df)
-    st.markdown("##### Butterflies (e.g., Z20-2xH21+M21, etc.)")
-    st.dataframe(butterflies_df.head(5))
-
-    # 4. Perform PCA on Spreads
-    # PCA is performed only on spreads, as they are the most stationary features
-    loadings, explained_variance, scores, spreads_df_clean = perform_pca(spreads_df)
-
-    if loadings is not None:
-        
-        # --- Explained Variance Visualization ---
-        st.header("2. Explained Variance")
-        variance_df = pd.DataFrame({
-            'Principal Component': [f'PC{i+1}' for i in range(len(explained_variance))],
-            'Explained Variance (%)': explained_variance * 100
-        })
-        variance_df['Cumulative Variance (%)'] = variance_df['Explained Variance (%)'].cumsum()
-        
-        col_var, col_pca_select = st.columns([1, 1])
-        with col_var:
-            st.dataframe(variance_df, use_container_width=True)
-            
-        # Determine how many components to use for fair curve reconstruction
-        default_pc_count = min(3, len(explained_variance))
-        with col_pca_select:
-            st.subheader("Fair Curve Setup")
-            pc_count = st.slider(
-                "Select number of Principal Components (PCs) for Fair Curve:",
-                min_value=1,
-                max_value=len(explained_variance),
-                value=default_pc_count,
-                help="Typically, the first 3 components (Level, Slope, Curve) explain over 95% of variance in spread changes."
-            )
-            
-            total_explained = variance_df['Cumulative Variance (%)'].iloc[pc_count - 1]
-            st.info(f"The selected **{pc_count} PCs** explain **{total_explained:.2f}%** of the total variance in the spreads.")
-        
-        
-        # --- Component Loadings Heatmap ---
-        st.header("3. PC Loadings Heatmap (PC vs. Spreads)")
-        st.markdown("""
-            This heatmap shows the weights of the first few PCs on each **Spread**. These weights define the fundamental Level, Slope, and Curvature factors.
-        """)
-        
-        plt.style.use('default') 
-        fig, ax = plt.subplots(figsize=(12, 6))
-        
-        loadings_plot = loadings.iloc[:, :default_pc_count]
-
-        sns.heatmap(
-            loadings_plot, 
-            annot=True, 
-            cmap='coolwarm', 
-            fmt=".2f", 
-            linewidths=0.5, 
-            linecolor='gray', 
-            cbar_kws={'label': 'Loading Weight'}
-        )
-        ax.set_title(f'Component Loadings for First {default_pc_count} Principal Components', fontsize=16)
-        ax.set_xlabel('Principal Component')
-        ax.set_ylabel('Spread Contract')
-        st.pyplot(fig)
-        
-        
-        # --- PC Scores Time Series Plot ---
-        def plot_pc_scores(scores_df, explained_variance):
-            """Plots the time series of the first 3 PC scores."""
-            
-            pc_labels = ['Level (PC1)', 'Slope (PC2)', 'Curvature (PC3)']
-            num_pcs = min(3, scores_df.shape[1])
-            if num_pcs == 0: return None
-
-            fig, axes = plt.subplots(nrows=num_pcs, ncols=1, figsize=(15, 4 * num_pcs), sharex=True)
-            if num_pcs == 1: axes = [axes] 
-
-            plt.suptitle("Time Series of Principal Component Scores (Risk Factors)", fontsize=16, y=1.02)
-
-            for i in range(num_pcs):
-                ax = axes[i]
-                pc_label = pc_labels[i]
-                variance_pct = explained_variance[i] * 100
-                
-                ax.plot(scores_df.index, scores_df.iloc[:, i], label=f'{pc_label} ({variance_pct:.2f}% Var.)', linewidth=1.5, color=plt.cm.tab10(i))
-                
-                ax.axhline(0, color='r', linestyle='--', linewidth=0.8)
-                
-                ax.set_title(f'{pc_label} Factor Score (Explaining {variance_pct:.2f}% of Spread Variance)', fontsize=14)
-                ax.grid(True, linestyle=':', alpha=0.6)
-                ax.set_ylabel('Score Value')
-                ax.legend(loc='upper left')
-                
-            plt.xlabel('Date')
-            plt.tight_layout(rect=[0, 0.03, 1, 0.98])
-            return fig
-
-        st.header("4. PC Factor Scores Time Series")
-        st.markdown("This plot shows the historical movement of the **latent risk factors** (Level, Slope, and Curvature) over the chosen historical range.")
-        fig_scores = plot_pc_scores(scores, explained_variance)
-        if fig_scores:
-            st.pyplot(fig_scores)
-            
-        
-        # --- Historical Reconstruction ---
-        
-        # 1. Reconstruct Spreads using only selected PCs
-        data_mean = spreads_df_clean.mean()
-        data_std = spreads_df_clean.std()
-        scores_used = scores.values[:, :pc_count]
-        loadings_used = loadings.values[:, :pc_count]
-        
-        reconstructed_scaled = scores_used @ loadings_used.T
-        
-        reconstructed_spreads = pd.DataFrame(
-            reconstructed_scaled * data_std.values + data_mean.values,
-            index=spreads_df_clean.index, 
-            columns=spreads_df_clean.columns
-        )
-
-        # 2. Reconstruct Outright Prices, Spreads, and Flies
-        historical_outrights_df, historical_spreads_df, historical_butterflies_df = \
-            reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads, spreads_df, butterflies_df)
-
-        
-        
-        # --- NEW: Cross-Sectional Curve Plot for Single Date ---
-        st.header("5. Curve Snapshot Analysis: " + analysis_date.strftime('%Y-%m-%d'))
-        st.markdown("This section plots the **current market values** (Original) against the **PCA Fair curve/spread/fly** for the selected date. The vertical difference is the theoretical mispricing.")
-
-        # --- 5.1 Outright Price Snapshot ---
-        st.subheader("5.1 Outright Price Curve")
-        
-        # Get the single-day snapshot for Outright Prices
-        try:
-            # 1. Select the single day's data, ensuring DataFrame structure
-            curve_snapshot_original = historical_outrights_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
-            curve_snapshot_pca = historical_outrights_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
-            
-            # 2. Rename column (which is the datetime key) and clean the index labels
-            curve_snapshot_original.columns = ['Original']
-            curve_snapshot_original.index = curve_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
-
-            curve_snapshot_pca.columns = ['PCA Fair']
-            curve_snapshot_pca.index = curve_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
-
-            # 3. Concatenate and drop NaNs (if any value is missing for a contract)
-            curve_comparison = pd.concat([curve_snapshot_original, curve_snapshot_pca], axis=1).dropna()
-            
-            if curve_comparison.empty:
-                st.warning(f"No complete Outright Price data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
-            else:
-                # --- Plot the Curve ---
-                fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
-                
-                # Plot Original Curve
-                ax_curve.plot(curve_comparison.index, curve_comparison['Original'], 
-                              label='Original Market Curve', marker='o', linestyle='-', linewidth=2.5, color='blue')
-                
-                # Plot PCA Fair Curve
-                ax_curve.plot(curve_comparison.index, curve_comparison['PCA Fair'], 
-                              label=f'PCA Fair Curve ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='red')
-                
-                # Plot Mispricing (Original - PCA Fair)
-                mispricing = curve_comparison['Original'] - curve_comparison['PCA Fair']
-                
-                # Annotate the contracts with the largest absolute mispricing
-                max_abs_mispricing = mispricing.abs().max()
-                if max_abs_mispricing > 0:
-                    mispricing_contract = mispricing.abs().idxmax()
-                    mispricing_value = mispricing.loc[mispricing_contract] * 10000 # Convert to BPS
-                    
-                    ax_curve.annotate(
-                        f"Mispricing: {mispricing_value:.2f} BPS",
-                        (mispricing_contract, curve_comparison.loc[mispricing_contract]['Original']),
-                        textcoords="offset points",
-                        xytext=(0, 10),
-                        ha='center',
-                        fontsize=10,
-                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
-                    )
-                
-                ax_curve.set_title(f'Market Price Curve vs. PCA Fair Price Curve', fontsize=16)
-                ax_curve.set_xlabel('Contract Maturity')
-                ax_curve.set_ylabel('Price (100 - Rate)')
-                ax_curve.legend(loc='upper right')
-                ax_curve.grid(True, linestyle=':', alpha=0.6)
-                plt.xticks(rotation=45, ha='right')
-                plt.tight_layout()
-                st.pyplot(fig_curve)
-                
-                # --- Detailed Contract Price/Rate Table (Outright) ---
-                st.markdown("###### Outright Price and Rate Mispricing")
-                
-                # Create the detailed table
-                detailed_comparison = curve_comparison.copy()
-                detailed_comparison.index.name = 'Contract'
-                
-                # Calculate Rates (Yields) and Mispricing in BPS
-                detailed_comparison['Original Rate (%)'] = 100.0 - detailed_comparison['Original']
-                detailed_comparison['PCA Fair Rate (%)'] = 100.0 - detailed_comparison['PCA Fair']
-                # Mispricing in Price terms (Original Price - PCA Fair Price) * 10,000 to get BPS
-                detailed_comparison['Mispricing (BPS)'] = (detailed_comparison['Original'] - detailed_comparison['PCA Fair']) * 10000
-
-                # Reorder columns and rename Price columns
-                detailed_comparison = detailed_comparison.rename(
-                    columns={'Original': 'Original Price', 'PCA Fair': 'PCA Fair Price'}
-                )
-                
-                detailed_comparison = detailed_comparison[[
-                    'Original Price', 
-                    'Original Rate (%)', 
-                    'PCA Fair Price', 
-                    'PCA Fair Rate (%)', 
-                    'Mispricing (BPS)'
-                ]]
-                
-                # Display the table, formatted for financial data
-                st.dataframe(
-                    detailed_comparison.style.format({
-                        'Original Price': "{:.4f}",
-                        'PCA Fair Price': "{:.4f}",
-                        'Original Rate (%)': "{:.4f}",
-                        'PCA Fair Rate (%)': "{:.4f}",
-                        'Mispricing (BPS)': "{:.2f}"
-                    }),
-                    use_container_width=True
-                )
-                
-        except KeyError:
-            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Outright Prices. Please choose a different date within the historical range.")
-
-        
-        # --- 5.2 Spread Snapshot ---
-        st.subheader("5.2 Spread Snapshot")
-
-        try:
-            # 1. Select the single day's data, ensuring DataFrame structure
-            spread_snapshot_original = historical_spreads_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
-            spread_snapshot_pca = historical_spreads_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
-            
-            # 2. Rename column (which is the datetime key) and clean the index labels
-            spread_snapshot_original.columns = ['Original']
-            spread_snapshot_original.index = spread_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
-
-            spread_snapshot_pca.columns = ['PCA Fair']
-            spread_snapshot_pca.index = spread_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
-
-            # 3. Concatenate and drop NaNs
-            spread_comparison = pd.concat([spread_snapshot_original, spread_snapshot_pca], axis=1).dropna()
-            
-            if spread_comparison.empty:
-                st.warning(f"No complete Spread data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
-            else:
-                # --- Plot the Spreads ---
-                fig_spread, ax_spread = plt.subplots(figsize=(15, 7))
-                
-                # Plot Original Spread
-                ax_spread.plot(spread_comparison.index, spread_comparison['Original'], 
-                              label='Original Market Spread', marker='o', linestyle='-', linewidth=2.5, color='darkgreen')
-                
-                # Plot PCA Fair Spread
-                ax_spread.plot(spread_comparison.index, spread_comparison['PCA Fair'], 
-                              label=f'PCA Fair Spread ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='orange')
-                
-                # Plot Mispricing (Original - PCA Fair)
-                mispricing = spread_comparison['Original'] - spread_comparison['PCA Fair']
-                ax_spread.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) # Add zero line for reference
-                
-                # Annotate the spread with the largest absolute mispricing
-                max_abs_mispricing = mispricing.abs().max()
-                if max_abs_mispricing > 0:
-                    mispricing_spread = mispricing.abs().idxmax()
-                    mispricing_value = mispricing.loc[mispricing_spread] * 10000 # Convert to BPS
-                    
-                    ax_spread.annotate(
-                        f"Mispricing: {mispricing_value:.2f} BPS",
-                        (mispricing_spread, spread_comparison.loc[mispricing_spread]['Original']),
-                        textcoords="offset points",
-                        xytext=(0, 10),
-                        ha='center',
-                        fontsize=10,
-                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
-                    )
-                
-                ax_spread.set_title('Market Spread vs. PCA Fair Spread', fontsize=16)
-                ax_spread.set_xlabel('Spread Contract (Short-Long)')
-                ax_spread.set_ylabel('Spread Value (Price Difference)')
-                ax_spread.legend(loc='upper right')
-                ax_spread.grid(True, linestyle=':', alpha=0.6)
-                plt.xticks(rotation=45, ha='right')
-                plt.tight_layout()
-                st.pyplot(fig_spread)
-                
-                # --- Detailed Spread Table ---
-                st.markdown("###### Spread Mispricing")
-                detailed_comparison_spread = spread_comparison.copy()
-                detailed_comparison_spread.index.name = 'Spread Contract'
-                detailed_comparison_spread['Mispricing (BPS)'] = mispricing * 10000
-                detailed_comparison_spread = detailed_comparison_spread.rename(
-                    columns={'Original': 'Original Spread', 'PCA Fair': 'PCA Fair Spread'}
-                )
-                
-                st.dataframe(
-                    detailed_comparison_spread.style.format({
-                        'Original Spread': "{:.4f}",
-                        'PCA Fair Spread': "{:.4f}",
-                        'Mispricing (BPS)': "{:.2f}"
-                    }),
-                    use_container_width=True
-                )
-
-        except KeyError:
-            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Spreads. Please choose a different date within the historical range.")
-
-
-        # --- 5.3 Butterfly (Fly) Snapshot ---
-        if not historical_butterflies_df.empty:
-            st.subheader("5.3 Butterfly (Fly) Snapshot")
-
-            try:
-                # 1. Select the single day's data, ensuring DataFrame structure
-                fly_snapshot_original = historical_butterflies_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
-                fly_snapshot_pca = historical_butterflies_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
-                
-                # 2. Rename column (which is the datetime key) and clean the index labels
-                fly_snapshot_original.columns = ['Original']
-                fly_snapshot_original.index = fly_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
-
-                fly_snapshot_pca.columns = ['PCA Fair']
-                fly_snapshot_pca.index = fly_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
-
-                # 3. Concatenate and drop NaNs
-                fly_comparison = pd.concat([fly_snapshot_original, fly_snapshot_pca], axis=1).dropna()
-                
-                if fly_comparison.empty:
-                    st.warning(f"No complete Butterfly (Fly) data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
-                else:
-                    # --- Plot the Flies ---
-                    fig_fly, ax_fly = plt.subplots(figsize=(15, 7))
-                    
-                    # Plot Original Fly
-                    ax_fly.plot(fly_comparison.index, fly_comparison['Original'], 
-                                  label='Original Market Fly', marker='o', linestyle='-', linewidth=2.5, color='purple')
-                    
-                    # Plot PCA Fair Fly
-                    ax_fly.plot(fly_comparison.index, fly_comparison['PCA Fair'], 
-                                  label=f'PCA Fair Fly ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='brown')
-                    
-                    # Plot Mispricing (Original - PCA Fair)
-                    mispricing = fly_comparison['Original'] - fly_comparison['PCA Fair']
-                    ax_fly.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) # Add zero line for reference
-                    
-                    # Annotate the fly with the largest absolute mispricing
-                    max_abs_mispricing = mispricing.abs().max()
-                    if max_abs_mispricing > 0:
-                        mispricing_fly = mispricing.abs().idxmax()
-                        mispricing_value = mispricing.loc[mispricing_fly] * 10000 # Convert to BPS
-                        
-                        ax_fly.annotate(
-                            f"Mispricing: {mispricing_value:.2f} BPS",
-                            (mispricing_fly, fly_comparison.loc[mispricing_fly]['Original']),
-                            textcoords="offset points",
-                            xytext=(0, 10),
-                            ha='center',
-                            fontsize=10,
-                            bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
-                        )
-                    
-                    ax_fly.set_title('Market Butterfly vs. PCA Fair Butterfly', fontsize=16)
-                    ax_fly.set_xlabel('Butterfly Contract (C1-2xC2+C3)')
-                    ax_fly.set_ylabel('Butterfly Value')
-                    ax_fly.legend(loc='upper right')
-                    ax_fly.grid(True, linestyle=':', alpha=0.6)
-                    plt.xticks(rotation=45, ha='right')
-                    plt.tight_layout()
-                    st.pyplot(fig_fly)
-
-                    # --- Detailed Fly Table ---
-                    st.markdown("###### Butterfly (Fly) Mispricing")
-                    detailed_comparison_fly = fly_comparison.copy()
-                    detailed_comparison_fly.index.name = 'Butterfly Contract'
-                    detailed_comparison_fly['Mispricing (BPS)'] = mispricing * 10000
-                    detailed_comparison_fly = detailed_comparison_fly.rename(
-                        columns={'Original': 'Original Fly', 'PCA Fair': 'PCA Fair Fly'}
-                    )
-                    
-                    st.dataframe(
-                        detailed_comparison_fly.style.format({
-                            'Original Fly': "{:.4f}",
-                            'PCA Fair Fly': "{:.4f}",
-                            'Mispricing (BPS)': "{:.2f}"
-                        }),
-                        use_container_width=True
-                    )
-
-            except KeyError:
-                st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Butterflies. Please choose a different date within the historical range.")
-        else:
-            st.info("Not enough contracts (need 3 or more) to calculate and plot butterfly snapshot.")
-            
-    else:
-        st.error("PCA failed. Please check your data quantity and quality.")
+</script>
+</body>
+</html>
