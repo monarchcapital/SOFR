@@ -482,13 +482,13 @@ if not price_df_filtered.empty:
         
         # --- NEW: Cross-Sectional Curve Plot for Single Date ---
         st.header("5. Curve Snapshot Analysis: " + analysis_date.strftime('%Y-%m-%d'))
-        st.markdown("This chart plots the **current market curve** (Original) against the **PCA Fair curve** for the selected date. The vertical difference is the theoretical mispricing.")
+        st.markdown("This section plots the **current market values** (Original) against the **PCA Fair curve/spread/fly** for the selected date. The vertical difference is the theoretical mispricing.")
 
-        # Get the single-day snapshot
+        # --- 5.1 Outright Price Snapshot ---
+        st.subheader("5.1 Outright Price Curve")
+        
+        # Get the single-day snapshot for Outright Prices
         try:
-            # FIX: Use .loc[[key]] to select the single row as a DataFrame, not a Series,
-            # which prevents the subsequent chained method failure (TypeError/AttributeError).
-            
             # 1. Select the single day's data, ensuring DataFrame structure
             curve_snapshot_original = historical_outrights_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
             curve_snapshot_pca = historical_outrights_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
@@ -504,7 +504,7 @@ if not price_df_filtered.empty:
             curve_comparison = pd.concat([curve_snapshot_original, curve_snapshot_pca], axis=1).dropna()
             
             if curve_comparison.empty:
-                st.warning(f"No complete data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
+                st.warning(f"No complete Outright Price data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
             else:
                 # --- Plot the Curve ---
                 fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
@@ -536,7 +536,7 @@ if not price_df_filtered.empty:
                         bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
                     )
                 
-                ax_curve.set_title(f'Market Price Curve vs. PCA Fair Price Curve on {analysis_date.strftime("%Y-%m-%d")}', fontsize=16)
+                ax_curve.set_title(f'Market Price Curve vs. PCA Fair Price Curve', fontsize=16)
                 ax_curve.set_xlabel('Contract Maturity')
                 ax_curve.set_ylabel('Price (100 - Rate)')
                 ax_curve.legend(loc='upper right')
@@ -545,8 +545,8 @@ if not price_df_filtered.empty:
                 plt.tight_layout()
                 st.pyplot(fig_curve)
                 
-                # --- Detailed Contract Price/Rate Table (New Feature) ---
-                st.subheader("5.1 Detailed Contract Prices and Mispricing")
+                # --- Detailed Contract Price/Rate Table (Outright) ---
+                st.markdown("###### Outright Price and Rate Mispricing")
                 
                 # Create the detailed table
                 detailed_comparison = curve_comparison.copy()
@@ -584,83 +584,176 @@ if not price_df_filtered.empty:
                 )
                 
         except KeyError:
-            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data. Please choose a different date within the historical range.")
+            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Outright Prices. Please choose a different date within the historical range.")
+
         
-        # --- Historical Time Series Comparison ---
-        st.header("6. Historical Time Series Comparison")
-        st.markdown(f"These plots compare the historical path of the market data against the PCA-reconstructed 'Fair' paths using the selected **{pc_count}** Principal Components.")
+        # --- 5.2 Spread Snapshot ---
+        st.subheader("5.2 Spread Snapshot")
 
-
-        def plot_historical_comparison(df, title, y_label):
-            df = df.dropna() 
-            if df.empty:
-                st.warning(f"No complete data points available to plot for {title}.")
-                return None
-                
-            fig, ax = plt.subplots(figsize=(15, 7))
+        try:
+            # 1. Select the single day's data, ensuring DataFrame structure
+            spread_snapshot_original = historical_spreads_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
+            spread_snapshot_pca = historical_spreads_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
             
-            original_cols = [col for col in df.columns if '(Original)' in col]
-            pca_cols = [col for col in df.columns if '(PCA)' in col]
-            
-            # Plot Original Data (thin, dashed, gray/darker)
-            df[original_cols].plot(ax=ax, legend=False, linestyle='-', alpha=0.4, color='darkgray', linewidth=1.5)
-            
-            # Plot PCA Reconstructed Data (thicker, solid, colored)
-            df[pca_cols].plot(ax=ax, legend=False, linestyle='-', linewidth=2.5)
+            # 2. Rename column (which is the datetime key) and clean the index labels
+            spread_snapshot_original.columns = ['Original']
+            spread_snapshot_original.index = spread_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
 
-            # Re-plot one Original column for a clear legend entry
-            if original_cols:
-                original_legend_label = 'Original Market Data'
-                df[original_cols[0]].plot(ax=ax, linestyle='--', color='black', alpha=0.6, label=original_legend_label, linewidth=1.5)
+            spread_snapshot_pca.columns = ['PCA Fair']
+            spread_snapshot_pca.index = spread_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
 
-            # Setup legend for PCA lines and one original line
-            if pca_cols:
-                pca_legend_lines = ax.lines[-len(pca_cols):]
-                original_line_for_legend = ax.lines[-len(pca_cols) - 1]
+            # 3. Concatenate and drop NaNs
+            spread_comparison = pd.concat([spread_snapshot_original, spread_snapshot_pca], axis=1).dropna()
+            
+            if spread_comparison.empty:
+                st.warning(f"No complete Spread data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
+            else:
+                # --- Plot the Spreads ---
+                fig_spread, ax_spread = plt.subplots(figsize=(15, 7))
                 
-                all_lines = [original_line_for_legend] + pca_legend_lines
-                all_labels = [col.replace(' (PCA)', ' (PCA Fair)') for col in pca_cols]
+                # Plot Original Spread
+                ax_spread.plot(spread_comparison.index, spread_comparison['Original'], 
+                              label='Original Market Spread', marker='o', linestyle='-', linewidth=2.5, color='darkgreen')
                 
-                ax.legend(all_lines, ['Original Market Data'] + all_labels, loc='best', ncol=4, fontsize='small')
+                # Plot PCA Fair Spread
+                ax_spread.plot(spread_comparison.index, spread_comparison['PCA Fair'], 
+                              label=f'PCA Fair Spread ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='orange')
+                
+                # Plot Mispricing (Original - PCA Fair)
+                mispricing = spread_comparison['Original'] - spread_comparison['PCA Fair']
+                ax_spread.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) # Add zero line for reference
+                
+                # Annotate the spread with the largest absolute mispricing
+                max_abs_mispricing = mispricing.abs().max()
+                if max_abs_mispricing > 0:
+                    mispricing_spread = mispricing.abs().idxmax()
+                    mispricing_value = mispricing.loc[mispricing_spread] * 10000 # Convert to BPS
                     
-            ax.set_title(title, fontsize=16)
-            ax.set_xlabel('Date')
-            ax.set_ylabel(y_label)
-            ax.grid(True, linestyle=':', alpha=0.6)
-            return fig
+                    ax_spread.annotate(
+                        f"Mispricing: {mispricing_value:.2f} BPS",
+                        (mispricing_spread, spread_comparison.loc[mispricing_spread]['Original']),
+                        textcoords="offset points",
+                        xytext=(0, 10),
+                        ha='center',
+                        fontsize=10,
+                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
+                    )
+                
+                ax_spread.set_title('Market Spread vs. PCA Fair Spread', fontsize=16)
+                ax_spread.set_xlabel('Spread Contract (Short-Long)')
+                ax_spread.set_ylabel('Spread Value (Price Difference)')
+                ax_spread.legend(loc='upper right')
+                ax_spread.grid(True, linestyle=':', alpha=0.6)
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                st.pyplot(fig_spread)
+                
+                # --- Detailed Spread Table ---
+                st.markdown("###### Spread Mispricing")
+                detailed_comparison_spread = spread_comparison.copy()
+                detailed_comparison_spread.index.name = 'Spread Contract'
+                detailed_comparison_spread['Mispricing (BPS)'] = mispricing * 10000
+                detailed_comparison_spread = detailed_comparison_spread.rename(
+                    columns={'Original': 'Original Spread', 'PCA Fair': 'PCA Fair Spread'}
+                )
+                
+                st.dataframe(
+                    detailed_comparison_spread.style.format({
+                        'Original Spread': "{:.4f}",
+                        'PCA Fair Spread': "{:.4f}",
+                        'Mispricing (BPS)': "{:.2f}"
+                    }),
+                    use_container_width=True
+                )
 
-        # 6.1 Outrights Plot
-        st.subheader("6.1 Historical Outright Prices")
-        fig_outrights = plot_historical_comparison(
-            historical_outrights_df, 
-            'Historical Outright Prices Time Series', 
-            'Price'
-        )
-        if fig_outrights:
-            st.pyplot(fig_outrights)
+        except KeyError:
+            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Spreads. Please choose a different date within the historical range.")
 
-        # 6.2 Spreads Plot
-        st.subheader("6.2 Historical Spreads")
-        fig_spreads = plot_historical_comparison(
-            historical_spreads_df, 
-            'Historical Spreads Time Series', 
-            'Spread Value (Price Difference)'
-        )
-        if fig_spreads:
-            st.pyplot(fig_spreads)
 
-        # 6.3 Flies Plot
+        # --- 5.3 Butterfly (Fly) Snapshot ---
         if not historical_butterflies_df.empty:
-            st.subheader("6.3 Historical Butterflies (Flies)")
-            fig_flies = plot_historical_comparison(
-                historical_butterflies_df, 
-                'Historical Butterflies Time Series', 
-                'Fly Value'
-            )
-            if fig_flies:
-                st.pyplot(fig_flies)
+            st.subheader("5.3 Butterfly (Fly) Snapshot")
+
+            try:
+                # 1. Select the single day's data, ensuring DataFrame structure
+                fly_snapshot_original = historical_butterflies_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
+                fly_snapshot_pca = historical_butterflies_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
+                
+                # 2. Rename column (which is the datetime key) and clean the index labels
+                fly_snapshot_original.columns = ['Original']
+                fly_snapshot_original.index = fly_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
+
+                fly_snapshot_pca.columns = ['PCA Fair']
+                fly_snapshot_pca.index = fly_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
+
+                # 3. Concatenate and drop NaNs
+                fly_comparison = pd.concat([fly_snapshot_original, fly_snapshot_pca], axis=1).dropna()
+                
+                if fly_comparison.empty:
+                    st.warning(f"No complete Butterfly (Fly) data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
+                else:
+                    # --- Plot the Flies ---
+                    fig_fly, ax_fly = plt.subplots(figsize=(15, 7))
+                    
+                    # Plot Original Fly
+                    ax_fly.plot(fly_comparison.index, fly_comparison['Original'], 
+                                  label='Original Market Fly', marker='o', linestyle='-', linewidth=2.5, color='purple')
+                    
+                    # Plot PCA Fair Fly
+                    ax_fly.plot(fly_comparison.index, fly_comparison['PCA Fair'], 
+                                  label=f'PCA Fair Fly ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='brown')
+                    
+                    # Plot Mispricing (Original - PCA Fair)
+                    mispricing = fly_comparison['Original'] - fly_comparison['PCA Fair']
+                    ax_fly.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) # Add zero line for reference
+                    
+                    # Annotate the fly with the largest absolute mispricing
+                    max_abs_mispricing = mispricing.abs().max()
+                    if max_abs_mispricing > 0:
+                        mispricing_fly = mispricing.abs().idxmax()
+                        mispricing_value = mispricing.loc[mispricing_fly] * 10000 # Convert to BPS
+                        
+                        ax_fly.annotate(
+                            f"Mispricing: {mispricing_value:.2f} BPS",
+                            (mispricing_fly, fly_comparison.loc[mispricing_fly]['Original']),
+                            textcoords="offset points",
+                            xytext=(0, 10),
+                            ha='center',
+                            fontsize=10,
+                            bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
+                        )
+                    
+                    ax_fly.set_title('Market Butterfly vs. PCA Fair Butterfly', fontsize=16)
+                    ax_fly.set_xlabel('Butterfly Contract (C1-2xC2+C3)')
+                    ax_fly.set_ylabel('Butterfly Value')
+                    ax_fly.legend(loc='upper right')
+                    ax_fly.grid(True, linestyle=':', alpha=0.6)
+                    plt.xticks(rotation=45, ha='right')
+                    plt.tight_layout()
+                    st.pyplot(fig_fly)
+
+                    # --- Detailed Fly Table ---
+                    st.markdown("###### Butterfly (Fly) Mispricing")
+                    detailed_comparison_fly = fly_comparison.copy()
+                    detailed_comparison_fly.index.name = 'Butterfly Contract'
+                    detailed_comparison_fly['Mispricing (BPS)'] = mispricing * 10000
+                    detailed_comparison_fly = detailed_comparison_fly.rename(
+                        columns={'Original': 'Original Fly', 'PCA Fair': 'PCA Fair Fly'}
+                    )
+                    
+                    st.dataframe(
+                        detailed_comparison_fly.style.format({
+                            'Original Fly': "{:.4f}",
+                            'PCA Fair Fly': "{:.4f}",
+                            'Mispricing (BPS)': "{:.2f}"
+                        }),
+                        use_container_width=True
+                    )
+
+            except KeyError:
+                st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Butterflies. Please choose a different date within the historical range.")
         else:
-            st.info("Not enough contracts (need 3 or more) to calculate and plot butterflies.")
+            st.info("Not enough contracts (need 3 or more) to calculate and plot butterfly snapshot.")
             
     else:
         st.error("PCA failed. Please check your data quantity and quality.")
