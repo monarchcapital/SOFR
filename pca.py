@@ -1,382 +1,759 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
-import base64
-from io import BytesIO
-from datetime import datetime
+from datetime import datetime, date
 
 # --- Configuration ---
-SOFR_RATES_FILE = 'sofr rates.csv'
-EXPIRY_FILE = 'EXPIRY (2).csv'
+st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
 
-# --- Helper Functions ---
+# --- Helper Functions for Data Processing ---
 
-def load_data():
-    """Loads required CSV data (SOFR rates and expiry dates)."""
-    print(f"Loading data from '{SOFR_RATES_FILE}' and '{EXPIRY_FILE}'...")
+def load_data(uploaded_file):
+    """Loads CSV data into a DataFrame, adapting to price or expiry file formats."""
+    if uploaded_file is None:
+        return None
+        
     try:
-        # Load Price File
-        df_prices = pd.read_csv(
-            SOFR_RATES_FILE,
-            index_col='Date',
-            parse_dates=True
+        # Read the uploaded file content to inspect the header for format identification
+        uploaded_file.seek(0)
+        file_content = uploaded_file.getvalue().decode("utf-8")
+        uploaded_file.seek(0)
+            
+        # --- Case 1: Expiry File (EXPIRY (2).csv format: MATURITY, DATE) ---
+        if 'MATURITY,DATE' in file_content.split('\n')[0].upper():
+            df = pd.read_csv(uploaded_file, sep=',')
+            df = df.rename(columns={'MATURITY': 'Contract', 'DATE': 'ExpiryDate'})
+            # Ensure Contract is the index and Date is datetime
+            df = df.set_index('Contract')
+            df['ExpiryDate'] = pd.to_datetime(df['ExpiryDate'])
+            df.index.name = 'Contract'
+            return df
+
+        # --- Case 2: Price File (sofr rates.csv format: Date as index) ---
+        df = pd.read_csv(
+            uploaded_file, 
+            index_col=0, 
+            parse_dates=True,
+            sep=',', # Explicitly specify comma as separator
+            header=0 # Ensure the first row is used as the header
         )
-        # Load Expiry File
-        df_expiry = pd.read_csv(EXPIRY_FILE)
-        df_expiry = df_expiry.rename(columns={'MATURITY': 'Contract', 'DATE': 'ExpiryDate'})
-        df_expiry = df_expiry.set_index('Contract')
-        df_expiry['ExpiryDate'] = pd.to_datetime(df_expiry['ExpiryDate'])
+        
+        df.index.name = 'Date'
+        
+        # Drop columns that are entirely NaN
+        df = df.dropna(axis=1, how='all')
+        
+        # Convert all price columns to numeric, coercing errors to NaN
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        # Filter out any remaining rows where the index date is NaT or the row is entirely NaN
+        df = df.dropna(how='all')
+        df = df[df.index.notna()]
 
-    except FileNotFoundError as e:
-        print(f"Error: Required file not found: {e.filename}. Please ensure both files are available.")
-        return None, None
+        if df.empty or df.shape[1] == 0:
+             raise ValueError("DataFrame is empty after processing or has no data columns.")
+             
+        return df
+        
     except Exception as e:
-        print(f"An error occurred during data loading: {e}")
-        return None, None
-
-    # Cleaning and Preprocessing for Prices
-    df_prices.dropna(axis=1, how='all', inplace=True)
-    df_prices.fillna(method='ffill', inplace=True)
-    df_prices.fillna(method='bfill', inplace=True)
-    df_prices.dropna(axis=0, how='any', inplace=True)
-
-    if df_prices.empty:
-        print("Error: Price DataFrame is empty after cleaning. Cannot proceed.")
-        return None, None
-
-    return df_prices, df_expiry
-
-def calculate_pca(df_prices, n_components=5):
-    """Calculates PCA on daily changes (returns) of SOFR outright contracts."""
-
-    # Calculate Daily Changes (Returns)
-    df_changes = df_prices.diff().dropna()
-    X = df_changes.values
-    maturity_labels = df_prices.columns.tolist()
-
-    if X.shape[0] < 2:
-        print("Error: Not enough data points to calculate PCA after differencing.")
-        return None, None, None, None, None
-
-    # Standardize data (crucial for volatility-based PCA)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Perform PCA
-    pca = PCA(n_components=n_components)
-    pca.fit(X_scaled)
-    X_pca = pca.transform(X_scaled)
-
-
-    # Prepare results
-    df_loadings = pd.DataFrame(
-        pca.components_,
-        columns=maturity_labels,
-        index=[f"PC{i+1}" for i in range(n_components)]
-    )
-
-    df_factors = pd.DataFrame(
-        X_pca,
-        index=df_changes.index,
-        columns=[f"PC{i+1}" for i in range(n_components)]
-    )
-
-    explained_variance = pca.explained_variance_ratio_
-
-    # Return transposed loadings for better table printing
-    return df_loadings.T, df_factors, explained_variance, scaler, pca
-
-
-def prepare_butterflies(df_prices, df_expiry):
-    """Creates butterfly spreads (3 contracts) and their time-to-maturity."""
-    contracts = df_prices.columns.tolist()
-    butterflies = {}
-
-    # Generate all 3-contract flies (k-1, k, k+1)
-    for i in range(1, len(contracts) - 1):
-        front = contracts[i-1]
-        mid = contracts[i]
-        back = contracts[i+1]
-
-        # Check if all contracts exist in the expiry data for maturity calculations
-        if front in df_expiry.index and mid in df_expiry.index and back in df_expiry.index:
-            # Fly calculation: Front - 2*Mid + Back
-            fly_prices = df_prices[front] - 2 * df_prices[mid] + df_prices[back]
-            fly_name = f"{front}-{mid}-{back}"
-            butterflies[fly_name] = fly_prices.dropna()
-
-    if not butterflies:
-        print("Warning: No valid butterfly spreads could be constructed.")
-        return None, None
-
-    df_butterflies = pd.DataFrame(butterflies)
-
-    # Calculate time-to-maturity for the mid-leg of each fly
-    maturity_data = {}
-    for fly_name, fly_series in df_butterflies.items():
-        mid_contract = fly_name.split('-')[1]
-
-        # Only proceed if we have expiry data
-        if mid_contract in df_expiry.index:
-            expiry_date = df_expiry.loc[mid_contract, 'ExpiryDate']
-
-            # Use the date index of the fly series to calculate days to maturity
-            days_to_maturity = (expiry_date - fly_series.index).days / 365.25
-            maturity_data[fly_name] = days_to_maturity
-
-    df_maturity = pd.DataFrame(maturity_data)
-
-    return df_butterflies, df_maturity
-
-def calculate_mispricing(df_prices, df_loadings, df_factors, scaler, pca, analysis_date):
-    """
-    Calculates the 'fair' butterfly price based on the top two principal components
-    and determines the mispricing on a specific analysis date.
-    """
-
-    if analysis_date not in df_factors.index:
-        print(f"Error: Analysis date {analysis_date.strftime('%Y-%m-%d')} not found in PCA factors.")
-        return None, None, None
-
-    # 1. Get Outright Prices (Original and PCA Fair)
-
-    # The actual outright price changes on the analysis date
-    outright_changes = df_prices.diff().loc[analysis_date].values.reshape(1, -1)
-
-    # Standardize the changes using the original scaler
-    outright_changes_scaled = scaler.transform(outright_changes)
-
-    # Project actual changes onto all PCs
-    actual_factors = pca.transform(outright_changes_scaled)
-
-    # Reconstitute using ONLY the top 2 PCs (PC1/Level and PC2/Slope)
-    # Step 1: Zero out all factors beyond PC2
-    factors_2pc = actual_factors.copy()
-    factors_2pc[:, 2:] = 0 # Zero out PC3, PC4, ...
-
-    # Step 2: Inverse transform to get the 2PC-only imputed *changes*
-    imputed_changes_scaled = pca.inverse_transform(factors_2pc)
-
-    # Step 3: Inverse the scaling to get the 2PC-only imputed *price changes*
-    imputed_changes_2pc = scaler.inverse_transform(imputed_changes_scaled)
-
-    # Get the original outright prices (LEVEL) on the analysis date
-    original_outright_prices = df_prices.loc[analysis_date].copy()
-
-    # Find the outright prices for the day BEFORE the analysis date to reconstruct the level
-    prev_date_idx = df_prices.index.get_loc(analysis_date) - 1
-    if prev_date_idx < 0:
-        print("Error: No previous day data available for reconstruction.")
-        return None, None, None
-
-    prev_date_prices = df_prices.iloc[prev_date_idx]
-
-    # Reconstituted outright prices (LEVEL) based on 2PC-only changes
-    # Reconstituted Price = Prev Day Price + 2PC-Imputed Change
-    reconstituted_outright_prices_2pc = prev_date_prices + imputed_changes_2pc[0]
-
-    # 2. Calculate Original and PCA Fair Butterfly Prices
-
-    butterfly_comparison = {}
-
-    # Get the contract list
-    contracts = df_prices.columns.tolist()
-
-    for i in range(1, len(contracts) - 1):
-        front = contracts[i-1]
-        mid = contracts[i]
-        back = contracts[i+1]
-        fly_name = f"{front}-{mid}-{back}"
-
-        # Original Fly Price = Front - 2*Mid + Back (using original prices)
-        original_fly = (original_outright_prices[front] -
-                        2 * original_outright_prices[mid] +
-                        original_outright_prices[back])
-
-        # PCA Fair Fly Price = Front - 2*Mid + Back (using 2PC-only prices)
-        pca_fair_fly = (reconstituted_outright_prices_2pc[front] -
-                        2 * reconstituted_outright_prices_2pc[mid] +
-                        reconstituted_outright_prices_2pc[back])
-
-        # Mispricing is the difference
-        mispricing = original_fly - pca_fair_fly
-
-        butterfly_comparison[fly_name] = {
-            'Original': original_fly,
-            'PCA Fair': pca_fair_fly,
-            'Mispricing': mispricing
-        }
-
-    df_comparison = pd.DataFrame.from_dict(butterfly_comparison, orient='index')
-
-    return df_comparison, original_outright_prices, reconstituted_outright_prices_2pc
-
-def plot_mispricing(df_comparison, df_maturity, analysis_date):
-    """Generates a base64 image of the butterfly mispricing vs time-to-maturity."""
-
-    # Ensure the maturity data aligns with the comparison data's index
-    valid_flies = df_comparison.index.intersection(df_maturity.columns)
-
-    if valid_flies.empty:
-        print("Warning: Cannot plot mispricing. No overlapping contracts between comparison and maturity data.")
+        st.error(f"Error loading and processing data from {uploaded_file.name}: {e}")
         return None
 
-    df_plot = df_comparison.loc[valid_flies].copy()
 
-    # Get Time-to-Maturity (in years) for the mid-leg of the fly on the analysis date
-    time_to_maturity = df_maturity.loc[analysis_date, valid_flies]
+def get_analysis_contracts(expiry_df, analysis_date):
+    """
+    Filters contract codes that expire on or after the analysis date and returns
+    them in chronological order with their expiry date. This list defines the 
+    maturities used in the analysis curve (e.g., Z20, H21, M21...).
+    """
+    if expiry_df is None:
+        return pd.DataFrame()
+    
+    # Filter contracts that expire on or after the analysis date
+    future_expiries = expiry_df[expiry_df['ExpiryDate'] >= analysis_date].copy()
+    
+    if future_expiries.empty:
+        st.warning(f"No contracts found expiring on or after {analysis_date.strftime('%Y-%m-%d')}.")
+        return pd.DataFrame()
 
-    # Convert mispricing to BPS (Basis Points)
-    df_plot['Mispricing (BPS)'] = df_plot['Mispricing'] * 10000
-    df_plot['Time to Maturity (Years)'] = time_to_maturity
+    # Sort by expiry date
+    future_expiries = future_expiries.sort_values(by='ExpiryDate')
+    
+    return future_expiries
 
-    plt.figure(figsize=(12, 7))
-    sns.set_style("whitegrid")
+def transform_to_analysis_curve(price_df, future_expiries_df):
+    """
+    Transforms the price DataFrame to only include relevant contracts in maturity order.
+    The column names are kept as the original contract codes (e.g., Z20, H21).
+    """
+    if price_df is None or future_expiries_df.empty:
+        return pd.DataFrame(), []
 
-    # Plotting Mispricing vs Time-to-Maturity
-    # Use a diverging color map to show positive/negative mispricing
-    plt.scatter(
-        df_plot['Time to Maturity (Years)'],
-        df_plot['Mispricing (BPS)'],
-        c=df_plot['Mispricing (BPS)'],
-        cmap='coolwarm',
-        s=150, # size of points
-        edgecolors='k',
-        alpha=0.7
+    contract_order = future_expiries_df.index.tolist()
+    
+    # Filter price columns to only include those present in the contract order
+    valid_contracts = [c for c in contract_order if c in price_df.columns]
+    
+    if not valid_contracts:
+        st.warning("No matching contract columns found in price data for the selected analysis date range.")
+        return pd.DataFrame(), []
+
+    # Filter the price data to only include valid, ordered contract columns
+    analysis_curve_df = price_df[valid_contracts]
+    
+    return analysis_curve_df, valid_contracts
+
+def calculate_outright_spreads(analysis_curve_df):
+    """
+    Calculates the first differences (spreads) on a CME basis: C1 - C2, C2 - C3, etc.
+    The labels now use the contract codes (e.g., Z20-H21).
+    """
+    if analysis_curve_df.empty:
+        return pd.DataFrame()
+
+    num_contracts = analysis_curve_df.shape[1]
+    spreads_data = {}
+    
+    for i in range(num_contracts - 1):
+        # CME Basis: Shorter maturity minus longer maturity
+        short_maturity = analysis_curve_df.columns[i]
+        long_maturity = analysis_curve_df.columns[i+1]
+        
+        spread_label = f"{short_maturity}-{long_maturity}"
+        
+        spreads_data[spread_label] = analysis_curve_df.iloc[:, i] - analysis_curve_df.iloc[:, i+1]
+        
+    return pd.DataFrame(spreads_data)
+
+def calculate_butterflies(analysis_curve_df):
+    """
+    Calculates butterflies (flies) on a CME basis: (C1 - C2) - (C2 - C3) = C1 - 2*C2 + C3, etc.
+    The labels now use the contract codes (e.g., Z20-2xH21+M21).
+    """
+    if analysis_curve_df.empty or analysis_curve_df.shape[1] < 3:
+        return pd.DataFrame()
+
+    num_contracts = analysis_curve_df.shape[1]
+    flies_data = {}
+
+    for i in range(num_contracts - 2):
+        short_maturity = analysis_curve_df.columns[i]    # C1
+        center_maturity = analysis_curve_df.columns[i+1] # C2
+        long_maturity = analysis_curve_df.columns[i+2]   # C3
+
+        # Fly = C1 - 2*C2 + C3
+        fly_label = f"{short_maturity}-2x{center_maturity}+{long_maturity}"
+
+        flies_data[fly_label] = analysis_curve_df.iloc[:, i] - 2 * analysis_curve_df.iloc[:, i+1] + analysis_curve_df.iloc[:, i+2]
+
+    return pd.DataFrame(flies_data)
+
+def perform_pca(data_df):
+    """Performs PCA on the input DataFrame (expected to be spreads)."""
+    # Drop rows with NaNs before standardization and PCA
+    data_df_clean = data_df.dropna()
+    
+    if data_df_clean.empty or data_df_clean.shape[0] < data_df_clean.shape[1]:
+        st.error("Not enough complete data points (rows) to perform PCA on the spreads after dropping NaNs.")
+        return None, None, None, None
+
+    # Standardize the data (PCA is sensitive to scale)
+    data_mean = data_df_clean.mean()
+    data_std = data_df_clean.std()
+    data_scaled = (data_df_clean - data_mean) / data_std
+    
+    # Determine optimal number of components (min(n_samples, n_features))
+    n_components = min(data_scaled.shape)
+
+    pca = PCA(n_components=n_components)
+    pca.fit(data_scaled)
+    
+    # Component Loadings (the eigenvectors * sqrt(eigenvalues))
+    loadings = pd.DataFrame(
+        pca.components_.T,
+        columns=[f'PC{i+1}' for i in range(n_components)],
+        index=data_df_clean.columns
     )
+    
+    explained_variance = pca.explained_variance_ratio_
+    
+    # Principal Component Scores (the transformed data)
+    scores = pd.DataFrame(
+        pca.transform(data_scaled),
+        index=data_df_clean.index,
+        columns=[f'PC{i+1}' for i in range(n_components)]
+    )
+    
+    return loadings, explained_variance, scores, data_df_clean
 
-    # Label the points with the mid-contract name
-    for i, row in df_plot.iterrows():
-        mid_contract = i.split('-')[1]
-        plt.annotate(
-            mid_contract,
-            (row['Time to Maturity (Years)'] + 0.05, row['Mispricing (BPS)']),
-            fontsize=9
+def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_df, spreads_df, butterflies_df):
+    """
+    Reconstructs Outright Prices and Derivatives historically using reconstructed spreads,
+    anchored to the original nearest contract price path (Level factor).
+    """
+    # Filter the analysis_curve_df to match the index of the reconstructed spreads
+    analysis_curve_df_aligned = analysis_curve_df.loc[reconstructed_spreads_df.index]
+    
+    # --- 1. Reconstruct Outright Prices ---
+    
+    # Anchor the entire curve reconstruction to the original historical nearest contract price path
+    nearest_contract_original = analysis_curve_df_aligned.iloc[:, 0]
+    nearest_contract_label = analysis_curve_df_aligned.columns[0]
+    
+    # Initialize the reconstructed prices DataFrame, starting with the original as the Level anchor
+    reconstructed_prices_df = pd.DataFrame(index=analysis_curve_df_aligned.index)
+    reconstructed_prices_df[nearest_contract_label + ' (PCA)'] = nearest_contract_original
+    
+    # Iterate through all maturities starting from the second contract (index 1)
+    for i in range(1, len(analysis_curve_df_aligned.columns)):
+        prev_maturity = analysis_curve_df_aligned.columns[i-1]
+        current_maturity = analysis_curve_df_aligned.columns[i]
+        spread_label = f"{prev_maturity}-{current_maturity}"
+        
+        # Calculate the reconstructed price P_i using P_i-1 (PCA) and S_i-1,i (PCA)
+        # P_i = P_i-1 (PCA) - S_i-1,i (PCA)
+        reconstructed_prices_df[current_maturity + ' (PCA)'] = (
+            reconstructed_prices_df[prev_maturity + ' (PCA)'] - reconstructed_spreads_df[spread_label]
+        )
+        
+    # Merge original prices for comparison
+    original_price_rename = {col: col + ' (Original)' for col in analysis_curve_df_aligned.columns}
+    original_prices_df = analysis_curve_df_aligned.rename(columns=original_price_rename)
+    
+    historical_outrights = pd.merge(original_prices_df, reconstructed_prices_df, left_index=True, right_index=True)
+
+
+    # --- 2. Prepare Spreads for comparison ---
+    spreads_df_aligned = spreads_df.loc[reconstructed_spreads_df.index]
+    original_spread_rename = {col: col + ' (Original)' for col in spreads_df_aligned.columns}
+    pca_spread_rename = {col: col + ' (PCA)' for col in reconstructed_spreads_df.columns}
+
+    original_spreads = spreads_df_aligned.rename(columns=original_spread_rename)
+    pca_spreads = reconstructed_spreads_df.rename(columns=pca_spread_rename)
+    
+    historical_spreads = pd.merge(original_spreads, pca_spreads, left_index=True, right_index=True)
+    
+    
+    # --- 3. Reconstruct Butterflies ---
+    if butterflies_df.empty:
+        return historical_outrights, historical_spreads, pd.DataFrame()
+    
+    butterflies_df_aligned = butterflies_df.loc[reconstructed_spreads_df.index]
+        
+    reconstructed_butterflies = {}
+    for i in range(len(spreads_df.columns) - 1):
+        spread1_label = spreads_df.columns[i]
+        spread2_label = spreads_df.columns[i+1]
+        original_fly_label = butterflies_df.columns[i]
+        
+        # Reconstruct fly: Fly = Spread1_PCA - Spread2_PCA
+        reconstructed_butterflies[original_fly_label + ' (PCA)'] = (
+            reconstructed_spreads_df[spread1_label] - reconstructed_spreads_df[spread2_label]
         )
 
-    plt.axhline(0, color='grey', linestyle='--', linewidth=1.5)
-
-    plt.title(f'Butterfly Mispricing vs. Time-to-Maturity ({analysis_date.strftime("%Y-%m-%d")})',
-              fontsize=16)
-    plt.xlabel('Time to Mid-Contract Maturity (Years)', fontsize=14)
-    plt.ylabel('Mispricing (Basis Points)', fontsize=14)
-    plt.colorbar(label='Mispricing (BPS)')
-    plt.tick_params(axis='both', which='major', labelsize=12)
-    plt.grid(True, linestyle=':', alpha=0.6)
-
-    plt.tight_layout()
-
-    # Encode plot to base64
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png')
-    plt.close(plt.gcf())
-    plot_data = base64.b64encode(buffer.getvalue()).decode()
-    return plot_data
-
-# Main function to execute the console analysis
-def run_full_pca_analysis():
-    print("="*80)
-    print("SOFR Futures PCA & Butterfly Mispricing Analysis (Console Output)")
-    print("="*80)
-
-    df_prices, df_expiry = load_data()
-
-    if df_prices is None or df_expiry is None:
-        return
-
-    # Use the latest available date for analysis
-    analysis_date = df_prices.index[-1]
-    print(f"\nAnalysis Date automatically set to the latest data point: {analysis_date.strftime('%Y-%m-%d')}")
-
-    # --- 1. Outright PCA Calculation ---
-    n_components = min(df_prices.shape[1], 5) # Use max 5 components or fewer if less contracts
-    print(f"\n--- 1. Performing PCA on Outright Futures Changes using {n_components} components ---")
-    df_loadings, df_factors, explained_variance, scaler, pca = calculate_pca(df_prices, n_components)
-
-    if df_loadings is None:
-        print("PCA calculation failed. Exiting.")
-        return
-
-    # Print Explained Variance
-    print("\n##### Explained Variance Ratio #####")
-    cumulative_variance = np.cumsum(explained_variance)
-    for i in range(len(explained_variance)):
-        pc_name = ["Level (PC1)", "Slope (PC2)", "Curvature (PC3)"][i] if i < 3 else f"PC{i+1}"
-        print(f"{pc_name:<15}: {explained_variance[i]*100:.2f}% (Cumulative: {cumulative_variance[i]*100:.2f}%)")
-
-    # Plot Explained Variance (Scree Plot)
-    plt.figure(figsize=(10, 6))
-    plt.plot(np.arange(1, len(cumulative_variance) + 1), cumulative_variance,
-             marker='o', linestyle='-', color='#1e40af', linewidth=2)
-    plt.title('Cumulative Explained Variance (Scree Plot)', fontsize=16)
-    plt.xlabel('Number of Principal Components', fontsize=12)
-    plt.ylabel('Cumulative Variance Explained', fontsize=12)
-    plt.axhline(y=0.95, color='#b91c1c', linestyle='--', label='95% Threshold')
-    plt.xticks(np.arange(1, len(cumulative_variance) + 1, 1))
-    plt.grid(axis='y', linestyle='dotted', alpha=0.7)
-    plt.legend()
-    plt.tight_layout()
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png')
-    plt.close(plt.gcf())
-    plot_data_scree = base64.b64encode(buffer.getvalue()).decode()
-    print(f"\n\n\n{plot_data_scree}\n[End Image Data]")
-
-    # Print PC Loadings
-    print("\n##### Principal Component Loadings (Top 3 - Transposed) #####")
-    print("These are the weights (eigenvectors) of each contract on the first three risk factors.")
-    df_display_loadings = df_loadings.iloc[:, :3] # Select top 3 PCs
-    df_display_loadings.index.name = 'Contract'
-    print(df_display_loadings.to_markdown(floatfmt=".4f"))
+    reconstructed_butterflies_df = pd.DataFrame(reconstructed_butterflies, index=reconstructed_spreads_df.index)
+    
+    # Merge original flies for comparison
+    original_fly_rename = {col: col + ' (Original)' for col in butterflies_df_aligned.columns}
+    original_butterflies_df = butterflies_df_aligned.rename(columns=original_fly_rename)
+    
+    historical_butterflies = pd.merge(original_butterflies_df, reconstructed_butterflies_df, left_index=True, right_index=True)
+    
+    return historical_outrights, historical_spreads, historical_butterflies
 
 
-    # --- 2. Butterfly Spread Mispricing Calculation ---
-    print("\n--- 2. Calculating Butterfly Spreads and Mispricing ---")
+# --- Streamlit Application Layout ---
 
-    df_butterflies, df_maturity = prepare_butterflies(df_prices, df_expiry)
+st.title("SOFR Futures PCA Analyzer")
 
-    if df_butterflies is None:
-        return
+# --- Sidebar Inputs ---
+st.sidebar.header("1. Data Uploads")
+price_file = st.sidebar.file_uploader(
+    "Upload Historical Price Data (e.g., 'sofr rates.csv')", 
+    type=['csv'], 
+    key='price_upload'
+)
+expiry_file = st.sidebar.file_uploader(
+    "Upload Contract Expiry Dates (e.g., 'EXPIRY (2).csv')", 
+    type=['csv'], 
+    key='expiry_upload'
+)
 
-    # Calculate Mispricing
-    df_comparison, _, _ = calculate_mispricing(
-        df_prices, df_loadings, df_factors, scaler, pca, analysis_date
+# Initialize dataframes
+price_df = load_data(price_file)
+expiry_df = load_data(expiry_file)
+
+if price_df is not None and expiry_df is not None:
+    # --- Date Range Filter ---
+    st.sidebar.header("2. Historical Date Range")
+    min_date = price_df.index.min().date()
+    max_date = price_df.index.max().date()
+    
+    start_date, end_date = st.sidebar.date_input(
+        "Select Historical Data Range for PCA Calibration", 
+        value=[min_date, max_date],
+        min_value=min_date,
+        max_value=max_date
     )
-
-    if df_comparison is None:
-        print("Mispricing calculation failed. Exiting.")
-        return
-
-    print("\n##### Butterfly Mispricing (Original vs. 2PC Fair Price) #####")
-    print("Mispricing is calculated as Original Fly - PCA Fair Fly (2-factor model).")
-
-    # Prepare detailed comparison table
-    detailed_comparison_fly = df_comparison.copy()
-    detailed_comparison_fly.index.name = 'Butterfly Contract'
-    detailed_comparison_fly['Mispricing (BPS)'] = detailed_comparison_fly['Mispricing'] * 10000
-    detailed_comparison_fly = detailed_comparison_fly.rename(
-        columns={'Original': 'Original Fly', 'PCA Fair': 'PCA Fair Fly'}
+    
+    price_df_filtered = price_df[(price_df.index.date >= start_date) & (price_df.index.date <= end_date)]
+    
+    # --- Analysis Date Selector (Maturity Roll) ---
+    st.sidebar.header("3. Curve Analysis Date")
+    
+    # Analysis date should be within the historical range for stability
+    default_analysis_date = end_date
+    if default_analysis_date < min_date:
+        default_analysis_date = min_date
+        
+    analysis_date = st.sidebar.date_input(
+        "Select **Single Date** for Curve Snapshot", 
+        value=default_analysis_date,
+        min_value=min_date,
+        max_value=max_date,
+        key='analysis_date'
     )
-
-    # Add mid-contract maturity in years for context
-    time_to_maturity_series = df_maturity.loc[analysis_date, detailed_comparison_fly.index].rename('Time to Maturity (Years)')
-    detailed_comparison_fly = detailed_comparison_fly.join(time_to_maturity_series)
-
-    # Reorder columns and format output
-    output_columns = ['Original Fly', 'PCA Fair Fly', 'Mispricing (BPS)', 'Time to Maturity (Years)']
-    print(detailed_comparison_fly[output_columns].to_markdown(floatfmt=".4f"))
-
-
-    # Plot Mispricing vs Time-to-Maturity
-    plot_data_mispricing = plot_mispricing(df_comparison, df_maturity, analysis_date)
-
-    if plot_data_mispricing:
-        print(f"\n\n\n{plot_data_mispricing}\n[End Image Data]")
+    
+    # Ensure analysis_date is a datetime object for comparison
+    analysis_dt = datetime.combine(analysis_date, datetime.min.time())
+    
+else:
+    st.info("Please upload both the Price Data and Expiry Data CSV files to begin the analysis.")
+    st.stop()
 
 
-if __name__ == "__main__":
-    # The main execution block
-    run_full_pca_analysis()
+# --- Core Processing Logic ---
+if not price_df_filtered.empty:
+    
+    # 1. Get the list of relevant contracts based on the analysis date
+    future_expiries_df = get_analysis_contracts(expiry_df, analysis_dt)
+    
+    if future_expiries_df.empty:
+        st.warning("Could not establish a relevant contract curve. Please check your date filters.")
+        st.stop()
+        
+    # 2. Transform historical prices to the required maturity curve
+    analysis_curve_df, contract_labels = transform_to_analysis_curve(price_df_filtered, future_expiries_df)
+
+    if analysis_curve_df.empty:
+        st.warning("Data transformation failed. Check if contracts in the price file match contracts in the expiry file.")
+        st.stop()
+        
+    # 3. Calculate Spreads and Butterflies (Inputs for PCA and comparison)
+    st.header("1. Data Derivatives Check (Contracts relevant to selected Analysis Date)")
+    
+    # Calculate Spreads
+    spreads_df = calculate_outright_spreads(analysis_curve_df)
+    st.markdown("##### Outright Spreads (e.g., Z20-H21, H21-M21, etc.)")
+    st.dataframe(spreads_df.head(5))
+    
+    if spreads_df.empty:
+        st.warning("Spreads could not be calculated. Need at least two contracts in the analysis curve.")
+        st.stop()
+        
+    # Calculate Butterflies
+    butterflies_df = calculate_butterflies(analysis_curve_df)
+    st.markdown("##### Butterflies (e.g., Z20-2xH21+M21, etc.)")
+    st.dataframe(butterflies_df.head(5))
+
+    # 4. Perform PCA on Spreads
+    # PCA is performed only on spreads, as they are the most stationary features
+    loadings, explained_variance, scores, spreads_df_clean = perform_pca(spreads_df)
+
+    if loadings is not None:
+        
+        # --- Explained Variance Visualization ---
+        st.header("2. Explained Variance")
+        variance_df = pd.DataFrame({
+            'Principal Component': [f'PC{i+1}' for i in range(len(explained_variance))],
+            'Explained Variance (%)': explained_variance * 100
+        })
+        variance_df['Cumulative Variance (%)'] = variance_df['Explained Variance (%)'].cumsum()
+        
+        col_var, col_pca_select = st.columns([1, 1])
+        with col_var:
+            st.dataframe(variance_df, use_container_width=True)
+            
+        # Determine how many components to use for fair curve reconstruction
+        default_pc_count = min(3, len(explained_variance))
+        with col_pca_select:
+            st.subheader("Fair Curve Setup")
+            pc_count = st.slider(
+                "Select number of Principal Components (PCs) for Fair Curve:",
+                min_value=1,
+                max_value=len(explained_variance),
+                value=default_pc_count,
+                help="Typically, the first 3 components (Level, Slope, Curve) explain over 95% of variance in spread changes."
+            )
+            
+            total_explained = variance_df['Cumulative Variance (%)'].iloc[pc_count - 1]
+            st.info(f"The selected **{pc_count} PCs** explain **{total_explained:.2f}%** of the total variance in the spreads.")
+        
+        
+        # --- Component Loadings Heatmap ---
+        st.header("3. PC Loadings Heatmap (PC vs. Spreads)")
+        st.markdown("""
+            This heatmap shows the weights of the first few PCs on each **Spread**. These weights define the fundamental Level, Slope, and Curvature factors.
+        """)
+        
+        plt.style.use('default') 
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        loadings_plot = loadings.iloc[:, :default_pc_count]
+
+        sns.heatmap(
+            loadings_plot, 
+            annot=True, 
+            cmap='coolwarm', 
+            fmt=".2f", 
+            linewidths=0.5, 
+            linecolor='gray', 
+            cbar_kws={'label': 'Loading Weight'}
+        )
+        ax.set_title(f'Component Loadings for First {default_pc_count} Principal Components', fontsize=16)
+        ax.set_xlabel('Principal Component')
+        ax.set_ylabel('Spread Contract')
+        st.pyplot(fig)
+        
+        
+        # --- PC Scores Time Series Plot ---
+        def plot_pc_scores(scores_df, explained_variance):
+            """Plots the time series of the first 3 PC scores."""
+            
+            pc_labels = ['Level (PC1)', 'Slope (PC2)', 'Curvature (PC3)']
+            num_pcs = min(3, scores_df.shape[1])
+            if num_pcs == 0: return None
+
+            fig, axes = plt.subplots(nrows=num_pcs, ncols=1, figsize=(15, 4 * num_pcs), sharex=True)
+            if num_pcs == 1: axes = [axes] 
+
+            plt.suptitle("Time Series of Principal Component Scores (Risk Factors)", fontsize=16, y=1.02)
+
+            for i in range(num_pcs):
+                ax = axes[i]
+                pc_label = pc_labels[i]
+                variance_pct = explained_variance[i] * 100
+                
+                ax.plot(scores_df.index, scores_df.iloc[:, i], label=f'{pc_label} ({variance_pct:.2f}% Var.)', linewidth=1.5, color=plt.cm.tab10(i))
+                
+                ax.axhline(0, color='r', linestyle='--', linewidth=0.8)
+                
+                ax.set_title(f'{pc_label} Factor Score (Explaining {variance_pct:.2f}% of Spread Variance)', fontsize=14)
+                ax.grid(True, linestyle=':', alpha=0.6)
+                ax.set_ylabel('Score Value')
+                ax.legend(loc='upper left')
+                
+            plt.xlabel('Date')
+            plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+            return fig
+
+        st.header("4. PC Factor Scores Time Series")
+        st.markdown("This plot shows the historical movement of the **latent risk factors** (Level, Slope, and Curvature) over the chosen historical range.")
+        fig_scores = plot_pc_scores(scores, explained_variance)
+        if fig_scores:
+            st.pyplot(fig_scores)
+            
+        
+        # --- Historical Reconstruction ---
+        
+        # 1. Reconstruct Spreads using only selected PCs
+        data_mean = spreads_df_clean.mean()
+        data_std = spreads_df_clean.std()
+        scores_used = scores.values[:, :pc_count]
+        loadings_used = loadings.values[:, :pc_count]
+        
+        reconstructed_scaled = scores_used @ loadings_used.T
+        
+        reconstructed_spreads = pd.DataFrame(
+            reconstructed_scaled * data_std.values + data_mean.values,
+            index=spreads_df_clean.index, 
+            columns=spreads_df_clean.columns
+        )
+
+        # 2. Reconstruct Outright Prices, Spreads, and Flies
+        historical_outrights_df, historical_spreads_df, historical_butterflies_df = \
+            reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads, spreads_df, butterflies_df)
+
+        
+        
+        # --- NEW: Cross-Sectional Curve Plot for Single Date ---
+        st.header("5. Curve Snapshot Analysis: " + analysis_date.strftime('%Y-%m-%d'))
+        st.markdown("This section plots the **current market values** (Original) against the **PCA Fair curve/spread/fly** for the selected date. The vertical difference is the theoretical mispricing.")
+
+        # --- 5.1 Outright Price Snapshot ---
+        st.subheader("5.1 Outright Price Curve")
+        
+        # Get the single-day snapshot for Outright Prices
+        try:
+            # 1. Select the single day's data, ensuring DataFrame structure
+            curve_snapshot_original = historical_outrights_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
+            curve_snapshot_pca = historical_outrights_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
+            
+            # 2. Rename column (which is the datetime key) and clean the index labels
+            curve_snapshot_original.columns = ['Original']
+            curve_snapshot_original.index = curve_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
+
+            curve_snapshot_pca.columns = ['PCA Fair']
+            curve_snapshot_pca.index = curve_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
+
+            # 3. Concatenate and drop NaNs (if any value is missing for a contract)
+            curve_comparison = pd.concat([curve_snapshot_original, curve_snapshot_pca], axis=1).dropna()
+            
+            if curve_comparison.empty:
+                st.warning(f"No complete Outright Price data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
+            else:
+                # --- Plot the Curve ---
+                fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
+                
+                # Plot Original Curve
+                ax_curve.plot(curve_comparison.index, curve_comparison['Original'], 
+                              label='Original Market Curve', marker='o', linestyle='-', linewidth=2.5, color='blue')
+                
+                # Plot PCA Fair Curve
+                ax_curve.plot(curve_comparison.index, curve_comparison['PCA Fair'], 
+                              label=f'PCA Fair Curve ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='red')
+                
+                # Plot Mispricing (Original - PCA Fair)
+                mispricing = curve_comparison['Original'] - curve_comparison['PCA Fair']
+                
+                # Annotate the contracts with the largest absolute mispricing
+                max_abs_mispricing = mispricing.abs().max()
+                if max_abs_mispricing > 0:
+                    mispricing_contract = mispricing.abs().idxmax()
+                    mispricing_value = mispricing.loc[mispricing_contract] * 10000 # Convert to BPS
+                    
+                    ax_curve.annotate(
+                        f"Mispricing: {mispricing_value:.2f} BPS",
+                        (mispricing_contract, curve_comparison.loc[mispricing_contract]['Original']),
+                        textcoords="offset points",
+                        xytext=(0, 10),
+                        ha='center',
+                        fontsize=10,
+                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
+                    )
+                
+                ax_curve.set_title(f'Market Price Curve vs. PCA Fair Price Curve', fontsize=16)
+                ax_curve.set_xlabel('Contract Maturity')
+                ax_curve.set_ylabel('Price (100 - Rate)')
+                ax_curve.legend(loc='upper right')
+                ax_curve.grid(True, linestyle=':', alpha=0.6)
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                st.pyplot(fig_curve)
+                
+                # --- Detailed Contract Price/Rate Table (Outright) ---
+                st.markdown("###### Outright Price and Rate Mispricing")
+                
+                # Create the detailed table
+                detailed_comparison = curve_comparison.copy()
+                detailed_comparison.index.name = 'Contract'
+                
+                # Calculate Rates (Yields) and Mispricing in BPS
+                detailed_comparison['Original Rate (%)'] = 100.0 - detailed_comparison['Original']
+                detailed_comparison['PCA Fair Rate (%)'] = 100.0 - detailed_comparison['PCA Fair']
+                # Mispricing in Price terms (Original Price - PCA Fair Price) * 10,000 to get BPS
+                detailed_comparison['Mispricing (BPS)'] = (detailed_comparison['Original'] - detailed_comparison['PCA Fair']) * 10000
+
+                # Reorder columns and rename Price columns
+                detailed_comparison = detailed_comparison.rename(
+                    columns={'Original': 'Original Price', 'PCA Fair': 'PCA Fair Price'}
+                )
+                
+                detailed_comparison = detailed_comparison[[
+                    'Original Price', 
+                    'Original Rate (%)', 
+                    'PCA Fair Price', 
+                    'PCA Fair Rate (%)', 
+                    'Mispricing (BPS)'
+                ]]
+                
+                # Display the table, formatted for financial data
+                st.dataframe(
+                    detailed_comparison.style.format({
+                        'Original Price': "{:.4f}",
+                        'PCA Fair Price': "{:.4f}",
+                        'Original Rate (%)': "{:.4f}",
+                        'PCA Fair Rate (%)': "{:.4f}",
+                        'Mispricing (BPS)': "{:.2f}"
+                    }),
+                    use_container_width=True
+                )
+                
+        except KeyError:
+            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Outright Prices. Please choose a different date within the historical range.")
+
+        
+        # --- 5.2 Spread Snapshot ---
+        st.subheader("5.2 Spread Snapshot")
+
+        try:
+            # 1. Select the single day's data, ensuring DataFrame structure
+            spread_snapshot_original = historical_spreads_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
+            spread_snapshot_pca = historical_spreads_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
+            
+            # 2. Rename column (which is the datetime key) and clean the index labels
+            spread_snapshot_original.columns = ['Original']
+            spread_snapshot_original.index = spread_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
+
+            spread_snapshot_pca.columns = ['PCA Fair']
+            spread_snapshot_pca.index = spread_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
+
+            # 3. Concatenate and drop NaNs
+            spread_comparison = pd.concat([spread_snapshot_original, spread_snapshot_pca], axis=1).dropna()
+            
+            if spread_comparison.empty:
+                st.warning(f"No complete Spread data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
+            else:
+                # --- Plot the Spreads ---
+                fig_spread, ax_spread = plt.subplots(figsize=(15, 7))
+                
+                # Plot Original Spread
+                ax_spread.plot(spread_comparison.index, spread_comparison['Original'], 
+                              label='Original Market Spread', marker='o', linestyle='-', linewidth=2.5, color='darkgreen')
+                
+                # Plot PCA Fair Spread
+                ax_spread.plot(spread_comparison.index, spread_comparison['PCA Fair'], 
+                              label=f'PCA Fair Spread ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='orange')
+                
+                # Plot Mispricing (Original - PCA Fair)
+                mispricing = spread_comparison['Original'] - spread_comparison['PCA Fair']
+                ax_spread.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) # Add zero line for reference
+                
+                # Annotate the spread with the largest absolute mispricing
+                max_abs_mispricing = mispricing.abs().max()
+                if max_abs_mispricing > 0:
+                    mispricing_spread = mispricing.abs().idxmax()
+                    mispricing_value = mispricing.loc[mispricing_spread] * 10000 # Convert to BPS
+                    
+                    ax_spread.annotate(
+                        f"Mispricing: {mispricing_value:.2f} BPS",
+                        (mispricing_spread, spread_comparison.loc[mispricing_spread]['Original']),
+                        textcoords="offset points",
+                        xytext=(0, 10),
+                        ha='center',
+                        fontsize=10,
+                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
+                    )
+                
+                ax_spread.set_title('Market Spread vs. PCA Fair Spread', fontsize=16)
+                ax_spread.set_xlabel('Spread Contract (Short-Long)')
+                ax_spread.set_ylabel('Spread Value (Price Difference)')
+                ax_spread.legend(loc='upper right')
+                ax_spread.grid(True, linestyle=':', alpha=0.6)
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                st.pyplot(fig_spread)
+                
+                # --- Detailed Spread Table ---
+                st.markdown("###### Spread Mispricing")
+                detailed_comparison_spread = spread_comparison.copy()
+                detailed_comparison_spread.index.name = 'Spread Contract'
+                detailed_comparison_spread['Mispricing (BPS)'] = mispricing * 10000
+                detailed_comparison_spread = detailed_comparison_spread.rename(
+                    columns={'Original': 'Original Spread', 'PCA Fair': 'PCA Fair Spread'}
+                )
+                
+                st.dataframe(
+                    detailed_comparison_spread.style.format({
+                        'Original Spread': "{:.4f}",
+                        'PCA Fair Spread': "{:.4f}",
+                        'Mispricing (BPS)': "{:.2f}"
+                    }),
+                    use_container_width=True
+                )
+
+        except KeyError:
+            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Spreads. Please choose a different date within the historical range.")
+
+
+        # --- 5.3 Butterfly (Fly) Snapshot ---
+        if not historical_butterflies_df.empty:
+            st.subheader("5.3 Butterfly (Fly) Snapshot")
+
+            try:
+                # 1. Select the single day's data, ensuring DataFrame structure
+                fly_snapshot_original = historical_butterflies_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
+                fly_snapshot_pca = historical_butterflies_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
+                
+                # 2. Rename column (which is the datetime key) and clean the index labels
+                fly_snapshot_original.columns = ['Original']
+                fly_snapshot_original.index = fly_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
+
+                fly_snapshot_pca.columns = ['PCA Fair']
+                fly_snapshot_pca.index = fly_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
+
+                # 3. Concatenate and drop NaNs
+                fly_comparison = pd.concat([fly_snapshot_original, fly_snapshot_pca], axis=1).dropna()
+                
+                if fly_comparison.empty:
+                    st.warning(f"No complete Butterfly (Fly) data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
+                else:
+                    # --- Plot the Flies ---
+                    fig_fly, ax_fly = plt.subplots(figsize=(15, 7))
+                    
+                    # Plot Original Fly
+                    ax_fly.plot(fly_comparison.index, fly_comparison['Original'], 
+                                  label='Original Market Fly', marker='o', linestyle='-', linewidth=2.5, color='purple')
+                    
+                    # Plot PCA Fair Fly
+                    ax_fly.plot(fly_comparison.index, fly_comparison['PCA Fair'], 
+                                  label=f'PCA Fair Fly ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='brown')
+                    
+                    # Plot Mispricing (Original - PCA Fair)
+                    mispricing = fly_comparison['Original'] - fly_comparison['PCA Fair']
+                    ax_fly.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) # Add zero line for reference
+                    
+                    # Annotate the fly with the largest absolute mispricing
+                    max_abs_mispricing = mispricing.abs().max()
+                    if max_abs_mispricing > 0:
+                        mispricing_fly = mispricing.abs().idxmax()
+                        mispricing_value = mispricing.loc[mispricing_fly] * 10000 # Convert to BPS
+                        
+                        ax_fly.annotate(
+                            f"Mispricing: {mispricing_value:.2f} BPS",
+                            (mispricing_fly, fly_comparison.loc[mispricing_fly]['Original']),
+                            textcoords="offset points",
+                            xytext=(0, 10),
+                            ha='center',
+                            fontsize=10,
+                            bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
+                        )
+                    
+                    ax_fly.set_title('Market Butterfly vs. PCA Fair Butterfly', fontsize=16)
+                    ax_fly.set_xlabel('Butterfly Contract (C1-2xC2+C3)')
+                    ax_fly.set_ylabel('Butterfly Value')
+                    ax_fly.legend(loc='upper right')
+                    ax_fly.grid(True, linestyle=':', alpha=0.6)
+                    plt.xticks(rotation=45, ha='right')
+                    plt.tight_layout()
+                    st.pyplot(fig_fly)
+
+                    # --- Detailed Fly Table ---
+                    st.markdown("###### Butterfly (Fly) Mispricing")
+                    detailed_comparison_fly = fly_comparison.copy()
+                    detailed_comparison_fly.index.name = 'Butterfly Contract'
+                    detailed_comparison_fly['Mispricing (BPS)'] = mispricing * 10000
+                    detailed_comparison_fly = detailed_comparison_fly.rename(
+                        columns={'Original': 'Original Fly', 'PCA Fair': 'PCA Fair Fly'}
+                    )
+                    
+                    st.dataframe(
+                        detailed_comparison_fly.style.format({
+                            'Original Fly': "{:.4f}",
+                            'PCA Fair Fly': "{:.4f}",
+                            'Mispricing (BPS)': "{:.2f}"
+                        }),
+                        use_container_width=True
+                    )
+
+            except KeyError:
+                st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Butterflies. Please choose a different date within the historical range.")
+        else:
+            st.info("Not enough contracts (need 3 or more) to calculate and plot butterfly snapshot.")
+            
+    else:
+        st.error("PCA failed. Please check your data quantity and quality.")
