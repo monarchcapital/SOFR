@@ -190,6 +190,60 @@ def perform_pca(data_df):
     
     return loadings, explained_variance, scores, data_df_clean
 
+# --- NEW HELPER FUNCTION: Calculate Z-Scores ---
+def calculate_z_scores(scores_df, analysis_dt):
+    """Calculates Z-scores for the latest date relative to the historical scores."""
+    if scores_df.empty:
+        return None, None
+        
+    scores_mean = scores_df.mean()
+    scores_std = scores_df.std()
+    
+    # Calculate Z-scores for the entire historical period
+    z_scores_historical = (scores_df - scores_mean) / scores_std
+    
+    # Get the Z-score for the specific analysis date
+    try:
+        current_z_score = z_scores_historical.loc[[analysis_dt]].T
+        return z_scores_historical, current_z_score
+    except KeyError:
+        return z_scores_historical, None
+
+# --- NEW HELPER FUNCTION: Calculate Outright Loadings ---
+def calculate_outright_loadings(loadings_df, contract_labels):
+    """
+    Transforms spread loadings to outright price loadings (cumulative sum).
+    Anchor (P1) is set to 1.
+    """
+    if loadings_df.empty or not contract_labels:
+        return pd.DataFrame()
+        
+    # Initialize a DataFrame for outright loadings
+    outright_loadings = pd.DataFrame(
+        index=contract_labels, 
+        columns=loadings_df.columns
+    )
+    
+    for pc_col in loadings_df.columns:
+        # P1 is the anchor, its loading is 1.0 (assuming a 1-to-1 impact of Level factor)
+        outright_loadings.loc[contract_labels[0], pc_col] = 1.0 
+        
+        current_loading = 1.0 # P1 loading
+        
+        # Iterate through spread loadings (S1, S2, ...)
+        for i in range(loadings_df.shape[0]): 
+            spread_loading = loadings_df.iloc[i][pc_col]
+            
+            # P_long = P_short - S. Thus, L_P(i+1) = L_P(i) - L_S(i, i+1)
+            # The loading of the next contract is the previous contract's loading minus the spread loading
+            current_loading -= spread_loading 
+            
+            # The contract being calculated is P(i+1), which is at index i+1 in contract_labels
+            outright_loadings.loc[contract_labels[i+1], pc_col] = current_loading
+
+    return outright_loadings.astype(float)
+
+
 def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_df, spreads_df, butterflies_df):
     """
     Reconstructs Outright Prices and Derivatives historically using reconstructed spreads,
@@ -300,7 +354,11 @@ if price_df is not None and expiry_df is not None:
         max_value=max_date
     )
     
-    price_df_filtered = price_df[(price_df.index.date >= start_date) & (price_df.index.date <= end_date)]
+    # Ensure start_date and end_date are used as datetime objects for filtering
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.max.time())
+    
+    price_df_filtered = price_df[(price_df.index >= start_dt) & (price_df.index <= end_dt)]
     
     # --- Analysis Date Selector (Maturity Roll) ---
     st.sidebar.header("3. Curve Analysis Date")
@@ -349,7 +407,18 @@ if not price_df_filtered.empty:
     # Calculate Spreads
     spreads_df = calculate_outright_spreads(analysis_curve_df)
     st.markdown("##### Outright Spreads (e.g., Z20-H21, H21-M21, etc.)")
-    st.dataframe(spreads_df.head(5))
+    
+    # Display logic adjusted to show data around analysis date for better context
+    try:
+        idx = spreads_df.index.get_loc(analysis_dt, method='nearest')
+        start_idx = max(0, idx - 2)
+        end_idx = min(len(spreads_df), idx + 3)
+        st.dataframe(spreads_df.iloc[start_idx:end_idx].fillna('None'))
+        st.caption(f"Showing spreads around the Analysis Date: {analysis_date.strftime('%Y-%m-%d')}")
+    except KeyError:
+        st.dataframe(spreads_df.head(5).fillna('None'))
+        st.caption("Showing latest 5 dates (Analysis Date not found in spread data).")
+
     
     if spreads_df.empty:
         st.warning("Spreads could not be calculated. Need at least two contracts in the analysis curve.")
@@ -358,7 +427,18 @@ if not price_df_filtered.empty:
     # Calculate Butterflies
     butterflies_df = calculate_butterflies(analysis_curve_df)
     st.markdown("##### Butterflies (e.g., Z20-2xH21+M21, etc.)")
-    st.dataframe(butterflies_df.head(5))
+    
+    # Display logic adjusted to show data around analysis date for better context
+    try:
+        idx = butterflies_df.index.get_loc(analysis_dt, method='nearest')
+        start_idx = max(0, idx - 2)
+        end_idx = min(len(butterflies_df), idx + 3)
+        st.dataframe(butterflies_df.iloc[start_idx:end_idx].fillna('None'))
+        st.caption(f"Showing butterflies around the Analysis Date: {analysis_date.strftime('%Y-%m-%d')}")
+    except KeyError:
+        st.dataframe(butterflies_df.head(5).fillna('None'))
+        st.caption("Showing latest 5 dates (Analysis Date not found in butterfly data).")
+
 
     # 4. Perform PCA on Spreads
     # PCA is performed only on spreads, as they are the most stationary features
@@ -419,6 +499,39 @@ if not price_df_filtered.empty:
         ax.set_ylabel('Spread Contract')
         st.pyplot(fig)
         
+        # --- NEW SECTION 7: Outright Loadings Plot (Moved to be near Spread Loadings) ---
+        st.header("4. PC Loadings vs. Outright Contract Levels")
+        st.markdown("This plot shows the **impact** (sensitivity) of a 1-unit movement in each PC on the **outright price** of each contract.")
+        
+        outright_loadings_df = calculate_outright_loadings(loadings, contract_labels)
+        
+        if not outright_loadings_df.empty:
+            plt.style.use('default') 
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            # Plot the first 3 or default number of components
+            num_factors_to_plot = min(3, outright_loadings_df.shape[1]) 
+            
+            for i in range(num_factors_to_plot):
+                pc_label = f'PC{i+1}'
+                ax.plot(
+                    outright_loadings_df.index, 
+                    outright_loadings_df[pc_label], 
+                    marker='o', 
+                    linestyle='-', 
+                    label=pc_label
+                )
+                
+            ax.axhline(0, color='r', linestyle='--', linewidth=0.8)
+            ax.set_title(f'Impact of Factors (PC Loadings) on Outright Prices', fontsize=16)
+            ax.set_xlabel('Contract Maturity')
+            ax.set_ylabel('Outright Price Loading (Factor Sensitivity)')
+            ax.legend(loc='upper right')
+            ax.grid(True, linestyle=':', alpha=0.6)
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            st.pyplot(fig)
+
         
         # --- PC Scores Time Series Plot ---
         def plot_pc_scores(scores_df, explained_variance):
@@ -451,11 +564,32 @@ if not price_df_filtered.empty:
             plt.tight_layout(rect=[0, 0.03, 1, 0.98])
             return fig
 
-        st.header("4. PC Factor Scores Time Series")
+        st.header("5. PC Factor Scores Time Series")
         st.markdown("This plot shows the historical movement of the **latent risk factors** (Level, Slope, and Curvature) over the chosen historical range.")
         fig_scores = plot_pc_scores(scores, explained_variance)
         if fig_scores:
             st.pyplot(fig_scores)
+            
+        # --- NEW SECTION 6: PC Factor Z-Scores ---
+        st.header("6. PC Factor Z-Scores (Trading Signal)")
+        
+        z_scores_historical, current_z_score = calculate_z_scores(scores, analysis_dt)
+
+        if current_z_score is not None:
+            st.markdown(f"Z-Scores for the curve on **{analysis_date.strftime('%Y-%m-%d')}** relative to the historical distribution:")
+            
+            # Use the first few columns (PCs) for display
+            num_pcs_to_display = min(5, current_z_score.shape[0])
+            
+            st.dataframe(
+                current_z_score.T.iloc[:, :num_pcs_to_display].style.applymap(
+                    lambda x: 'background-color: #ffcccc' if abs(x) >= 2 else '', subset=current_z_score.index[:num_pcs_to_display]
+                ).format("{:.2f}"),
+                use_container_width=True
+            )
+            st.caption("A Z-score outside the $\pm 2.0$ range is often considered a statistical extreme (signal).")
+        else:
+             st.warning(f"Z-Score calculation skipped. Analysis Date {analysis_date.strftime('%Y-%m-%d')} not found in PC Scores data.")
             
         
         # --- Historical Reconstruction ---
@@ -480,12 +614,12 @@ if not price_df_filtered.empty:
 
         
         
-        # --- NEW: Cross-Sectional Curve Plot for Single Date ---
-        st.header("5. Curve Snapshot Analysis: " + analysis_date.strftime('%Y-%m-%d'))
+        # --- Cross-Sectional Curve Plot for Single Date ---
+        st.header("7. Curve Snapshot Analysis: " + analysis_date.strftime('%Y-%m-%d'))
         st.markdown("This section plots the **current market values** (Original) against the **PCA Fair curve/spread/fly** for the selected date. The vertical difference is the theoretical mispricing.")
 
-        # --- 5.1 Outright Price Snapshot ---
-        st.subheader("5.1 Outright Price Curve")
+        # --- 7.1 Outright Price Snapshot ---
+        st.subheader("7.1 Outright Price Curve")
         
         # Get the single-day snapshot for Outright Prices
         try:
@@ -587,8 +721,8 @@ if not price_df_filtered.empty:
             st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Outright Prices. Please choose a different date within the historical range.")
 
         
-        # --- 5.2 Spread Snapshot ---
-        st.subheader("5.2 Spread Snapshot")
+        # --- 7.2 Spread Snapshot ---
+        st.subheader("7.2 Spread Snapshot")
 
         try:
             # 1. Select the single day's data, ensuring DataFrame structure
@@ -670,9 +804,9 @@ if not price_df_filtered.empty:
             st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Spreads. Please choose a different date within the historical range.")
 
 
-        # --- 5.3 Butterfly (Fly) Snapshot ---
+        # --- 7.3 Butterfly (Fly) Snapshot ---
         if not historical_butterflies_df.empty:
-            st.subheader("5.3 Butterfly (Fly) Snapshot")
+            st.subheader("7.3 Butterfly (Fly) Snapshot")
 
             try:
                 # 1. Select the single day's data, ensuring DataFrame structure
