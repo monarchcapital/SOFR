@@ -294,7 +294,7 @@ if price_df is not None and expiry_df is not None:
     max_date = price_df.index.max().date()
     
     start_date, end_date = st.sidebar.date_input(
-        "Select Historical Data Range", 
+        "Select Historical Data Range for PCA Calibration", 
         value=[min_date, max_date],
         min_value=min_date,
         max_value=max_date
@@ -303,7 +303,7 @@ if price_df is not None and expiry_df is not None:
     price_df_filtered = price_df[(price_df.index.date >= start_date) & (price_df.index.date <= end_date)]
     
     # --- Analysis Date Selector (Maturity Roll) ---
-    st.sidebar.header("3. Maturity Roll Date")
+    st.sidebar.header("3. Curve Analysis Date")
     
     # Analysis date should be within the historical range for stability
     default_analysis_date = end_date
@@ -311,7 +311,7 @@ if price_df is not None and expiry_df is not None:
         default_analysis_date = min_date
         
     analysis_date = st.sidebar.date_input(
-        "Select Analysis Date (Drives which contracts form the curve)", 
+        "Select **Single Date** for Curve Snapshot", 
         value=default_analysis_date,
         min_value=min_date,
         max_value=max_date,
@@ -344,7 +344,7 @@ if not price_df_filtered.empty:
         st.stop()
         
     # 3. Calculate Spreads and Butterflies (Inputs for PCA and comparison)
-    st.header("1. Data Derivatives Check (Using Contracts relevant to selected Analysis Date)")
+    st.header("1. Data Derivatives Check (Contracts relevant to selected Analysis Date)")
     
     # Calculate Spreads
     spreads_df = calculate_outright_spreads(analysis_curve_df)
@@ -397,11 +397,7 @@ if not price_df_filtered.empty:
         # --- Component Loadings Heatmap ---
         st.header("3. PC Loadings Heatmap (PC vs. Spreads)")
         st.markdown("""
-            **This is the mathematically correct PCA visualization.** PCA is performed on **Spreads** (the change/slope between maturities) because they are more stationary than outright prices. 
-            The first 3 PCs represent the standard factors:
-            1.  **PC1 (Level):** Almost equal weights across all spreads.
-            2.  **PC2 (Slope):** Large positive weights on short-end spreads, large negative weights on long-end spreads.
-            3.  **PC3 (Curvature):** Alternating weights (positive/negative/positive).
+            This heatmap shows the weights of the first few PCs on each **Spread**. These weights define the fundamental Level, Slope, and Curvature factors.
         """)
         
         plt.style.use('default') 
@@ -424,20 +420,18 @@ if not price_df_filtered.empty:
         st.pyplot(fig)
         
         
-        # --- PC Scores Time Series Plot (New) ---
+        # --- PC Scores Time Series Plot ---
         def plot_pc_scores(scores_df, explained_variance):
             """Plots the time series of the first 3 PC scores."""
             
-            # Define labels for the first three PCs
             pc_labels = ['Level (PC1)', 'Slope (PC2)', 'Curvature (PC3)']
-            
             num_pcs = min(3, scores_df.shape[1])
             if num_pcs == 0: return None
 
             fig, axes = plt.subplots(nrows=num_pcs, ncols=1, figsize=(15, 4 * num_pcs), sharex=True)
             if num_pcs == 1: axes = [axes] 
 
-            plt.suptitle("Time Series of Principal Component Scores (Factors)", fontsize=16, y=1.02)
+            plt.suptitle("Time Series of Principal Component Scores (Risk Factors)", fontsize=16, y=1.02)
 
             for i in range(num_pcs):
                 ax = axes[i]
@@ -458,7 +452,7 @@ if not price_df_filtered.empty:
             return fig
 
         st.header("4. PC Factor Scores Time Series")
-        st.markdown("This plot shows the historical movement of the **latent risk factors** (Level, Slope, and Curvature) derived from the spreads.")
+        st.markdown("This plot shows the historical movement of the **latent risk factors** (Level, Slope, and Curvature) over the chosen historical range.")
         fig_scores = plot_pc_scores(scores, explained_variance)
         if fig_scores:
             st.pyplot(fig_scores)
@@ -484,10 +478,106 @@ if not price_df_filtered.empty:
         historical_outrights_df, historical_spreads_df, historical_butterflies_df = \
             reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads, spreads_df, butterflies_df)
 
+        
+        
+        # --- NEW: Cross-Sectional Curve Plot for Single Date ---
+        st.header("5. Curve Snapshot Analysis: " + analysis_date.strftime('%Y-%m-%d'))
+        st.markdown("This chart plots the **current market curve** (Original) against the **PCA Fair curve** for the selected date. The vertical difference is the theoretical mispricing.")
 
-        # --- New Plotting Section ---
-        st.header("5. Historical PCA Fair Curve Comparison")
-        st.markdown(f"The plots below compare the **Original Market Data** against the **PCA-reconstructed 'Fair' values** using **{pc_count}** Principal Components. The difference is the arbitrage or mispricing signal.")
+        # Get the single-day snapshot
+        try:
+            curve_snapshot_original = historical_outrights_df.filter(regex='\(Original\)$').loc[analysis_dt].T.rename(columns={analysis_dt: 'Original'}).droplevel(1)
+            curve_snapshot_pca = historical_outrights_df.filter(regex='\(PCA\)$').loc[analysis_dt].T.rename(columns={analysis_dt: 'PCA Fair'}).droplevel(1)
+            
+            curve_comparison = pd.concat([curve_snapshot_original, curve_snapshot_pca], axis=1).dropna()
+            
+            if curve_comparison.empty:
+                st.warning(f"No complete data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')}.")
+            else:
+                # --- Plot the Curve ---
+                fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
+                
+                # Plot Original Curve
+                ax_curve.plot(curve_comparison.index, curve_comparison['Original'], 
+                              label='Original Market Curve', marker='o', linestyle='-', linewidth=2.5, color='blue')
+                
+                # Plot PCA Fair Curve
+                ax_curve.plot(curve_comparison.index, curve_comparison['PCA Fair'], 
+                              label=f'PCA Fair Curve ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='red')
+                
+                # Plot Mispricing (Original - PCA Fair)
+                mispricing = curve_comparison['Original'] - curve_comparison['PCA Fair']
+                
+                # Annotate the contracts with the largest absolute mispricing
+                max_abs_mispricing = mispricing.abs().max()
+                if max_abs_mispricing > 0:
+                    mispricing_contract = mispricing.abs().idxmax()
+                    mispricing_value = mispricing.loc[mispricing_contract] * 10000 # Convert to BPS
+                    
+                    ax_curve.annotate(
+                        f"Mispricing: {mispricing_value:.2f} BPS",
+                        (mispricing_contract, curve_comparison.loc[mispricing_contract]['Original']),
+                        textcoords="offset points",
+                        xytext=(0, 10),
+                        ha='center',
+                        fontsize=10,
+                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
+                    )
+                
+                ax_curve.set_title(f'Market Price Curve vs. PCA Fair Price Curve on {analysis_date.strftime("%Y-%m-%d")}', fontsize=16)
+                ax_curve.set_xlabel('Contract Maturity')
+                ax_curve.set_ylabel('Price (100 - Rate)')
+                ax_curve.legend(loc='upper right')
+                ax_curve.grid(True, linestyle=':', alpha=0.6)
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                st.pyplot(fig_curve)
+                
+                # --- Detailed Contract Price/Rate Table (New Feature) ---
+                st.subheader("5.1 Detailed Contract Prices and Mispricing")
+                
+                # Create the detailed table
+                detailed_comparison = curve_comparison.copy()
+                detailed_comparison.index.name = 'Contract'
+                
+                # Calculate Rates (Yields) and Mispricing in BPS
+                detailed_comparison['Original Rate (%)'] = 100.0 - detailed_comparison['Original']
+                detailed_comparison['PCA Fair Rate (%)'] = 100.0 - detailed_comparison['PCA Fair']
+                # Mispricing in Price terms (Original Price - PCA Fair Price) * 10,000 to get BPS
+                detailed_comparison['Mispricing (BPS)'] = (detailed_comparison['Original'] - detailed_comparison['PCA Fair']) * 10000
+
+                # Reorder columns and rename Price columns
+                detailed_comparison = detailed_comparison.rename(
+                    columns={'Original': 'Original Price', 'PCA Fair': 'PCA Fair Price'}
+                )
+                
+                detailed_comparison = detailed_comparison[[
+                    'Original Price', 
+                    'Original Rate (%)', 
+                    'PCA Fair Price', 
+                    'PCA Fair Rate (%)', 
+                    'Mispricing (BPS)'
+                ]]
+                
+                # Display the table, formatted for financial data
+                st.dataframe(
+                    detailed_comparison.style.format({
+                        'Original Price': "{:.4f}",
+                        'PCA Fair Price': "{:.4f}",
+                        'Original Rate (%)': "{:.4f}",
+                        'PCA Fair Rate (%)': "{:.4f}",
+                        'Mispricing (BPS)': "{:.2f}"
+                    }),
+                    use_container_width=True
+                )
+                
+        except KeyError:
+            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data. Please choose a different date within the historical range.")
+        
+        # --- Historical Time Series Comparison ---
+        st.header("6. Historical Time Series Comparison")
+        st.markdown(f"These plots compare the historical path of the market data against the PCA-reconstructed 'Fair' paths using the selected **{pc_count}** Principal Components.")
+
 
         def plot_historical_comparison(df, title, y_label):
             df = df.dropna() 
@@ -500,7 +590,6 @@ if not price_df_filtered.empty:
             original_cols = [col for col in df.columns if '(Original)' in col]
             pca_cols = [col for col in df.columns if '(PCA)' in col]
             
-            # Determine line styles and colors for better distinction
             # Plot Original Data (thin, dashed, gray/darker)
             df[original_cols].plot(ax=ax, legend=False, linestyle='-', alpha=0.4, color='darkgray', linewidth=1.5)
             
@@ -510,15 +599,11 @@ if not price_df_filtered.empty:
             # Re-plot one Original column for a clear legend entry
             if original_cols:
                 original_legend_label = 'Original Market Data'
-                # Use a specific dark line for the overall "Original" legend
                 df[original_cols[0]].plot(ax=ax, linestyle='--', color='black', alpha=0.6, label=original_legend_label, linewidth=1.5)
 
             # Setup legend for PCA lines and one original line
             if pca_cols:
-                # Find the lines for PCA reconstructed data (the last 'len(pca_cols)' lines)
                 pca_legend_lines = ax.lines[-len(pca_cols):]
-                
-                # The line before the PCA lines is the one we used for the 'Original Market Data' legend
                 original_line_for_legend = ax.lines[-len(pca_cols) - 1]
                 
                 all_lines = [original_line_for_legend] + pca_legend_lines
@@ -532,32 +617,32 @@ if not price_df_filtered.empty:
             ax.grid(True, linestyle=':', alpha=0.6)
             return fig
 
-        # 5.1 Outrights Plot
-        st.subheader("5.1 Historical Outright Prices")
+        # 6.1 Outrights Plot
+        st.subheader("6.1 Historical Outright Prices")
         fig_outrights = plot_historical_comparison(
             historical_outrights_df, 
-            'Historical Outright Prices: Original vs. PCA Fair Curve (Anchored to Nearest Contract)', 
+            'Historical Outright Prices Time Series', 
             'Price'
         )
         if fig_outrights:
             st.pyplot(fig_outrights)
 
-        # 5.2 Spreads Plot
-        st.subheader("5.2 Historical Spreads")
+        # 6.2 Spreads Plot
+        st.subheader("6.2 Historical Spreads")
         fig_spreads = plot_historical_comparison(
             historical_spreads_df, 
-            'Historical Spreads: Original vs. PCA Reconstructed (Filtered by PC Components)', 
+            'Historical Spreads Time Series', 
             'Spread Value (Price Difference)'
         )
         if fig_spreads:
             st.pyplot(fig_spreads)
 
-        # 5.3 Flies Plot
+        # 6.3 Flies Plot
         if not historical_butterflies_df.empty:
-            st.subheader("5.3 Historical Butterflies (Flies)")
+            st.subheader("6.3 Historical Butterflies (Flies)")
             fig_flies = plot_historical_comparison(
                 historical_butterflies_df, 
-                'Historical Butterflies: Original vs. PCA Reconstructed (Filtered by PC Components)', 
+                'Historical Butterflies Time Series', 
                 'Fly Value'
             )
             if fig_flies:
