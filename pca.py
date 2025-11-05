@@ -204,10 +204,18 @@ def calculate_z_scores(scores_df, analysis_dt):
     
     # Get the Z-score for the specific analysis date
     try:
+        # Use a list slice [[analysis_dt]] to ensure a DataFrame is returned even if the date is exactly matched
         current_z_score = z_scores_historical.loc[[analysis_dt]].T
         return z_scores_historical, current_z_score
     except KeyError:
-        return z_scores_historical, None
+        # If the exact date is not present, find the nearest one
+        try:
+            # Find the nearest date label
+            nearest_date_label = (z_scores_historical.index - analysis_dt).to_series().abs().idxmin()
+            current_z_score = z_scores_historical.loc[[nearest_date_label]].T
+            return z_scores_historical, current_z_score
+        except Exception:
+            return z_scores_historical, None
 
 # --- NEW HELPER FUNCTION: Calculate Outright Loadings ---
 def calculate_outright_loadings(loadings_df, contract_labels):
@@ -410,14 +418,15 @@ if not price_df_filtered.empty:
     
     # Display logic adjusted to show data around analysis date for better context
     try:
+        # **FIXED: Changed KeyError to a general Exception to catch the TypeError**
         idx = spreads_df.index.get_loc(analysis_dt, method='nearest')
         start_idx = max(0, idx - 2)
         end_idx = min(len(spreads_df), idx + 3)
         st.dataframe(spreads_df.iloc[start_idx:end_idx].fillna('None'))
         st.caption(f"Showing spreads around the Analysis Date: {analysis_date.strftime('%Y-%m-%d')}")
-    except KeyError:
+    except Exception:
         st.dataframe(spreads_df.head(5).fillna('None'))
-        st.caption("Showing latest 5 dates (Analysis Date not found in spread data).")
+        st.caption("Showing latest 5 dates (Date lookup failed).")
 
     
     if spreads_df.empty:
@@ -430,14 +439,15 @@ if not price_df_filtered.empty:
     
     # Display logic adjusted to show data around analysis date for better context
     try:
+        # **FIXED: Changed KeyError to a general Exception to catch the TypeError**
         idx = butterflies_df.index.get_loc(analysis_dt, method='nearest')
         start_idx = max(0, idx - 2)
         end_idx = min(len(butterflies_df), idx + 3)
         st.dataframe(butterflies_df.iloc[start_idx:end_idx].fillna('None'))
         st.caption(f"Showing butterflies around the Analysis Date: {analysis_date.strftime('%Y-%m-%d')}")
-    except KeyError:
+    except Exception:
         st.dataframe(butterflies_df.head(5).fillna('None'))
-        st.caption("Showing latest 5 dates (Analysis Date not found in butterfly data).")
+        st.caption("Showing latest 5 dates (Date lookup failed).")
 
 
     # 4. Perform PCA on Spreads
@@ -499,7 +509,7 @@ if not price_df_filtered.empty:
         ax.set_ylabel('Spread Contract')
         st.pyplot(fig)
         
-        # --- NEW SECTION 7: Outright Loadings Plot (Moved to be near Spread Loadings) ---
+        # --- NEW SECTION: Outright Loadings Plot ---
         st.header("4. PC Loadings vs. Outright Contract Levels")
         st.markdown("This plot shows the **impact** (sensitivity) of a 1-unit movement in each PC on the **outright price** of each contract.")
         
@@ -570,13 +580,13 @@ if not price_df_filtered.empty:
         if fig_scores:
             st.pyplot(fig_scores)
             
-        # --- NEW SECTION 6: PC Factor Z-Scores ---
+        # --- NEW SECTION: PC Factor Z-Scores ---
         st.header("6. PC Factor Z-Scores (Trading Signal)")
         
         z_scores_historical, current_z_score = calculate_z_scores(scores, analysis_dt)
 
         if current_z_score is not None:
-            st.markdown(f"Z-Scores for the curve on **{analysis_date.strftime('%Y-%m-%d')}** relative to the historical distribution:")
+            st.markdown(f"Z-Scores for the curve on **{current_z_score.columns[0].strftime('%Y-%m-%d')}** relative to the historical distribution (using nearest date):")
             
             # Use the first few columns (PCs) for display
             num_pcs_to_display = min(5, current_z_score.shape[0])
@@ -589,7 +599,7 @@ if not price_df_filtered.empty:
             )
             st.caption("A Z-score outside the $\pm 2.0$ range is often considered a statistical extreme (signal).")
         else:
-             st.warning(f"Z-Score calculation skipped. Analysis Date {analysis_date.strftime('%Y-%m-%d')} not found in PC Scores data.")
+             st.warning(f"Z-Score calculation skipped. Analysis Date {analysis_date.strftime('%Y-%m-%d')} not found or failed to match nearest date in PC Scores data.")
             
         
         # --- Historical Reconstruction ---
