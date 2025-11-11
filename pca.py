@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.linear_model import LinearRegression 
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, date
@@ -11,6 +12,8 @@ st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
 
 # --- Helper Functions for Data Processing ---
 
+# Use st.cache_data for performance as file loading is idempotent
+@st.cache_data
 def load_data(uploaded_file):
     """Loads CSV data into a DataFrame, adapting to price or expiry file formats."""
     if uploaded_file is None:
@@ -22,35 +25,31 @@ def load_data(uploaded_file):
         file_content = uploaded_file.getvalue().decode("utf-8")
         uploaded_file.seek(0)
             
-        # --- Case 1: Expiry File (EXPIRY (2).csv format: MATURITY, DATE) ---
+        # --- Case 1: Expiry File (MATURITY, DATE) ---
         if 'MATURITY,DATE' in file_content.split('\n')[0].upper():
             df = pd.read_csv(uploaded_file, sep=',')
             df = df.rename(columns={'MATURITY': 'Contract', 'DATE': 'ExpiryDate'})
-            # Ensure Contract is the index and Date is datetime
             df = df.set_index('Contract')
             df['ExpiryDate'] = pd.to_datetime(df['ExpiryDate'])
             df.index.name = 'Contract'
             return df
 
-        # --- Case 2: Price File (sofr rates.csv format: Date as index) ---
+        # --- Case 2: Price File (Date as index) ---
         df = pd.read_csv(
             uploaded_file, 
             index_col=0, 
             parse_dates=True,
-            sep=',', # Explicitly specify comma as separator
-            header=0 # Ensure the first row is used as the header
+            sep=',', 
+            header=0 
         )
         
         df.index.name = 'Date'
-        
-        # Drop columns that are entirely NaN
         df = df.dropna(axis=1, how='all')
         
-        # Convert all price columns to numeric, coercing errors to NaN
         for col in df.columns:
+            # Ensure price columns are numeric
             df[col] = pd.to_numeric(df[col], errors='coerce')
             
-        # Filter out any remaining rows where the index date is NaT or the row is entirely NaN
         df = df.dropna(how='all')
         df = df[df.index.notna()]
 
@@ -64,115 +63,140 @@ def load_data(uploaded_file):
         return None
 
 
+@st.cache_data
 def get_analysis_contracts(expiry_df, analysis_date):
-    """
-    Filters contract codes that expire on or after the analysis date and returns
-    them in chronological order with their expiry date. This list defines the 
-    maturities used in the analysis curve (e.g., Z20, H21, M21...).
-    """
+    """Filters contract codes that expire on or after the analysis date."""
     if expiry_df is None:
         return pd.DataFrame()
-    
-    # Filter contracts that expire on or after the analysis date
     future_expiries = expiry_df[expiry_df['ExpiryDate'] >= analysis_date].copy()
+    future_expiries = future_expiries.sort_values(by='ExpiryDate')
     
     if future_expiries.empty:
         st.warning(f"No contracts found expiring on or after {analysis_date.strftime('%Y-%m-%d')}.")
-        return pd.DataFrame()
-
-    # Sort by expiry date
-    future_expiries = future_expiries.sort_values(by='ExpiryDate')
     
     return future_expiries
 
+@st.cache_data
 def transform_to_analysis_curve(price_df, future_expiries_df):
-    """
-    Transforms the price DataFrame to only include relevant contracts in maturity order.
-    The column names are kept as the original contract codes (e.g., Z20, H21).
-    """
+    """Selects and orders historical prices for relevant contracts."""
     if price_df is None or future_expiries_df.empty:
         return pd.DataFrame(), []
-
     contract_order = future_expiries_df.index.tolist()
-    
-    # Filter price columns to only include those present in the contract order
     valid_contracts = [c for c in contract_order if c in price_df.columns]
-    
     if not valid_contracts:
         st.warning("No matching contract columns found in price data for the selected analysis date range.")
         return pd.DataFrame(), []
-
-    # Filter the price data to only include valid, ordered contract columns
     analysis_curve_df = price_df[valid_contracts]
-    
     return analysis_curve_df, valid_contracts
 
-def calculate_outright_spreads(analysis_curve_df):
+
+# --- GENERALIZED DERIVATIVE CALCULATION FUNCTIONS (k-step) ---
+
+@st.cache_data
+def calculate_k_step_spreads(analysis_curve_df, k):
     """
-    Calculates the first differences (spreads) on a CME basis: C1 - C2, C2 - C3, etc.
-    The labels now use the contract codes (e.g., Z20-H21).
+    Calculates spreads between contracts separated by 'k' steps (e.g., k=1 for 3M, k=2 for 6M, k=4 for 12M).
+    CME Basis: C_i - C_{i+k}
     """
-    if analysis_curve_df.empty:
+    if analysis_curve_df.empty or analysis_curve_df.shape[1] < k + 1:
         return pd.DataFrame()
 
     num_contracts = analysis_curve_df.shape[1]
     spreads_data = {}
     
-    for i in range(num_contracts - 1):
-        # CME Basis: Shorter maturity minus longer maturity
+    for i in range(num_contracts - k):
         short_maturity = analysis_curve_df.columns[i]
-        long_maturity = analysis_curve_df.columns[i+1]
+        long_maturity = analysis_curve_df.columns[i+k]
         
         spread_label = f"{short_maturity}-{long_maturity}"
-        
-        spreads_data[spread_label] = analysis_curve_df.iloc[:, i] - analysis_curve_df.iloc[:, i+1]
+        # Spread = C_i - C_{i+k}
+        spreads_data[spread_label] = analysis_curve_df.iloc[:, i] - analysis_curve_df.iloc[:, i+k]
         
     return pd.DataFrame(spreads_data)
 
-def calculate_butterflies(analysis_curve_df):
+@st.cache_data
+def calculate_k_step_butterflies(analysis_curve_df, k):
     """
-    Calculates butterflies (flies) on a CME basis: (C1 - C2) - (C2 - C3) = C1 - 2*C2 + C3, etc.
-    The labels now use the contract codes (e.g., Z20-2xH21+M21).
+    Calculates butterflies using contracts separated by 'k' steps (e.g., k=1 for 3M fly, k=2 for 6M fly, k=4 for 12M fly).
+    Formula: C_i - 2 * C_{i+k} + C_{i+2k}
+    Label Format: C_i-2xC_{i+k}+C_{i+2k}
     """
-    if analysis_curve_df.empty or analysis_curve_df.shape[1] < 3:
+    if analysis_curve_df.empty or analysis_curve_df.shape[1] < 2 * k + 1:
         return pd.DataFrame()
 
     num_contracts = analysis_curve_df.shape[1]
     flies_data = {}
 
-    for i in range(num_contracts - 2):
-        short_maturity = analysis_curve_df.columns[i]    # C1
-        center_maturity = analysis_curve_df.columns[i+1] # C2
-        long_maturity = analysis_curve_df.columns[i+2]   # C3
+    for i in range(num_contracts - 2 * k):
+        short_maturity = analysis_curve_df.columns[i]      # C_i
+        center_maturity = analysis_curve_df.columns[i+k]   # C_{i+k}
+        long_maturity = analysis_curve_df.columns[i+2*k]   # C_{i+2k}
 
-        # Fly = C1 - 2*C2 + C3
+        # Fly = C_i - 2*C_{i+k} + C_{i+2k}
         fly_label = f"{short_maturity}-2x{center_maturity}+{long_maturity}"
 
-        flies_data[fly_label] = analysis_curve_df.iloc[:, i] - 2 * analysis_curve_df.iloc[:, i+1] + analysis_curve_df.iloc[:, i+2]
+        flies_data[fly_label] = analysis_curve_df.iloc[:, i] - 2 * analysis_curve_df.iloc[:, i+k] + analysis_curve_df.iloc[:, i+2*k]
 
     return pd.DataFrame(flies_data)
+# --- END GENERALIZED DERIVATIVE CALCULATION FUNCTIONS ---
+
 
 def perform_pca(data_df):
-    """Performs PCA on the input DataFrame (expected to be spreads)."""
-    # Drop rows with NaNs before standardization and PCA
+    """Performs PCA on the input DataFrame (expected to be spreads for Fair Curve)."""
     data_df_clean = data_df.dropna()
     
     if data_df_clean.empty or data_df_clean.shape[0] < data_df_clean.shape[1]:
-        st.error("Not enough complete data points (rows) to perform PCA on the spreads after dropping NaNs.")
-        return None, None, None, None
+        return None, None, None, None, None
 
-    # Standardize the data (PCA is sensitive to scale)
+    # Standardize the data (PCA on Correlation Matrix - preferred for spread PCA)
     data_mean = data_df_clean.mean()
     data_std = data_df_clean.std()
     data_scaled = (data_df_clean - data_mean) / data_std
     
-    # Determine optimal number of components (min(n_samples, n_features))
     n_components = min(data_scaled.shape)
 
     pca = PCA(n_components=n_components)
     pca.fit(data_scaled)
     
-    # Component Loadings (the eigenvectors * sqrt(eigenvalues))
+    # Loadings (Eigenvectors on Correlation Matrix)
+    loadings = pd.DataFrame(
+        pca.components_.T,
+        columns=[f'PC{i+1}' for i in range(n_components)],
+        index=data_df_clean.columns
+    )
+    # Get Eigenvalues (Variance of the principal components)
+    eigenvalues = pca.explained_variance_
+    
+    explained_variance_ratio = pca.explained_variance_ratio_
+    
+    scores = pd.DataFrame(
+        pca.transform(data_scaled),
+        index=data_df_clean.index,
+        columns=[f'PC{i+1}' for i in range(n_components)]
+    )
+    
+    return loadings, explained_variance_ratio, eigenvalues, scores, data_df_clean
+
+# --- PCA ON PRICES (FOR NON-UNIFORM PC1 VISUALIZATION) ---
+def perform_pca_on_prices(price_df):
+    """
+    Performs PCA directly on Outright Price Levels using the COVARIANCE MATRIX 
+    (unstandardized data), which results in a NON-UNIFORM PC1.
+    """
+    data_df_clean = price_df.dropna()
+    
+    if data_df_clean.empty or data_df_clean.shape[0] < data_df_clean.shape[1]:
+        return None, None
+        
+    # Center the data, but DO NOT scale/standardize it (PCA on Covariance Matrix)
+    data_centered = data_df_clean - data_df_clean.mean() 
+    
+    n_components = min(data_centered.shape)
+
+    pca = PCA(n_components=n_components)
+    pca.fit(data_centered)
+    
+    # Loadings (Eigenvectors - the raw sensitivities)
     loadings = pd.DataFrame(
         pca.components_.T,
         columns=[f'PC{i+1}' for i in range(n_components)],
@@ -181,151 +205,450 @@ def perform_pca(data_df):
     
     explained_variance = pca.explained_variance_ratio_
     
-    # Principal Component Scores (the transformed data)
-    scores = pd.DataFrame(
-        pca.transform(data_scaled),
-        index=data_df_clean.index,
-        columns=[f'PC{i+1}' for i in range(n_components)]
-    )
-    
-    return loadings, explained_variance, scores, data_df_clean
+    return loadings, explained_variance
 
-# --- NEW HELPER FUNCTION: Calculate Z-Scores ---
-def calculate_z_scores(scores_df, analysis_dt):
-    """Calculates Z-scores for the latest date relative to the historical scores."""
-    if scores_df.empty:
-        return None, None
-        
-    scores_mean = scores_df.mean()
-    scores_std = scores_df.std()
-    
-    # Calculate Z-scores for the entire historical period
-    z_scores_historical = (scores_df - scores_mean) / scores_std
-    
-    # Get the Z-score for the specific analysis date
-    try:
-        # Use a list slice [[analysis_dt]] to ensure a DataFrame is returned even if the date is exactly matched
-        current_z_score = z_scores_historical.loc[[analysis_dt]].T
-        return z_scores_historical, current_z_score
-    except KeyError:
-        # If the exact date is not present, find the nearest one
-        try:
-            # Find the nearest date label
-            nearest_date_label = (z_scores_historical.index - analysis_dt).to_series().abs().idxmin()
-            current_z_score = z_scores_historical.loc[[nearest_date_label]].T
-            return z_scores_historical, current_z_score
-        except Exception:
-            return z_scores_historical, None
+# --- RECONSTRUCTION LOGIC ---
 
-# --- NEW HELPER FUNCTION: Calculate Outright Loadings ---
-def calculate_outright_loadings(loadings_df, contract_labels):
+def _reconstruct_derivative(original_df, reconstructed_prices, derivative_type='spread'):
     """
-    Transforms spread loadings to outright price loadings (cumulative sum).
-    Anchor (P1) is set to 1.
+    Helper to reconstruct a derivative from the reconstructed price curve.
     """
-    if loadings_df.empty or not contract_labels:
+    if original_df.empty:
         return pd.DataFrame()
-        
-    # Initialize a DataFrame for outright loadings
-    outright_loadings = pd.DataFrame(
-        index=contract_labels, 
-        columns=loadings_df.columns
-    )
+
+    # Align the original data index with the reconstructed prices index
+    valid_indices = reconstructed_prices.index.intersection(original_df.index)
+    original_df_aligned = original_df.loc[valid_indices]
+    reconstructed_prices_aligned = reconstructed_prices.loc[valid_indices]
     
-    for pc_col in loadings_df.columns:
-        # P1 is the anchor, its loading is 1.0 (assuming a 1-to-1 impact of Level factor)
-        outright_loadings.loc[contract_labels[0], pc_col] = 1.0 
+    reconstructed_data = {}
+    
+    for label in original_df_aligned.columns:
         
-        current_loading = 1.0 # P1 loading
-        
-        # Iterate through spread loadings (S1, S2, ...)
-        for i in range(loadings_df.shape[0]): 
-            spread_loading = loadings_df.iloc[i][pc_col]
+        try:
+            if derivative_type == 'spread':
+                # Spread: C_i - C_{i+k}. Label is C_i-C_{i+k} (e.g., Z25-M26)
+                # Handle unique prefixed labels
+                if ':' in label:
+                    # Remove prefix like '3M Spread: ' or '6M Spread: '
+                    core_label = label.split(': ')[1] 
+                else:
+                    core_label = label
+                    
+                c1, c_long = core_label.split('-')
+                
+                # Use the core label without prefix for price lookup, but must append ' (PCA)'
+                reconstructed_data[label + ' (PCA)'] = (
+                    reconstructed_prices_aligned[c1 + ' (PCA)'] - reconstructed_prices_aligned[c_long + ' (PCA)']
+                )
             
-            # P_long = P_short - S. Thus, L_P(i+1) = L_P(i) - L_S(i, i+1)
-            # The loading of the next contract is the previous contract's loading minus the spread loading
-            current_loading -= spread_loading 
+            elif derivative_type == 'fly':
+                # Fly: C_i - 2 * C_{i+k} + C_{i+2k}. Label format: C_i-2xC_{i+k}+C_{i+2k}
+                # Example: Z25-2xM26+Z26
+                
+                if ':' in label:
+                    core_label = label.split(': ')[1] 
+                else:
+                    core_label = label
+                    
+                # 1. Split on the first '-' to get ['C_i', '2xC_{i+k}+C_{i+2k}']
+                parts = core_label.split('-', 1) 
+                c1 = parts[0] # C_i
+                
+                # 2. Split the second part by '+' to get ['2xC_{i+k}', 'C_{i+2k}']
+                sub_parts = parts[1].split('+')
+                
+                # 3. Extract C_{i+k} from '2xC_{i+k}'
+                c2_label = sub_parts[0].split('x')[1] 
+                
+                # 4. Extract C_{i+2k}
+                c3_label = sub_parts[1] 
+                
+                # Reconstruct the derivative
+                reconstructed_data[label + ' (PCA)'] = (
+                    reconstructed_prices_aligned[c1 + ' (PCA)'] - 
+                    2 * reconstructed_prices_aligned[c2_label + ' (PCA)'] + 
+                    reconstructed_prices_aligned[c3_label + ' (PCA)']
+                )
             
-            # The contract being calculated is P(i+1), which is at index i+1 in contract_labels
-            outright_loadings.loc[contract_labels[i+1], pc_col] = current_loading
-
-    return outright_loadings.astype(float)
-
-
-def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_df, spreads_df, butterflies_df):
-    """
-    Reconstructs Outright Prices and Derivatives historically using reconstructed spreads,
-    anchored to the original nearest contract price path (Level factor).
-    """
-    # Filter the analysis_curve_df to match the index of the reconstructed spreads
-    analysis_curve_df_aligned = analysis_curve_df.loc[reconstructed_spreads_df.index]
+        except Exception as e:
+             # Skip if reconstruction fails due to malformed label or missing price
+             # print(f"Skipping {derivative_type} reconstruction for {label}. Error: {e}")
+             continue 
     
-    # --- 1. Reconstruct Outright Prices ---
+    reconstructed_df = pd.DataFrame(reconstructed_data, index=reconstructed_prices_aligned.index)
     
-    # Anchor the entire curve reconstruction to the original historical nearest contract price path
+    original_rename = {col: col + ' (Original)' for col in original_df_aligned.columns}
+    original_df_renamed = original_df_aligned.rename(columns=original_rename)
+    
+    return pd.merge(original_df_renamed, reconstructed_df, left_index=True, right_index=True)
+
+
+def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_3M_df, spreads_3M_df, spreads_6M_df, butterflies_3M_df, butterflies_6M_df, spreads_12M_df, butterflies_12M_df):
+    """
+    Reconstructs Outright Prices and all derivative types based on the 
+    reconstructed 3M spreads (PCA result) and the original nearest contract price anchor.
+    """
+    # Filter the analysis_curve_df to match the index of the reconstructed 3M spreads
+    analysis_curve_df_aligned = analysis_curve_df.loc[reconstructed_spreads_3M_df.index]
+    
+    # --- 1. Reconstruct Outright Prices (Anchor) ---
     nearest_contract_original = analysis_curve_df_aligned.iloc[:, 0]
     nearest_contract_label = analysis_curve_df_aligned.columns[0]
     
-    # Initialize the reconstructed prices DataFrame, starting with the original as the Level anchor
     reconstructed_prices_df = pd.DataFrame(index=analysis_curve_df_aligned.index)
-    reconstructed_prices_df[nearest_contract_label + ' (PCA)'] = nearest_contract_original
+    reconstructed_prices_df[nearest_contract_label + ' (PCA)'] = nearest_contract_original # Anchor
     
-    # Iterate through all maturities starting from the second contract (index 1)
+    # The 3M spreads used for PCA reconstruction DO NOT have the '3M Spread: ' prefix
+    spreads_3M_df_no_prefix = spreads_3M_df.copy()
+
+    # Reconstruct all subsequent contracts using the reconstructed 3M spreads (k=1)
     for i in range(1, len(analysis_curve_df_aligned.columns)):
         prev_maturity = analysis_curve_df_aligned.columns[i-1]
         current_maturity = analysis_curve_df_aligned.columns[i]
-        spread_label = f"{prev_maturity}-{current_maturity}"
+        spread_label_no_prefix = f"{prev_maturity}-{current_maturity}" # This is always the 3M spread label
+
+        # Check in the reconstructed 3M spreads DataFrame (which has the prefix)
+        spread_label_reconstructed = f"3M Spread: {spread_label_no_prefix}"
         
-        # Calculate the reconstructed price P_i using P_i-1 (PCA) and S_i-1,i (PCA)
-        # P_i = P_i-1 (PCA) - S_i-1,i (PCA)
-        reconstructed_prices_df[current_maturity + ' (PCA)'] = (
-            reconstructed_prices_df[prev_maturity + ' (PCA)'] - reconstructed_spreads_df[spread_label]
-        )
-        
-    # Merge original prices for comparison
+        if spread_label_no_prefix in reconstructed_spreads_3M_df.columns:
+            # P_i = P_i-1 (PCA) - S_i-1,i (PCA)
+            reconstructed_prices_df[current_maturity + ' (PCA)'] = (
+                reconstructed_prices_df[prev_maturity + ' (PCA)'] - reconstructed_spreads_3M_df[spread_label_no_prefix]
+            )
+        else:
+            # Fallback if the 3M spread is missing for that contract roll
+             reconstructed_prices_df[current_maturity + ' (PCA)'] = reconstructed_prices_df[prev_maturity + ' (PCA)']
+
     original_price_rename = {col: col + ' (Original)' for col in analysis_curve_df_aligned.columns}
     original_prices_df = analysis_curve_df_aligned.rename(columns=original_price_rename)
-    
     historical_outrights = pd.merge(original_prices_df, reconstructed_prices_df, left_index=True, right_index=True)
 
 
-    # --- 2. Prepare Spreads for comparison ---
-    spreads_df_aligned = spreads_df.loc[reconstructed_spreads_df.index]
-    original_spread_rename = {col: col + ' (Original)' for col in spreads_df_aligned.columns}
-    pca_spread_rename = {col: col + ' (PCA)' for col in reconstructed_spreads_df.columns}
+    # --- 2. Reconstruct Derivatives from Reconstructed Prices ---
+    
+    # NOTE: The input derivative DFs (spreads_3M_df, etc.) must now contain the prefixes
+    # for the helper function _reconstruct_derivative to work correctly with the labels.
+    
+    # Prepare derivative DFs with prefixes for _reconstruct_derivative to correctly rename columns
+    spreads_3M_df_prefixed = spreads_3M_df_no_prefix.rename(columns=lambda x: f"3M Spread: {x}")
+    butterflies_3M_df_prefixed = butterflies_3M_df.rename(columns=lambda x: f"3M Fly: {x}")
+    spreads_6M_df_prefixed = spreads_6M_df.rename(columns=lambda x: f"6M Spread: {x}")
+    butterflies_6M_df_prefixed = butterflies_6M_df.rename(columns=lambda x: f"6M Fly: {x}")
+    spreads_12M_df_prefixed = spreads_12M_df.rename(columns=lambda x: f"12M Spread: {x}")
+    butterflies_12M_df_prefixed = butterflies_12M_df.rename(columns=lambda x: f"12M Fly: {x}")
+    
+    historical_spreads_3M = _reconstruct_derivative(spreads_3M_df_prefixed, reconstructed_prices_df, derivative_type='spread')
+    historical_butterflies_3M = _reconstruct_derivative(butterflies_3M_df_prefixed, reconstructed_prices_df, derivative_type='fly')
+    
+    historical_spreads_6M = _reconstruct_derivative(spreads_6M_df_prefixed, reconstructed_prices_df, derivative_type='spread')
+    historical_butterflies_6M = _reconstruct_derivative(butterflies_6M_df_prefixed, reconstructed_prices_df, derivative_type='fly')
+    
+    historical_spreads_12M = _reconstruct_derivative(spreads_12M_df_prefixed, reconstructed_prices_df, derivative_type='spread')
+    historical_butterflies_12M = _reconstruct_derivative(butterflies_12M_df_prefixed, reconstructed_prices_df, derivative_type='fly')
+    
+    return historical_outrights, historical_spreads_3M, historical_butterflies_3M, historical_spreads_6M, historical_butterflies_6M, historical_spreads_12M, historical_butterflies_12M, spreads_3M_df_no_prefix
 
-    original_spreads = spreads_df_aligned.rename(columns=original_spread_rename)
-    pca_spreads = reconstructed_spreads_df.rename(columns=pca_spread_rename)
-    
-    historical_spreads = pd.merge(original_spreads, pca_spreads, left_index=True, right_index=True)
-    
-    
-    # --- 3. Reconstruct Butterflies ---
-    if butterflies_df.empty:
-        return historical_outrights, historical_spreads, pd.DataFrame()
-    
-    butterflies_df_aligned = butterflies_df.loc[reconstructed_spreads_df.index]
-        
-    reconstructed_butterflies = {}
-    for i in range(len(spreads_df.columns) - 1):
-        spread1_label = spreads_df.columns[i]
-        spread2_label = spreads_df.columns[i+1]
-        original_fly_label = butterflies_df.columns[i]
-        
-        # Reconstruct fly: Fly = Spread1_PCA - Spread2_PCA
-        reconstructed_butterflies[original_fly_label + ' (PCA)'] = (
-            reconstructed_spreads_df[spread1_label] - reconstructed_spreads_df[spread2_label]
-        )
 
-    reconstructed_butterflies_df = pd.DataFrame(reconstructed_butterflies, index=reconstructed_spreads_df.index)
+# --- ORIGINAL HEDGING LOGIC (Section 6) ---
+
+def calculate_reconstructed_covariance(loadings_df, eigenvalues, spread_std_dev, pc_count):
+    """
+    Calculates the covariance matrix of the STANDARDIZED spreads 
+    reconstructed using the first 'pc_count' PCs: Sigma_scaled = L_p Lambda_p L_p^T
+    Then scales back to original spread space: Sigma = (diag(sigma)) * Sigma_scaled * (diag(sigma))
+    """
+    # 1. Select the loadings and eigenvalues for the used PCs
+    L_p = loadings_df.iloc[:, :pc_count].values # Loadings (Eigenvectors on Correlation Matrix)
+    lambda_p = eigenvalues[:pc_count]           # Eigenvalues (Variance of standardized scores)
     
-    # Merge original flies for comparison
-    original_fly_rename = {col: col + ' (Original)' for col in butterflies_df_aligned.columns}
-    original_butterflies_df = butterflies_df_aligned.rename(columns=original_fly_rename)
+    # 2. Reconstruct the Covariance Matrix of the Standardized Data
+    # Sigma_scaled = L_p * Lambda_p * L_p^T
+    Sigma_scaled = L_p @ np.diag(lambda_p) @ L_p.T
     
-    historical_butterflies = pd.merge(original_butterflies_df, reconstructed_butterflies_df, left_index=True, right_index=True)
+    # 3. Scale back to the original spread data covariance matrix
+    # Cov(X) = diag(sigma) * Cov(Z) * diag(sigma)
+    Sigma = Sigma_scaled * np.outer(spread_std_dev.values, spread_std_dev.values)
     
-    return historical_outrights, historical_spreads, historical_butterflies
+    Sigma_df = pd.DataFrame(Sigma, index=loadings_df.index, columns=loadings_df.index)
+    
+    return Sigma_df
+
+def calculate_best_and_worst_hedge_3M(trade_label, loadings_df, eigenvalues, pc_count, spreads_3M_df_clean):
+    """
+    Calculates the best (min residual risk) and worst (max residual risk) 
+    hedge for a given 3M spread trade using the reconstructed covariance matrix, 
+    and returns the full results DataFrame as well. (Section 6 - 3M Spreads only)
+    """
+    # NOTE: trade_label here is a simple contract spread label (e.g., Z25-H26)
+    if trade_label not in loadings_df.index:
+        return None, None, None
+        
+    spread_std_dev = spreads_3M_df_clean.std()
+    
+    # Reconstruct covariance matrix using selected PCs
+    Sigma_reconstructed = calculate_reconstructed_covariance(
+        loadings_df, eigenvalues, spread_std_dev, pc_count
+    )
+    
+    trade_spread = trade_label
+    
+    results = []
+    
+    # Iterate through all other 3M spreads as potential hedges
+    potential_hedges = [col for col in Sigma_reconstructed.columns if col != trade_spread]
+    
+    for hedge_spread in potential_hedges:
+        
+        # Terms from the reconstructed covariance matrix (Sigma)
+        Var_Trade = Sigma_reconstructed.loc[trade_spread, trade_spread] # Var(T)
+        Var_Hedge = Sigma_reconstructed.loc[hedge_spread, hedge_spread] # Var(H)
+        Cov_TH = Sigma_reconstructed.loc[trade_spread, hedge_spread]    # Cov(T, H)
+        
+        # 1. Minimum Variance Hedge Ratio (k*)
+        if Var_Hedge == 0:
+            k_star = 0
+        else:
+            k_star = Cov_TH / Var_Hedge
+            
+        # 2. Residual Variance of the hedged portfolio (Var(T - k*H) = Var(T) - k*Cov(T,H))
+        Residual_Variance = Var_Trade - (k_star * Cov_TH)
+        Residual_Variance = max(0, Residual_Variance) 
+        
+        # 3. Residual Volatility (Score) in BPS
+        Residual_Volatility_BPS = np.sqrt(Residual_Variance) * 10000
+        
+        results.append({
+            'Hedge Spread': hedge_spread,
+            'Hedge Ratio (k*)': k_star,
+            'Residual Volatility (BPS)': Residual_Volatility_BPS
+        })
+
+    if not results:
+        return None, None, None
+        
+    results_df = pd.DataFrame(results)
+    
+    # Best hedge minimizes Residual Volatility
+    best_hedge = results_df.sort_values(by='Residual Volatility (BPS)', ascending=True).iloc[0]
+    
+    # Worst hedge maximizes Residual Volatility
+    worst_hedge = results_df.sort_values(by='Residual Volatility (BPS)', ascending=False).iloc[0]
+    
+    # Return the individual best/worst series AND the full DataFrame
+    return best_hedge, worst_hedge, results_df
+
+
+# --- GENERALIZED HEDGING LOGIC (Section 7) ---
+
+def calculate_derivatives_covariance_generalized(all_derivatives_df, scores_df, eigenvalues, pc_count):
+    """
+    Calculates the Raw Covariance Matrix for ALL derivatives (Spreads, Flies) 
+    by projecting their standardized time series onto the standardized 3M Spread PC scores.
+    Returns the Raw Covariance Matrix, the aligned derivatives data, and the standardized loadings (L_D).
+    """
+    # 1. Align and clean data - ensure all derivatives are aligned with the PC scores index
+    aligned_index = all_derivatives_df.index.intersection(scores_df.index)
+    derivatives_aligned = all_derivatives_df.loc[aligned_index].dropna(axis=1)
+    scores_aligned = scores_df.loc[aligned_index]
+    
+    if derivatives_aligned.empty:
+        # Return empty dataframes, but return all three expected variables
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame() 
+        
+    # 2. Standardize all derivatives
+    derivatives_mean = derivatives_aligned.mean()
+    derivatives_std = derivatives_aligned.std()
+    # Subtract mean is important for proper regression/loadings calculation
+    derivatives_scaled = (derivatives_aligned - derivatives_mean) / derivatives_std
+    
+    # 3. Calculate Loadings (Beta) of each standardized derivative on the standardized PCs
+    
+    loadings_data = {}
+    X = scores_aligned.iloc[:, :pc_count].values # Standardized PC scores
+    
+    # Use Linear Regression to find the standardized loading (beta) for each derivative
+    for col in derivatives_scaled.columns:
+        y = derivatives_scaled[col].values
+        # Using intercept=False as both X (scores) and y (scaled derivative) are mean-zero
+        reg = LinearRegression(fit_intercept=False) 
+        reg.fit(X, y)
+        loadings_data[col] = reg.coef_
+
+    # L_D: Loadings of the full derivatives set D onto the PC space
+    loadings_df = pd.DataFrame(
+        loadings_data, 
+        index=[f'PC{i+1}' for i in range(pc_count)]
+    ).T
+    
+    # 4. Reconstruct the Covariance Matrix in Standardized Space
+    # Sigma_Std = L_D * Lambda_p * L_D^T
+    L_D = loadings_df.values
+    lambda_p = eigenvalues[:pc_count]
+    Sigma_Std = L_D @ np.diag(lambda_p) @ L_D.T
+    
+    # 5. Scale back to the original derivative data covariance matrix (Raw Space)
+    # Cov_Raw = diag(sigma) * Sigma_Std * diag(sigma)
+    Sigma_Raw = Sigma_Std * np.outer(derivatives_std.values, derivatives_std.values)
+    
+    Sigma_Raw_df = pd.DataFrame(Sigma_Raw, index=derivatives_aligned.columns, columns=derivatives_aligned.columns)
+    
+    return Sigma_Raw_df, derivatives_aligned, loadings_df
+
+def calculate_best_and_worst_hedge_generalized(trade_label, Sigma_Raw_df):
+    """
+    Calculates the best/worst hedge using the generalized Raw Covariance Matrix (Sigma_Raw_df).
+    (Section 7 - All Derivatives)
+    """
+    
+    if trade_label not in Sigma_Raw_df.index:
+        return None, None, None
+        
+    results = []
+    
+    # Iterate through all other derivatives as potential hedges
+    potential_hedges = [col for col in Sigma_Raw_df.columns if col != trade_label]
+    
+    for hedge_instrument in potential_hedges:
+        
+        # Terms from the reconstructed covariance matrix (Sigma)
+        Var_Trade = Sigma_Raw_df.loc[trade_label, trade_label] # Var(T)
+        Var_Hedge = Sigma_Raw_df.loc[hedge_instrument, hedge_instrument] # Var(H)
+        Cov_TH = Sigma_Raw_df.loc[trade_label, hedge_instrument]    # Cov(T, H)
+        
+        # 1. Minimum Variance Hedge Ratio (k*)
+        if Var_Hedge <= 1e-9: # Check for near-zero variance
+            k_star = 0
+        else:
+            k_star = Cov_TH / Var_Hedge
+            
+        # 2. Residual Variance of the hedged portfolio (Var(T - k*H) = Var(T) - k*Cov(T,H))
+        Residual_Variance = Var_Trade - (k_star * Cov_TH)
+        Residual_Variance = max(0, Residual_Variance) 
+        
+        # 3. Residual Volatility (Score) in BPS
+        Residual_Volatility_BPS = np.sqrt(Residual_Variance) * 10000
+        
+        results.append({
+            'Hedge Instrument': hedge_instrument,
+            'Hedge Ratio (k*)': k_star,
+            'Residual Volatility (BPS)': Residual_Volatility_BPS
+        })
+
+    if not results:
+        return None, None, None
+        
+    results_df = pd.DataFrame(results)
+    
+    # Best hedge minimizes Residual Volatility
+    best_hedge = results_df.sort_values(by='Residual Volatility (BPS)', ascending=True).iloc[0]
+    
+    # Worst hedge maximizes Residual Volatility
+    worst_hedge = results_df.sort_values(by='Residual Volatility (BPS)', ascending=False).iloc[0]
+    
+    # Return the individual best/worst series AND the full DataFrame
+    return best_hedge, worst_hedge, results_df
+
+# --- FACTOR-BASED HEDGING LOGIC (Section 8) ---
+
+def calculate_factor_sensitivities(loadings_df_gen, pc_count):
+    """
+    Calculates the Standardized Sensitivity (Beta) of every derivative to the first three 
+    principal components (Level, Slope, Curvature).
+    """
+    if loadings_df_gen.empty:
+        return pd.DataFrame()
+
+    # Define the factor mapping based on the first 3 PCs
+    pc_map = {
+        'PC1': 'Level (Whole Curve Shift)', 
+        'PC2': 'Slope (Steepening/Flattening)', 
+        'PC3': 'Curvature (Fly Risk)'
+    }
+    
+    # Only use up to the number of available PCs, or 3, whichever is smaller
+    available_pcs = loadings_df_gen.columns.intersection(list(pc_map.keys()))
+    
+    # Filter the generalized loadings L_D for the relevant PCs
+    factor_sensitivities = loadings_df_gen.filter(items=available_pcs.tolist(), axis=1).copy()
+    
+    # Rename columns for clarity in the output
+    factor_sensitivities.columns = [pc_map[col] for col in available_pcs]
+    
+    return factor_sensitivities
+
+def calculate_all_factor_hedges(trade_label, factor_name, factor_sensitivities_df, Sigma_Raw_df):
+    """
+    Calculates the Factor Hedge Ratio and the resulting Residual Volatility for all potential 
+    hedge instruments, for a specified factor.
+    
+    Inputs:
+    - trade_label: The derivative being hedged.
+    - factor_name: The factor (Level, Slope, Curvature) to neutralize.
+    - factor_sensitivities_df: Loadings (Betas) of instruments to factors (L_D).
+    - Sigma_Raw_df: The full reconstructed raw covariance matrix of all derivatives.
+    
+    Returns: DataFrame of results sorted by Residual Volatility.
+    """
+    if trade_label not in factor_sensitivities_df.index:
+        return pd.DataFrame(), f"Trade instrument '{trade_label}' not found in sensitivities."
+    if factor_name not in factor_sensitivities_df.columns:
+        return pd.DataFrame(), f"Factor '{factor_name}' not found."
+    if trade_label not in Sigma_Raw_df.index:
+        return pd.DataFrame(), f"Trade instrument '{trade_label}' not found in covariance matrix."
+
+    results = []
+    
+    Trade_Exposure = factor_sensitivities_df.loc[trade_label, factor_name]
+    Var_Trade = Sigma_Raw_df.loc[trade_label, trade_label] # Var(T)
+    
+    # Iterate through all other derivatives as potential hedges
+    potential_hedges = [col for col in Sigma_Raw_df.columns if col != trade_label]
+
+    for hedge_instrument in potential_hedges:
+        try:
+            Hedge_Exposure = factor_sensitivities_df.loc[hedge_instrument, factor_name]
+            Var_Hedge = Sigma_Raw_df.loc[hedge_instrument, hedge_instrument] # Var(H)
+            Cov_TH = Sigma_Raw_df.loc[trade_label, hedge_instrument]        # Cov(T, H)
+
+            # 1. Calculate Factor Hedge Ratio (k_factor)
+            if abs(Hedge_Exposure) < 1e-9:
+                k_factor = 0.0
+                Residual_Volatility_BPS = np.nan # Cannot neutralize factor with zero-exposure hedge
+            else:
+                # k_factor is the ratio of sensitivities: k = Beta_T / Beta_H
+                k_factor = Trade_Exposure / Hedge_Exposure
+                
+                # 2. Calculate Residual Variance of the hedged portfolio (Var(T - k*H))
+                # Var(P) = Var(T) + k^2 Var(H) - 2k Cov(T, H)
+                Residual_Variance = Var_Trade + (k_factor**2 * Var_Hedge) - (2 * k_factor * Cov_TH)
+                Residual_Variance = max(0, Residual_Variance) 
+                
+                # 3. Residual Volatility (Score) in BPS
+                Residual_Volatility_BPS = np.sqrt(Residual_Variance) * 10000
+                
+            results.append({
+                'Hedge Instrument': hedge_instrument,
+                'Trade Sensitivity': Trade_Exposure,
+                'Hedge Sensitivity': Hedge_Exposure,
+                f'Factor Hedge Ratio (k_factor)': k_factor,
+                'Residual Volatility (BPS)': Residual_Volatility_BPS
+            })
+            
+        except Exception as e:
+            # Handle case where covariance or sensitivity might be missing (shouldn't happen if alignment is correct)
+            # print(f"Error processing hedge {hedge_instrument}: {e}")
+            continue
+
+    if not results:
+        return pd.DataFrame(), "No valid hedge candidates found."
+        
+    results_df = pd.DataFrame(results)
+    
+    # Sort by Residual Volatility (BPS) to show the most effective hedges first
+    results_df = results_df.sort_values(by='Residual Volatility (BPS)', ascending=True, na_position='last')
+    
+    return results_df, None
 
 
 # --- Streamlit Application Layout ---
@@ -349,6 +672,11 @@ expiry_file = st.sidebar.file_uploader(
 price_df = load_data(price_file)
 expiry_df = load_data(expiry_file)
 
+# Placeholder for L_D Loadings and Sigma_Raw_df, calculated in Section 7 and used in Section 8
+loadings_df_gen = pd.DataFrame()
+Sigma_Raw_df = pd.DataFrame()
+spreads_3M_df_no_prefix = pd.DataFrame() # Also need this for Section 6 if price_df is not None
+
 if price_df is not None and expiry_df is not None:
     # --- Date Range Filter ---
     st.sidebar.header("2. Historical Date Range")
@@ -362,16 +690,11 @@ if price_df is not None and expiry_df is not None:
         max_value=max_date
     )
     
-    # Ensure start_date and end_date are used as datetime objects for filtering
-    start_dt = datetime.combine(start_date, datetime.min.time())
-    end_dt = datetime.combine(end_date, datetime.max.time())
-    
-    price_df_filtered = price_df[(price_df.index >= start_dt) & (price_df.index <= end_dt)]
+    price_df_filtered = price_df[(price_df.index.date >= start_date) & (price_df.index.date <= end_date)]
     
     # --- Analysis Date Selector (Maturity Roll) ---
     st.sidebar.header("3. Curve Analysis Date")
     
-    # Analysis date should be within the historical range for stability
     default_analysis_date = end_date
     if default_analysis_date < min_date:
         default_analysis_date = min_date
@@ -384,7 +707,6 @@ if price_df is not None and expiry_df is not None:
         key='analysis_date'
     )
     
-    # Ensure analysis_date is a datetime object for comparison
     analysis_dt = datetime.combine(analysis_date, datetime.min.time())
     
 else:
@@ -395,7 +717,7 @@ else:
 # --- Core Processing Logic ---
 if not price_df_filtered.empty:
     
-    # 1. Get the list of relevant contracts based on the analysis date
+    # 1. Get the list of relevant contracts
     future_expiries_df = get_analysis_contracts(expiry_df, analysis_dt)
     
     if future_expiries_df.empty:
@@ -409,58 +731,43 @@ if not price_df_filtered.empty:
         st.warning("Data transformation failed. Check if contracts in the price file match contracts in the expiry file.")
         st.stop()
         
-    # 3. Calculate Spreads and Butterflies (Inputs for PCA and comparison)
+    # 3. Calculate Derivatives
     st.header("1. Data Derivatives Check (Contracts relevant to selected Analysis Date)")
     
-    # Calculate Spreads
-    spreads_df = calculate_outright_spreads(analysis_curve_df)
-    st.markdown("##### Outright Spreads (e.g., Z20-H21, H21-M21, etc.)")
+    # 3M (k=1) - Used for PCA input
+    spreads_3M_df_raw = calculate_k_step_spreads(analysis_curve_df, 1) # No prefix here
+    butterflies_3M_df = calculate_k_step_butterflies(analysis_curve_df, 1)
     
-    # Display logic adjusted to show data around analysis date for better context
-    try:
-        # **FIXED: Changed KeyError to a general Exception to catch the TypeError**
-        idx = spreads_df.index.get_loc(analysis_dt, method='nearest')
-        start_idx = max(0, idx - 2)
-        end_idx = min(len(spreads_df), idx + 3)
-        st.dataframe(spreads_df.iloc[start_idx:end_idx].fillna('None'))
-        st.caption(f"Showing spreads around the Analysis Date: {analysis_date.strftime('%Y-%m-%d')}")
-    except Exception:
-        st.dataframe(spreads_df.head(5).fillna('None'))
-        st.caption("Showing latest 5 dates (Date lookup failed).")
-
+    # 6M (k=2)
+    spreads_6M_df = calculate_k_step_spreads(analysis_curve_df, 2)
+    butterflies_6M_df = calculate_k_step_butterflies(analysis_curve_df, 2)
     
-    if spreads_df.empty:
-        st.warning("Spreads could not be calculated. Need at least two contracts in the analysis curve.")
+    # 12M (k=4)
+    spreads_12M_df = calculate_k_step_spreads(analysis_curve_df, 4)
+    butterflies_12M_df = calculate_k_step_butterflies(analysis_curve_df, 4)
+    
+    st.markdown("##### 3-Month Outright Spreads (k=1, e.g., Z25-H26)")
+    st.dataframe(spreads_3M_df_raw.head(5))
+    
+    if spreads_3M_df_raw.empty:
+        st.warning("3M Spreads could not be calculated. Need at least two contracts in the analysis curve.")
         st.stop()
         
-    # Calculate Butterflies
-    butterflies_df = calculate_butterflies(analysis_curve_df)
-    st.markdown("##### Butterflies (e.g., Z20-2xH21+M21, etc.)")
+    # 4. Perform PCA
+    # 4a. PCA on 3M Spreads (Standard Method - Used for Fair Curve Reconstruction & Hedging)
+    loadings_spread, explained_variance_ratio, eigenvalues, scores, spreads_3M_df_clean = perform_pca(spreads_3M_df_raw)
     
-    # Display logic adjusted to show data around analysis date for better context
-    try:
-        # **FIXED: Changed KeyError to a general Exception to catch the TypeError**
-        idx = butterflies_df.index.get_loc(analysis_dt, method='nearest')
-        start_idx = max(0, idx - 2)
-        end_idx = min(len(butterflies_df), idx + 3)
-        st.dataframe(butterflies_df.iloc[start_idx:end_idx].fillna('None'))
-        st.caption(f"Showing butterflies around the Analysis Date: {analysis_date.strftime('%Y-%m-%d')}")
-    except Exception:
-        st.dataframe(butterflies_df.head(5).fillna('None'))
-        st.caption("Showing latest 5 dates (Date lookup failed).")
+    # 4b. PCA on Outright Prices (User Requested Independent Method - Unstandardized/Covariance)
+    loadings_outright_direct, explained_variance_outright_direct = perform_pca_on_prices(analysis_curve_df)
 
 
-    # 4. Perform PCA on Spreads
-    # PCA is performed only on spreads, as they are the most stationary features
-    loadings, explained_variance, scores, spreads_df_clean = perform_pca(spreads_df)
-
-    if loadings is not None:
+    if loadings_spread is not None and loadings_outright_direct is not None:
         
         # --- Explained Variance Visualization ---
         st.header("2. Explained Variance")
         variance_df = pd.DataFrame({
-            'Principal Component': [f'PC{i+1}' for i in range(len(explained_variance))],
-            'Explained Variance (%)': explained_variance * 100
+            'Principal Component': [f'PC{i+1}' for i in range(len(explained_variance_ratio))],
+            'Explained Variance (%)': explained_variance_ratio * 100
         })
         variance_df['Cumulative Variance (%)'] = variance_df['Explained Variance (%)'].cumsum()
         
@@ -468,35 +775,38 @@ if not price_df_filtered.empty:
         with col_var:
             st.dataframe(variance_df, use_container_width=True)
             
-        # Determine how many components to use for fair curve reconstruction
-        default_pc_count = min(3, len(explained_variance))
+        default_pc_count = min(3, len(explained_variance_ratio))
         with col_pca_select:
-            st.subheader("Fair Curve Setup")
+            st.subheader("Fair Curve & Hedging Setup")
             pc_count = st.slider(
-                "Select number of Principal Components (PCs) for Fair Curve:",
+                "Select number of Principal Components (PCs) for Fair Curve & Hedging:",
                 min_value=1,
-                max_value=len(explained_variance),
+                max_value=len(explained_variance_ratio),
                 value=default_pc_count,
-                help="Typically, the first 3 components (Level, Slope, Curve) explain over 95% of variance in spread changes."
+                key='pc_slider'
             )
-            
             total_explained = variance_df['Cumulative Variance (%)'].iloc[pc_count - 1]
-            st.info(f"The selected **{pc_count} PCs** explain **{total_explained:.2f}%** of the total variance in the spreads.")
+            st.info(f"The selected **{pc_count} PCs** explain **{total_explained:.2f}%** of the total variance in the spreads. This is the risk model used.")
         
         
-        # --- Component Loadings Heatmap ---
-        st.header("3. PC Loadings Heatmap (PC vs. Spreads)")
+        # --- Component Loadings Heatmaps ---
+        st.header("3. PC Loadings")
+        
+        # --- 3.1 Spread Loadings (Standard Method) ---
+        st.subheader("3.1 PC Loadings Heatmap (PC vs. 3M Spreads)")
         st.markdown("""
-            This heatmap shows the weights of the first few PCs on each **Spread**. These weights define the fundamental Level, Slope, and Curvature factors.
+            This heatmap shows the **Loadings (Eigenvectors)** of the first few PCs on each **3-Month Spread**. These weights are derived from **Standardized PCA** and represent how each spread contributes to the overall risk factors (Level, Slope, Curvature).
+            
+            * **Interpretation of Loadings (Weights):** The value of the loading (weight) indicates the **sensitivity** of that specific spread to the respective Principal Component. A high absolute value means the spread has historically been highly correlated with the movement of that PC factor.
         """)
         
         plt.style.use('default') 
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig_spread_loading, ax_spread_loading = plt.subplots(figsize=(12, 6))
         
-        loadings_plot = loadings.iloc[:, :default_pc_count]
+        loadings_spread_plot = loadings_spread.iloc[:, :default_pc_count]
 
         sns.heatmap(
-            loadings_plot, 
+            loadings_spread_plot, 
             annot=True, 
             cmap='coolwarm', 
             fmt=".2f", 
@@ -504,47 +814,47 @@ if not price_df_filtered.empty:
             linecolor='gray', 
             cbar_kws={'label': 'Loading Weight'}
         )
-        ax.set_title(f'Component Loadings for First {default_pc_count} Principal Components', fontsize=16)
-        ax.set_xlabel('Principal Component')
-        ax.set_ylabel('Spread Contract')
-        st.pyplot(fig)
+        ax_spread_loading.set_title(f'3.1 Component Loadings for First {default_pc_count} Principal Components (on Spreads)', fontsize=16)
+        ax_spread_loading.set_xlabel('Principal Component')
+        ax_spread_loading.set_ylabel('Spread Contract')
+        st.pyplot(fig_spread_loading)
         
-        # --- NEW SECTION: Outright Loadings Plot ---
-        st.header("4. PC Loadings vs. Outright Contract Levels")
-        st.markdown("This plot shows the **impact** (sensitivity) of a 1-unit movement in each PC on the **outright price** of each contract.")
         
-        outright_loadings_df = calculate_outright_loadings(loadings, contract_labels)
+        # --- 3.2 Outright Loadings (User Requested Independent Method) ---
+        st.subheader("3.2 PC Loadings Heatmap (PC vs. Outright Contracts - Absolute Sensitivity)")
         
-        if not outright_loadings_df.empty:
-            plt.style.use('default') 
-            fig, ax = plt.subplots(figsize=(12, 6))
+        pc1_outright_variance = explained_variance_outright_direct[0] * 100
+        st.markdown(f"""
+            This heatmap shows the **independent sensitivity** of each **outright contract price** to the principal components. This result is based on **Unstandardized PCA (Covariance Matrix)**, meaning the weights reflect the **absolute historical price volatility and duration** of each contract.
             
-            # Plot the first 3 or default number of components
-            num_factors_to_plot = min(3, outright_loadings_df.shape[1]) 
-            
-            for i in range(num_factors_to_plot):
-                pc_label = f'PC{i+1}'
-                ax.plot(
-                    outright_loadings_df.index, 
-                    outright_loadings_df[pc_label], 
-                    marker='o', 
-                    linestyle='-', 
-                    label=pc_label
-                )
-                
-            ax.axhline(0, color='r', linestyle='--', linewidth=0.8)
-            ax.set_title(f'Impact of Factors (PC Loadings) on Outright Prices', fontsize=16)
-            ax.set_xlabel('Contract Maturity')
-            ax.set_ylabel('Outright Price Loading (Factor Sensitivity)')
-            ax.legend(loc='upper right')
-            ax.grid(True, linestyle=':', alpha=0.6)
-            plt.xticks(rotation=45, ha='right')
-            plt.tight_layout()
-            st.pyplot(fig)
+            **PC1 Explained Variance (Absolute Price):** **{pc1_outright_variance:.2f}%**
+        """)
+        
+        fig_outright_loading, ax_outright_loading = plt.subplots(figsize=(12, 6))
+        
+        loadings_outright_plot = loadings_outright_direct.iloc[:, :default_pc_count]
 
+        max_abs = loadings_outright_plot.abs().max().max()
+        
+        sns.heatmap(
+            loadings_outright_plot, 
+            annot=True, 
+            cmap='coolwarm', 
+            fmt=".4f",
+            linewidths=0.5, 
+            linecolor='gray', 
+            vmin=-max_abs, 
+            vmax=max_abs,
+            cbar_kws={'label': 'Absolute Price Sensitivity (Eigenvector Weight)'}
+        )
+        ax_outright_loading.set_title(f'3.2 Component Loadings for First {default_pc_count} PCs (Unstandardized Outright Prices)', fontsize=16)
+        ax_outright_loading.set_xlabel('Principal Component')
+        ax_outright_loading.set_ylabel('Outright Contract')
+        st.pyplot(fig_outright_loading)
+        
         
         # --- PC Scores Time Series Plot ---
-        def plot_pc_scores(scores_df, explained_variance):
+        def plot_pc_scores(scores_df, explained_variance_ratio):
             """Plots the time series of the first 3 PC scores."""
             
             pc_labels = ['Level (PC1)', 'Slope (PC2)', 'Curvature (PC3)']
@@ -559,7 +869,7 @@ if not price_df_filtered.empty:
             for i in range(num_pcs):
                 ax = axes[i]
                 pc_label = pc_labels[i]
-                variance_pct = explained_variance[i] * 100
+                variance_pct = explained_variance_ratio[i] * 100
                 
                 ax.plot(scores_df.index, scores_df.iloc[:, i], label=f'{pc_label} ({variance_pct:.2f}% Var.)', linewidth=1.5, color=plt.cm.tab10(i))
                 
@@ -574,77 +884,139 @@ if not price_df_filtered.empty:
             plt.tight_layout(rect=[0, 0.03, 1, 0.98])
             return fig
 
-        st.header("5. PC Factor Scores Time Series")
-        st.markdown("This plot shows the historical movement of the **latent risk factors** (Level, Slope, and Curvature) over the chosen historical range.")
-        fig_scores = plot_pc_scores(scores, explained_variance)
+        st.header("4. PC Factor Scores Time Series")
+        st.markdown("This plot shows the historical movement of the **latent risk factors** (Level, Slope, and Curvature) over the chosen historical range. The scores are derived from the **Spread PCA (3.1)**.")
+        fig_scores = plot_pc_scores(scores, explained_variance_ratio)
         if fig_scores:
             st.pyplot(fig_scores)
             
-        # --- NEW SECTION: PC Factor Z-Scores ---
-        st.header("6. PC Factor Z-Scores (Trading Signal)")
         
-        z_scores_historical, current_z_score = calculate_z_scores(scores, analysis_dt)
-
-        if current_z_score is not None:
-            st.markdown(f"Z-Scores for the curve on **{current_z_score.columns[0].strftime('%Y-%m-%d')}** relative to the historical distribution (using nearest date):")
-            
-            # Use the first few columns (PCs) for display
-            num_pcs_to_display = min(5, current_z_score.shape[0])
-            
-            st.dataframe(
-                current_z_score.T.iloc[:, :num_pcs_to_display].style.applymap(
-                    lambda x: 'background-color: #ffcccc' if abs(x) >= 2 else '', subset=current_z_score.index[:num_pcs_to_display]
-                ).format("{:.2f}"),
-                use_container_width=True
-            )
-            st.caption("A Z-score outside the $\pm 2.0$ range is often considered a statistical extreme (signal).")
-        else:
-             st.warning(f"Z-Score calculation skipped. Analysis Date {analysis_date.strftime('%Y-%m-%d')} not found or failed to match nearest date in PC Scores data.")
-            
+        # --- Historical Reconstruction (Based on Spread PCA) ---
         
-        # --- Historical Reconstruction ---
-        
-        # 1. Reconstruct Spreads using only selected PCs
-        data_mean = spreads_df_clean.mean()
-        data_std = spreads_df_clean.std()
+        # 1. Reconstruct 3M Spreads using only selected PCs
+        data_mean = spreads_3M_df_clean.mean()
+        data_std = spreads_3M_df_clean.std()
         scores_used = scores.values[:, :pc_count]
-        loadings_used = loadings.values[:, :pc_count]
+        loadings_used = loadings_spread.values[:, :pc_count]
         
         reconstructed_scaled = scores_used @ loadings_used.T
         
-        reconstructed_spreads = pd.DataFrame(
+        # NOTE: The reconstructed spreads DF still uses the simple, unprefixed labels
+        reconstructed_spreads_3M = pd.DataFrame(
             reconstructed_scaled * data_std.values + data_mean.values,
-            index=spreads_df_clean.index, 
-            columns=spreads_df_clean.columns
+            index=spreads_3M_df_clean.index, 
+            columns=spreads_3M_df_clean.columns
         )
 
-        # 2. Reconstruct Outright Prices, Spreads, and Flies
-        historical_outrights_df, historical_spreads_df, historical_butterflies_df = \
-            reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads, spreads_df, butterflies_df)
+        # 2. Reconstruct Outright Prices and ALL Derivatives (3M, 6M, 12M)
+        historical_outrights_df, historical_spreads_3M_df, historical_butterflies_3M_df, historical_spreads_6M_df, historical_butterflies_6M_df, historical_spreads_12M_df, historical_butterflies_12M_df, spreads_3M_df_no_prefix = \
+            reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_3M, spreads_3M_df_raw, spreads_6M_df, butterflies_3M_df, butterflies_6M_df, spreads_12M_df, butterflies_12M_df)
 
         
-        
-        # --- Cross-Sectional Curve Plot for Single Date ---
-        st.header("7. Curve Snapshot Analysis: " + analysis_date.strftime('%Y-%m-%d'))
-        st.markdown("This section plots the **current market values** (Original) against the **PCA Fair curve/spread/fly** for the selected date. The vertical difference is the theoretical mispricing.")
+        # --- HELPER FUNCTION FOR PLOTTING SNAPSHOTS (defined here to use local variables) ---
+        def plot_snapshot(historical_df, derivative_type, analysis_dt, pc_count):
+            """Plots and displays the table for a single derivative type snapshot."""
+            
+            if historical_df.empty:
+                 st.info(f"Not enough contracts to calculate and plot {derivative_type} snapshot.")
+                 return
+                 
+            try:
+                # 1. Select the single day's data
+                snapshot_original = historical_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
+                snapshot_pca = historical_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
+                
+                # 2. Rename column (which is the datetime key) and clean the index labels
+                snapshot_original.columns = ['Original']
+                # Index labels contain the full prefix and the '(Original)' suffix (e.g., '3M Spread: Z25-H26 (Original)')
+                snapshot_original.index = snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
 
-        # --- 7.1 Outright Price Snapshot ---
-        st.subheader("7.1 Outright Price Curve")
+                snapshot_pca.columns = ['PCA Fair']
+                snapshot_pca.index = snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
+
+                # 3. Concatenate and drop NaNs (if any value is missing for a contract)
+                comparison = pd.concat([snapshot_original, snapshot_pca], axis=1).dropna()
+                
+                if comparison.empty:
+                    st.warning(f"No complete {derivative_type} data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
+                    return
+
+                # --- Plot the Derivative ---
+                fig, ax = plt.subplots(figsize=(15, 7))
+                
+                ax.plot(comparison.index, comparison['Original'], 
+                              label=f'Original Market {derivative_type}', marker='o', linestyle='-', linewidth=2.5, color='blue')
+                
+                ax.plot(comparison.index, comparison['PCA Fair'], 
+                              label=f'PCA Fair {derivative_type} ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='red')
+                
+                mispricing = comparison['Original'] - comparison['PCA Fair']
+                ax.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) 
+                
+                # Annotate the derivative with the largest absolute mispricing
+                max_abs_mispricing = mispricing.abs().max()
+                if max_abs_mispricing > 0:
+                    mispricing_contract = mispricing.abs().idxmax()
+                    mispricing_value = mispricing.loc[mispricing_contract] * 10000 # Convert to BPS
+                    
+                    ax.annotate(
+                        f"Mispricing: {mispricing_value:.2f} BPS",
+                        (mispricing_contract, comparison.loc[mispricing_contract]['Original']),
+                        textcoords="offset points",
+                        xytext=(0, 10),
+                        ha='center',
+                        fontsize=10,
+                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
+                    )
+                
+                ax.set_title(f'Market {derivative_type} vs. PCA Fair {derivative_type}', fontsize=16)
+                ax.set_xlabel(f'{derivative_type} Contract')
+                ax.set_ylabel(f'{derivative_type} Value (Price Difference)')
+                ax.legend(loc='upper right')
+                ax.grid(True, linestyle=':', alpha=0.6)
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                st.pyplot(fig)
+                
+                # --- Detailed Table ---
+                st.markdown(f"###### {derivative_type} Mispricing")
+                detailed_comparison = comparison.copy()
+                detailed_comparison.index.name = f'{derivative_type} Contract'
+                detailed_comparison['Mispricing (BPS)'] = mispricing * 10000
+                detailed_comparison = detailed_comparison.rename(
+                    columns={'Original': f'Original {derivative_type}', 'PCA Fair': f'PCA Fair {derivative_type}'}
+                )
+                
+                st.dataframe(
+                    detailed_comparison.style.format({
+                        f'Original {derivative_type}': "{:.4f}",
+                        f'PCA Fair {derivative_type}': "{:.4f}",
+                        'Mispricing (BPS)': "{:.2f}"
+                    }),
+                    use_container_width=True
+                )
+
+            except KeyError:
+                st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for {derivative_type}. Please choose a different date within the historical range.")
+        # --- END HELPER FUNCTION ---
+
+
+        # --- 5. Curve Snapshot Analysis ---
+        st.header("5. Curve Snapshot Analysis: " + analysis_date.strftime('%Y-%m-%d'))
+
+        # --- 5.1 Outright Price Snapshot ---
+        st.subheader("5.1 Outright Price Curve")
         
-        # Get the single-day snapshot for Outright Prices
         try:
-            # 1. Select the single day's data, ensuring DataFrame structure
             curve_snapshot_original = historical_outrights_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
             curve_snapshot_pca = historical_outrights_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
             
-            # 2. Rename column (which is the datetime key) and clean the index labels
             curve_snapshot_original.columns = ['Original']
             curve_snapshot_original.index = curve_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
 
             curve_snapshot_pca.columns = ['PCA Fair']
             curve_snapshot_pca.index = curve_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
 
-            # 3. Concatenate and drop NaNs (if any value is missing for a contract)
             curve_comparison = pd.concat([curve_snapshot_original, curve_snapshot_pca], axis=1).dropna()
             
             if curve_comparison.empty:
@@ -653,22 +1025,18 @@ if not price_df_filtered.empty:
                 # --- Plot the Curve ---
                 fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
                 
-                # Plot Original Curve
                 ax_curve.plot(curve_comparison.index, curve_comparison['Original'], 
                               label='Original Market Curve', marker='o', linestyle='-', linewidth=2.5, color='blue')
                 
-                # Plot PCA Fair Curve
                 ax_curve.plot(curve_comparison.index, curve_comparison['PCA Fair'], 
                               label=f'PCA Fair Curve ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='red')
                 
-                # Plot Mispricing (Original - PCA Fair)
                 mispricing = curve_comparison['Original'] - curve_comparison['PCA Fair']
                 
-                # Annotate the contracts with the largest absolute mispricing
                 max_abs_mispricing = mispricing.abs().max()
                 if max_abs_mispricing > 0:
                     mispricing_contract = mispricing.abs().idxmax()
-                    mispricing_value = mispricing.loc[mispricing_contract] * 10000 # Convert to BPS
+                    mispricing_value = mispricing.loc[mispricing_contract] * 10000 
                     
                     ax_curve.annotate(
                         f"Mispricing: {mispricing_value:.2f} BPS",
@@ -692,17 +1060,13 @@ if not price_df_filtered.empty:
                 # --- Detailed Contract Price/Rate Table (Outright) ---
                 st.markdown("###### Outright Price and Rate Mispricing")
                 
-                # Create the detailed table
                 detailed_comparison = curve_comparison.copy()
                 detailed_comparison.index.name = 'Contract'
                 
-                # Calculate Rates (Yields) and Mispricing in BPS
                 detailed_comparison['Original Rate (%)'] = 100.0 - detailed_comparison['Original']
                 detailed_comparison['PCA Fair Rate (%)'] = 100.0 - detailed_comparison['PCA Fair']
-                # Mispricing in Price terms (Original Price - PCA Fair Price) * 10,000 to get BPS
                 detailed_comparison['Mispricing (BPS)'] = (detailed_comparison['Original'] - detailed_comparison['PCA Fair']) * 10000
 
-                # Reorder columns and rename Price columns
                 detailed_comparison = detailed_comparison.rename(
                     columns={'Original': 'Original Price', 'PCA Fair': 'PCA Fair Price'}
                 )
@@ -715,7 +1079,6 @@ if not price_df_filtered.empty:
                     'Mispricing (BPS)'
                 ]]
                 
-                # Display the table, formatted for financial data
                 st.dataframe(
                     detailed_comparison.style.format({
                         'Original Price': "{:.4f}",
@@ -731,173 +1094,290 @@ if not price_df_filtered.empty:
             st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Outright Prices. Please choose a different date within the historical range.")
 
         
-        # --- 7.2 Spread Snapshot ---
-        st.subheader("7.2 Spread Snapshot")
+        # --- 5.2 Spread Snapshot (3M) ---
+        st.subheader("5.2 3M Spread Snapshot (k=1, e.g., Z25-H26)")
+        plot_snapshot(historical_spreads_3M_df, "3M Spread", analysis_dt, pc_count)
 
-        try:
-            # 1. Select the single day's data, ensuring DataFrame structure
-            spread_snapshot_original = historical_spreads_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
-            spread_snapshot_pca = historical_spreads_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
+
+        # --- 5.3 Butterfly (Fly) Snapshot (3M) ---
+        if not historical_butterflies_3M_df.empty:
+            st.subheader("5.3 3M Butterfly (Fly) Snapshot (k=1, e.g., Z25-2xH26+M26)")
+            plot_snapshot(historical_butterflies_3M_df, "3M Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 3 or more) to calculate and plot 3M butterfly snapshot.")
             
-            # 2. Rename column (which is the datetime key) and clean the index labels
-            spread_snapshot_original.columns = ['Original']
-            spread_snapshot_original.index = spread_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
+        # --------------------------- 6-Month (k=2) Derivatives ---------------------------
+        
+        # --- 5.4 Spread Snapshot (6M) ---
+        st.subheader("5.4 6M Spread Snapshot (k=2, e.g., Z25-M26)")
+        plot_snapshot(historical_spreads_6M_df, "6M Spread", analysis_dt, pc_count)
 
-            spread_snapshot_pca.columns = ['PCA Fair']
-            spread_snapshot_pca.index = spread_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
+        # --- 5.5 Butterfly (Fly) Snapshot (6M) ---
+        if not historical_butterflies_6M_df.empty:
+            st.subheader("5.5 6M Butterfly (Fly) Snapshot (k=2, e.g., Z25-2xM26+Z26)")
+            plot_snapshot(historical_butterflies_6M_df, "6M Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 5 or more) to calculate and plot 6M butterfly snapshot.")
 
-            # 3. Concatenate and drop NaNs
-            spread_comparison = pd.concat([spread_snapshot_original, spread_snapshot_pca], axis=1).dropna()
+        # --------------------------- 12-Month (k=4) Derivatives ---------------------------
             
-            if spread_comparison.empty:
-                st.warning(f"No complete Spread data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
-            else:
-                # --- Plot the Spreads ---
-                fig_spread, ax_spread = plt.subplots(figsize=(15, 7))
+        # --- 5.6 Spread Snapshot (12M) ---
+        st.subheader("5.6 12M Spread Snapshot (k=4, e.g., Z25-Z26)")
+        plot_snapshot(historical_spreads_12M_df, "12M Spread", analysis_dt, pc_count)
+
+        # --- 5.7 Butterfly (Fly) Snapshot (12M) ---
+        if not historical_butterflies_12M_df.empty:
+            st.subheader("5.7 12M Butterfly (Fly) Snapshot (k=4, e.g., Z25-2xZ26+Z27)")
+            plot_snapshot(historical_butterflies_12M_df, "12M Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 9 or more) to calculate and plot 12M butterfly snapshot.")
+
+
+        # --------------------------- 6. PCA-Based Hedging Strategy (3M Spreads ONLY - Original Section) ---------------------------
+        st.header("6. PCA-Based Hedging Strategy (3M Spreads ONLY - Original Section)")
+        st.markdown(f"""
+            This section calculates the **Minimum Variance Hedge Ratio ($k^*$ )** for a chosen **3M spread** trade, using *another 3M spread* as the hedge. The calculation uses the **Covariance Matrix** of the **3M spreads**, which is **reconstructed using the selected {pc_count} Principal Components**.
+            
+            * **Trade:** Long 1 unit of the selected 3M spread.
+            * **Hedge:** Short $k^*$ units of the hedging 3M spread.
+        """)
+        
+        if spreads_3M_df_clean.shape[1] < 2:
+            st.warning("Need at least two 3M spreads to analyze hedging.")
+        else:
+            
+            # NOTE: trade_selection_3m uses the simple contract spread label (e.g., Z25-H26)
+            default_trade = spreads_3M_df_clean.columns[0]
                 
-                # Plot Original Spread
-                ax_spread.plot(spread_comparison.index, spread_comparison['Original'], 
-                              label='Original Market Spread', marker='o', linestyle='-', linewidth=2.5, color='darkgreen')
+            trade_selection_3m = st.selectbox(
+                "Select Trade Spread (Long 1 unit):", 
+                options=spreads_3M_df_clean.columns.tolist(),
+                index=spreads_3M_df_clean.columns.get_loc(default_trade) if default_trade in spreads_3M_df_clean.columns else 0,
+                key='trade_spread_select_3m'
+            )
+            
+            # CALL TO THE ORIGINAL 3M SPREAD FUNCTION
+            best_hedge_data_3m, worst_hedge_data_3m, all_results_df_full_3m = calculate_best_and_worst_hedge_3M(
+                trade_selection_3m, loadings_spread, eigenvalues, pc_count, spreads_3M_df_clean
+            )
+            
+            if best_hedge_data_3m is not None:
                 
-                # Plot PCA Fair Spread
-                ax_spread.plot(spread_comparison.index, spread_comparison['PCA Fair'], 
-                              label=f'PCA Fair Spread ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='orange')
+                col_best, col_worst = st.columns(2)
                 
-                # Plot Mispricing (Original - PCA Fair)
-                mispricing = spread_comparison['Original'] - spread_comparison['PCA Fair']
-                ax_spread.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) # Add zero line for reference
-                
-                # Annotate the spread with the largest absolute mispricing
-                max_abs_mispricing = mispricing.abs().max()
-                if max_abs_mispricing > 0:
-                    mispricing_spread = mispricing.abs().idxmax()
-                    mispricing_value = mispricing.loc[mispricing_spread] * 10000 # Convert to BPS
+                with col_best:
+                    st.success(f"Best Hedge for **Long 1x {trade_selection_3m}**")
+                    st.markdown(f"""
+                        - **Hedge Spread:** **{best_hedge_data_3m['Hedge Spread']}**
+                        - **Hedge Action:** Short **{best_hedge_data_3m['Hedge Ratio (k*)']:.4f}** units.
+                        - **Residual Volatility (Score):** **{best_hedge_data_3m['Residual Volatility (BPS)']:.2f} BPS** (Lowest Risk)
+                    """)
                     
-                    ax_spread.annotate(
-                        f"Mispricing: {mispricing_value:.2f} BPS",
-                        (mispricing_spread, spread_comparison.loc[mispricing_spread]['Original']),
-                        textcoords="offset points",
-                        xytext=(0, 10),
-                        ha='center',
-                        fontsize=10,
-                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
-                    )
+                with col_worst:
+                    st.error(f"Worst Hedge for **Long 1x {trade_selection_3m}**")
+                    st.markdown(f"""
+                        - **Hedge Spread:** **{worst_hedge_data_3m['Hedge Spread']}**
+                        - **Hedge Action:** Short **{worst_hedge_data_3m['Hedge Ratio (k*)']:.4f}** units.
+                        - **Residual Volatility (Score):** **{worst_hedge_data_3m['Residual Volatility (BPS)']:.2f} BPS** (Highest Risk)
+                    """)
+                    
+                st.markdown("---")
+                st.markdown("###### Detailed Hedging Results (All 3M Spreads as Hedge Candidates)")
                 
-                ax_spread.set_title('Market Spread vs. PCA Fair Spread', fontsize=16)
-                ax_spread.set_xlabel('Spread Contract (Short-Long)')
-                ax_spread.set_ylabel('Spread Value (Price Difference)')
-                ax_spread.legend(loc='upper right')
-                ax_spread.grid(True, linestyle=':', alpha=0.6)
-                plt.xticks(rotation=45, ha='right')
-                plt.tight_layout()
-                st.pyplot(fig_spread)
-                
-                # --- Detailed Spread Table ---
-                st.markdown("###### Spread Mispricing")
-                detailed_comparison_spread = spread_comparison.copy()
-                detailed_comparison_spread.index.name = 'Spread Contract'
-                detailed_comparison_spread['Mispricing (BPS)'] = mispricing * 10000
-                detailed_comparison_spread = detailed_comparison_spread.rename(
-                    columns={'Original': 'Original Spread', 'PCA Fair': 'PCA Fair Spread'}
-                )
-                
+                # Use the full results DataFrame directly and sort it for display
+                all_results_df_full_3m = all_results_df_full_3m.sort_values(by='Residual Volatility (BPS)', ascending=True)
+
                 st.dataframe(
-                    detailed_comparison_spread.style.format({
-                        'Original Spread': "{:.4f}",
-                        'PCA Fair Spread': "{:.4f}",
-                        'Mispricing (BPS)': "{:.2f}"
+                    all_results_df_full_3m.style.format({
+                        'Hedge Ratio (k*)': "{:.4f}",
+                        'Residual Volatility (BPS)': "{:.2f}"
                     }),
                     use_container_width=True
                 )
-
-        except KeyError:
-            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Spreads. Please choose a different date within the historical range.")
-
-
-        # --- 7.3 Butterfly (Fly) Snapshot ---
-        if not historical_butterflies_df.empty:
-            st.subheader("7.3 Butterfly (Fly) Snapshot")
-
-            try:
-                # 1. Select the single day's data, ensuring DataFrame structure
-                fly_snapshot_original = historical_butterflies_df.filter(regex='\(Original\)$').loc[[analysis_dt]].T
-                fly_snapshot_pca = historical_butterflies_df.filter(regex='\(PCA\)$').loc[[analysis_dt]].T
                 
-                # 2. Rename column (which is the datetime key) and clean the index labels
-                fly_snapshot_original.columns = ['Original']
-                fly_snapshot_original.index = fly_snapshot_original.index.str.replace(r'\s\(Original\)$', '', regex=True)
+            else:
+                st.warning("3M Hedging calculation failed. Check if enough historical data is available after filtering.")
 
-                fly_snapshot_pca.columns = ['PCA Fair']
-                fly_snapshot_pca.index = fly_snapshot_pca.index.str.replace(r'\s\(PCA\)$', '', regex=True)
 
-                # 3. Concatenate and drop NaNs
-                fly_comparison = pd.concat([fly_snapshot_original, fly_snapshot_pca], axis=1).dropna()
-                
-                if fly_comparison.empty:
-                    st.warning(f"No complete Butterfly (Fly) data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
-                else:
-                    # --- Plot the Flies ---
-                    fig_fly, ax_fly = plt.subplots(figsize=(15, 7))
-                    
-                    # Plot Original Fly
-                    ax_fly.plot(fly_comparison.index, fly_comparison['Original'], 
-                                  label='Original Market Fly', marker='o', linestyle='-', linewidth=2.5, color='purple')
-                    
-                    # Plot PCA Fair Fly
-                    ax_fly.plot(fly_comparison.index, fly_comparison['PCA Fair'], 
-                                  label=f'PCA Fair Fly ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='brown')
-                    
-                    # Plot Mispricing (Original - PCA Fair)
-                    mispricing = fly_comparison['Original'] - fly_comparison['PCA Fair']
-                    ax_fly.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7) # Add zero line for reference
-                    
-                    # Annotate the fly with the largest absolute mispricing
-                    max_abs_mispricing = mispricing.abs().max()
-                    if max_abs_mispricing > 0:
-                        mispricing_fly = mispricing.abs().idxmax()
-                        mispricing_value = mispricing.loc[mispricing_fly] * 10000 # Convert to BPS
-                        
-                        ax_fly.annotate(
-                            f"Mispricing: {mispricing_value:.2f} BPS",
-                            (mispricing_fly, fly_comparison.loc[mispricing_fly]['Original']),
-                            textcoords="offset points",
-                            xytext=(0, 10),
-                            ha='center',
-                            fontsize=10,
-                            bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
-                        )
-                    
-                    ax_fly.set_title('Market Butterfly vs. PCA Fair Butterfly', fontsize=16)
-                    ax_fly.set_xlabel('Butterfly Contract (C1-2xC2+C3)')
-                    ax_fly.set_ylabel('Butterfly Value')
-                    ax_fly.legend(loc='upper right')
-                    ax_fly.grid(True, linestyle=':', alpha=0.6)
-                    plt.xticks(rotation=45, ha='right')
-                    plt.tight_layout()
-                    st.pyplot(fig_fly)
-
-                    # --- Detailed Fly Table ---
-                    st.markdown("###### Butterfly (Fly) Mispricing")
-                    detailed_comparison_fly = fly_comparison.copy()
-                    detailed_comparison_fly.index.name = 'Butterfly Contract'
-                    detailed_comparison_fly['Mispricing (BPS)'] = mispricing * 10000
-                    detailed_comparison_fly = detailed_comparison_fly.rename(
-                        columns={'Original': 'Original Fly', 'PCA Fair': 'PCA Fair Fly'}
-                    )
-                    
-                    st.dataframe(
-                        detailed_comparison_fly.style.format({
-                            'Original Fly': "{:.4f}",
-                            'PCA Fair Fly': "{:.4f}",
-                            'Mispricing (BPS)': "{:.2f}"
-                        }),
-                        use_container_width=True
-                    )
-
-            except KeyError:
-                st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Butterflies. Please choose a different date within the historical range.")
-        else:
-            st.info("Not enough contracts (need 3 or more) to calculate and plot butterfly snapshot.")
+        # --------------------------- 7. PCA-Based Generalized Hedging Strategy (Minimum Variance) ---------------------------
+        st.header("7. PCA-Based Generalized Hedging Strategy (Minimum Variance)")
+        st.markdown(f"""
+            This section calculates the **Minimum Variance Hedge Ratio ($k^*$ )** for *any* derivative trade, using *any* other derivative as a hedge. The calculation is based on the **full covariance matrix** of all derivatives, which is **reconstructed using the selected {pc_count} Principal Components** derived from the 3M Spreads.
             
+            * **Trade:** Long 1 unit of the selected instrument.
+            * **Hedge:** Short $k^*$ units of the hedging instrument.
+        """)
+        
+        # --- HEDGING DATA PREPARATION (FOR SECTIONS 7 & 8) ---
+        # 1. Combine all historical derivative time series into one DataFrame
+        # **CRITICAL: Ensure all derivatives have unique, explicit prefixes**
+        all_derivatives_list = [
+            spreads_3M_df_raw.rename(columns=lambda x: f"3M Spread: {x}"), # Uses raw spread DF (no prefix)
+            butterflies_3M_df.rename(columns=lambda x: f"3M Fly: {x}"),
+            spreads_6M_df.rename(columns=lambda x: f"6M Spread: {x}"),
+            butterflies_6M_df.rename(columns=lambda x: f"6M Fly: {x}"),
+            spreads_12M_df.rename(columns=lambda x: f"12M Spread: {x}"),
+            butterflies_12M_df.rename(columns=lambda x: f"12M Fly: {x}"),
+        ]
+        
+        all_derivatives_df = pd.concat(all_derivatives_list, axis=1)
+
+        # 2. Calculate the Generalized Covariance Matrix AND Loadings L_D
+        Sigma_Raw_df, all_derivatives_aligned, loadings_df_gen = calculate_derivatives_covariance_generalized(
+            all_derivatives_df, scores, eigenvalues, pc_count
+        )
+        
+        if Sigma_Raw_df.empty or Sigma_Raw_df.shape[0] < 2:
+            st.warning("Not enough data to calculate generalized hedging correlations.")
+        else:
+            
+            trade_selection_gen = st.selectbox(
+                "Select Trade Instrument (Long 1 unit):", 
+                options=Sigma_Raw_df.columns.tolist(),
+                index=0,
+                key='trade_instrument_select_gen'
+            )
+            
+            # CALL TO THE GENERALIZED MINIMUM VARIANCE FUNCTION
+            best_hedge_data_gen, worst_hedge_data_gen, all_results_df_full_gen = calculate_best_and_worst_hedge_generalized(
+                trade_selection_gen, Sigma_Raw_df
+            )
+            
+            if best_hedge_data_gen is not None:
+                
+                col_best_gen, col_worst_gen = st.columns(2)
+                
+                with col_best_gen:
+                    st.success(f"Best Hedge for **Long 1x {trade_selection_gen}**")
+                    st.markdown(f"""
+                        - **Hedge Instrument:** **{best_hedge_data_gen['Hedge Instrument']}**
+                        - **Hedge Action:** Short **{best_hedge_data_gen['Hedge Ratio (k*)']:.4f}** units.
+                        - **Residual Volatility (Score):** **{best_hedge_data_gen['Residual Volatility (BPS)']:.2f} BPS** (Lowest Risk)
+                    """)
+                    
+                with col_worst_gen:
+                    st.error(f"Worst Hedge for **Long 1x {trade_selection_gen}**")
+                    st.markdown(f"""
+                        - **Hedge Instrument:** **{worst_hedge_data_gen['Hedge Instrument']}**
+                        - **Hedge Action:** Short **{worst_hedge_data_gen['Hedge Ratio (k*)']:.4f}** units.
+                        - **Residual Volatility (Score):** **{worst_hedge_data_gen['Residual Volatility (BPS)']:.2f} BPS** (Highest Risk)
+                    """)
+                    
+                st.markdown("---")
+                st.markdown("###### Detailed Hedging Results (All Derivatives as Hedge Candidates - Sorted by Minimum Variance)")
+                
+                # Use the full results DataFrame directly and sort it for display
+                all_results_df_full_gen = all_results_df_full_gen.sort_values(by='Residual Volatility (BPS)', ascending=True)
+
+                st.dataframe(
+                    all_results_df_full_gen.style.format({
+                        'Hedge Ratio (k*)': "{:.4f}",
+                        'Residual Volatility (BPS)': "{:.2f}"
+                    }),
+                    use_container_width=True
+                )
+                
+            else:
+                st.warning("Generalized Minimum Variance Hedging calculation failed for the selected trade. Check if enough historical data is available after filtering.")
+
+
+        # --------------------------- 8. PCA-Based Factor Hedging Strategy (Sensitivity Hedging - REWRITTEN) ---------------------------
+        st.header("8. PCA-Based Factor Hedging Strategy (Sensitivity Hedging)")
+        st.markdown(f"""
+            This strategy selects a hedge instrument to neutralize a trade's exposure to a **single, specific risk factor** (Level, Slope, or Curvature). The **Hedge Ratio ($k_{{factor}}$)** is determined purely by the ratio of sensitivities (factor exposures) of the trade and the hedge. The table below shows the calculated hedge ratio and the **Residual Volatility (BPS)** *after* applying that factor hedge, calculated using the full $\\Sigma_{{\\text{{Raw}}}}$ covariance matrix.
+            
+            * **Goal:** Neutralize exposure to the selected factor.
+            * **Formula:** $k_{{factor}} = \\frac{{\\text{{Sens}}(\\text{{Trade}}, \\text{{Factor}})}}{{\\text{{Sens}}(\\text{{Hedge}}, \\text{{Factor}})}}$
+            * **Sorting:** Results are sorted by **Residual Volatility** (lowest risk remaining after factor neutralization) to find the 'best suitable' hedge.
+        """)
+        
+        # 1. Calculate the sensitivities from the generalized loadings L_D (same as Section 7 prep)
+        factor_sensitivities_df = calculate_factor_sensitivities(loadings_df_gen, pc_count)
+            
+        if factor_sensitivities_df.empty:
+             st.error("Factor sensitivity data is unavailable. Please ensure Section 7 successfully calculated the loadings.")
+        else:
+            
+            # 2. Setup the selection boxes 
+            col_trade_sel, col_factor_sel = st.columns(2)
+            
+            instrument_options = factor_sensitivities_df.index.tolist()
+            factor_options = factor_sensitivities_df.columns.tolist()
+
+            with col_trade_sel:
+                trade_selection_factor = st.selectbox(
+                    "1. Select Trade Instrument (Long 1 unit):", 
+                    options=instrument_options,
+                    index=0,
+                    key='trade_instrument_factor_table' 
+                )
+            with col_factor_sel:
+                factor_selection = st.selectbox(
+                    "2. Select Factor to Neutralize:", 
+                    options=factor_options,
+                    index=0,
+                    key='factor_select_table' 
+                )
+            
+            st.markdown("---")
+            
+            # 3. Calculate all factor hedges
+            factor_results_df, error_msg = calculate_all_factor_hedges(
+                trade_selection_factor, 
+                factor_selection, 
+                factor_sensitivities_df, 
+                Sigma_Raw_df
+            )
+            
+            # 4. Display Results
+            if error_msg:
+                st.error(f"Factor hedge calculation failed: {error_msg}")
+            elif not factor_results_df.empty:
+                
+                # Filter out hedges with near-zero factor sensitivity (Ratio is meaningless/too large)
+                factor_results_df_clean = factor_results_df.dropna(subset=['Residual Volatility (BPS)'])
+
+                best_hedge_row = factor_results_df_clean.iloc[0]
+                
+                st.success(f"Best Suitable Hedge for Neutralizing **{factor_selection}** Risk is **{best_hedge_row['Hedge Instrument']}**.")
+                st.markdown(f"""
+                    * **Trade Sensitivity to {factor_selection}:** `{best_hedge_row['Trade Sensitivity']:.4f}`
+                    * **Best Hedge Ratio ($k_{{factor}}$):** Short `{best_hedge_row[f'Factor Hedge Ratio (k_factor)']:.4f}` units of **{best_hedge_row['Hedge Instrument']}**.
+                    * **Lowest Residual Volatility:** `{best_hedge_row['Residual Volatility (BPS)']:.2f} BPS`
+                """)
+                
+                st.markdown("---")
+                st.markdown(f"###### Detailed Factor Hedging Results for Trade: **{trade_selection_factor}** (Sorted by Residual Volatility)")
+                
+                # Prepare table for display
+                display_df = factor_results_df.rename(columns={
+                    f'Factor Hedge Ratio (k_factor)': 'Hedge Ratio (k_factor)',
+                    'Residual Volatility (BPS)': 'Residual Volatility (BPS)'
+                })[['Hedge Instrument', 'Hedge Ratio (k_factor)', 'Residual Volatility (BPS)', 'Hedge Sensitivity']]
+                
+                # Format and display
+                st.dataframe(
+                    display_df.style.format({
+                        'Hedge Ratio (k_factor)': "{:.4f}",
+                        'Residual Volatility (BPS)': "{:.2f}",
+                        'Hedge Sensitivity': "{:.4f}",
+                    }),
+                    use_container_width=True
+                )
+                
+            else:
+                 st.info("No hedge candidates could be successfully processed. Check if any instrument has non-zero sensitivity to the selected factor.")
+                 
+            # Display full sensitivities table as before for reference
+            st.markdown("---")
+            st.subheader(f"Factor Sensitivities (Standardized Beta) Table for Reference")
+            st.markdown("This shows the raw input exposures used for the ratio calculation.")
+            
+            st.dataframe(
+                factor_sensitivities_df.style.format("{:.4f}"),
+                use_container_width=True
+            )
+
+
     else:
         st.error("PCA failed. Please check your data quantity and quality.")
