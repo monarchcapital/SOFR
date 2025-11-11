@@ -138,6 +138,40 @@ def calculate_k_step_butterflies(analysis_curve_df, k):
         flies_data[fly_label] = analysis_curve_df.iloc[:, i] - 2 * analysis_curve_df.iloc[:, i+k] + analysis_curve_df.iloc[:, i+2*k]
 
     return pd.DataFrame(flies_data)
+
+# --- NEW: Double Butterfly Calculation Function ---
+@st.cache_data
+def calculate_k_step_double_butterflies(analysis_curve_df, k):
+    """
+    Calculates double butterflies using contracts separated by 'k' steps (e.g., k=1 for 3M DBF).
+    Formula: C_i - 3 * C_{i+k} + 3 * C_{i+2k} - C_{i+3k}
+    Label Format: C_i-3xC_{i+k}+3xC_{i+2k}-C_{i+3k}
+    """
+    # Need 4 contracts: C_i, C_{i+k}, C_{i+2k}, C_{i+3k}
+    if analysis_curve_df.empty or analysis_curve_df.shape[1] < 3 * k + 1:
+        return pd.DataFrame()
+
+    num_contracts = analysis_curve_df.shape[1]
+    dbflies_data = {}
+
+    for i in range(num_contracts - 3 * k):
+        c1_maturity = analysis_curve_df.columns[i]          # C_i
+        c2_maturity = analysis_curve_df.columns[i+k]        # C_{i+k}
+        c3_maturity = analysis_curve_df.columns[i+2*k]      # C_{i+2k}
+        c4_maturity = analysis_curve_df.columns[i+3*k]      # C_{i+3k}
+
+        # DBF = C_i - 3*C_{i+k} + 3*C_{i+2k} - C_{i+3k}
+        dbfly_label = f"{c1_maturity}-3x{c2_maturity}+3x{c3_maturity}-{c4_maturity}"
+
+        dbflies_data[dbfly_label] = (
+            analysis_curve_df.iloc[:, i] 
+            - 3 * analysis_curve_df.iloc[:, i+k] 
+            + 3 * analysis_curve_df.iloc[:, i+2*k] 
+            - analysis_curve_df.iloc[:, i+3*k]
+        )
+
+    return pd.DataFrame(dbflies_data)
+
 # --- END GENERALIZED DERIVATIVE CALCULATION FUNCTIONS ---
 
 
@@ -209,6 +243,7 @@ def perform_pca_on_prices(price_df):
 
 # --- RECONSTRUCTION LOGIC ---
 
+# --- MODIFIED: _reconstruct_derivative now handles 'dbfly' ---
 def _reconstruct_derivative(original_df, reconstructed_prices, derivative_type='spread'):
     """
     Helper to reconstruct a derivative from the reconstructed price curve.
@@ -228,40 +263,28 @@ def _reconstruct_derivative(original_df, reconstructed_prices, derivative_type='
         try:
             if derivative_type == 'spread':
                 # Spread: C_i - C_{i+k}. Label is C_i-C_{i+k} (e.g., Z25-M26)
-                # Handle unique prefixed labels
                 if ':' in label:
-                    # Remove prefix like '3M Spread: ' or '6M Spread: '
                     core_label = label.split(': ')[1] 
                 else:
                     core_label = label
                     
                 c1, c_long = core_label.split('-')
                 
-                # Use the core label without prefix for price lookup, but must append ' (PCA)'
                 reconstructed_data[label + ' (PCA)'] = (
                     reconstructed_prices_aligned[c1 + ' (PCA)'] - reconstructed_prices_aligned[c_long + ' (PCA)']
                 )
             
             elif derivative_type == 'fly':
                 # Fly: C_i - 2 * C_{i+k} + C_{i+2k}. Label format: C_i-2xC_{i+k}+C_{i+2k}
-                # Example: Z25-2xM26+Z26
-                
                 if ':' in label:
                     core_label = label.split(': ')[1] 
                 else:
                     core_label = label
                     
-                # 1. Split on the first '-' to get ['C_i', '2xC_{i+k}+C_{i+2k}']
                 parts = core_label.split('-', 1) 
-                c1 = parts[0] # C_i
-                
-                # 2. Split the second part by '+' to get ['2xC_{i+k}', 'C_{i+2k}']
+                c1 = parts[0] 
                 sub_parts = parts[1].split('+')
-                
-                # 3. Extract C_{i+k} from '2xC_{i+k}'
                 c2_label = sub_parts[0].split('x')[1] 
-                
-                # 4. Extract C_{i+2k}
                 c3_label = sub_parts[1] 
                 
                 # Reconstruct the derivative
@@ -271,9 +294,35 @@ def _reconstruct_derivative(original_df, reconstructed_prices, derivative_type='
                     reconstructed_prices_aligned[c3_label + ' (PCA)']
                 )
             
+            elif derivative_type == 'dbfly':
+                # Double Fly: C_i - 3 * C_{i+k} + 3 * C_{i+2k} - C_{i+3k}. Label format: C_i-3xC_{i+k}+3xC_{i+2k}-C_{i+3k}
+                if ':' in label:
+                    core_label = label.split(': ')[1] 
+                else:
+                    core_label = label
+                    
+                parts = core_label.split('-', 1) 
+                c1 = parts[0] # C_i
+                
+                sub_parts_1 = parts[1].split('+')
+                
+                c2_label = sub_parts_1[0].split('x')[1] # C_{i+k} from '3xC_{i+k}'
+                
+                sub_parts_2 = sub_parts_1[1].split('-')
+                
+                c3_label = sub_parts_2[0].split('x')[1] # C_{i+2k} from '3xC_{i+2k}'
+                c4_label = sub_parts_2[1] # C_{i+3k}
+                
+                # Reconstruct the derivative
+                reconstructed_data[label + ' (PCA)'] = (
+                    reconstructed_prices_aligned[c1 + ' (PCA)'] - 
+                    3 * reconstructed_prices_aligned[c2_label + ' (PCA)'] + 
+                    3 * reconstructed_prices_aligned[c3_label + ' (PCA)'] -
+                    reconstructed_prices_aligned[c4_label + ' (PCA)']
+                )
+            
         except Exception as e:
              # Skip if reconstruction fails due to malformed label or missing price
-             # print(f"Skipping {derivative_type} reconstruction for {label}. Error: {e}")
              continue 
     
     reconstructed_df = pd.DataFrame(reconstructed_data, index=reconstructed_prices_aligned.index)
@@ -284,7 +333,8 @@ def _reconstruct_derivative(original_df, reconstructed_prices, derivative_type='
     return pd.merge(original_df_renamed, reconstructed_df, left_index=True, right_index=True)
 
 
-def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_3M_df, spreads_3M_df, spreads_6M_df, butterflies_3M_df, butterflies_6M_df, spreads_12M_df, butterflies_12M_df):
+# --- MODIFIED: reconstruct_prices_and_derivatives now handles Double Butterflies ---
+def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_3M_df, spreads_3M_df, spreads_6M_df, butterflies_3M_df, butterflies_6M_df, spreads_12M_df, butterflies_12M_df, double_butterflies_3M_df, double_butterflies_6M_df, double_butterflies_12M_df):
     """
     Reconstructs Outright Prices and all derivative types based on the 
     reconstructed 3M spreads (PCA result) and the original nearest contract price anchor.
@@ -299,7 +349,6 @@ def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_
     reconstructed_prices_df = pd.DataFrame(index=analysis_curve_df_aligned.index)
     reconstructed_prices_df[nearest_contract_label + ' (PCA)'] = nearest_contract_original # Anchor
     
-    # The 3M spreads used for PCA reconstruction DO NOT have the '3M Spread: ' prefix
     spreads_3M_df_no_prefix = spreads_3M_df.copy()
 
     # Reconstruct all subsequent contracts using the reconstructed 3M spreads (k=1)
@@ -308,7 +357,6 @@ def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_
         current_maturity = analysis_curve_df_aligned.columns[i]
         spread_label_no_prefix = f"{prev_maturity}-{current_maturity}" # This is always the 3M spread label
 
-        # Check in the reconstructed 3M spreads DataFrame (which has the prefix)
         spread_label_reconstructed = f"3M Spread: {spread_label_no_prefix}"
         
         if spread_label_no_prefix in reconstructed_spreads_3M_df.columns:
@@ -327,9 +375,6 @@ def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_
 
     # --- 2. Reconstruct Derivatives from Reconstructed Prices ---
     
-    # NOTE: The input derivative DFs (spreads_3M_df, etc.) must now contain the prefixes
-    # for the helper function _reconstruct_derivative to work correctly with the labels.
-    
     # Prepare derivative DFs with prefixes for _reconstruct_derivative to correctly rename columns
     spreads_3M_df_prefixed = spreads_3M_df_no_prefix.rename(columns=lambda x: f"3M Spread: {x}")
     butterflies_3M_df_prefixed = butterflies_3M_df.rename(columns=lambda x: f"3M Fly: {x}")
@@ -338,6 +383,11 @@ def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_
     spreads_12M_df_prefixed = spreads_12M_df.rename(columns=lambda x: f"12M Spread: {x}")
     butterflies_12M_df_prefixed = butterflies_12M_df.rename(columns=lambda x: f"12M Fly: {x}")
     
+    # New Double Butterfly DFs
+    double_butterflies_3M_df_prefixed = double_butterflies_3M_df.rename(columns=lambda x: f"3M Double Fly: {x}")
+    double_butterflies_6M_df_prefixed = double_butterflies_6M_df.rename(columns=lambda x: f"6M Double Fly: {x}")
+    double_butterflies_12M_df_prefixed = double_butterflies_12M_df.rename(columns=lambda x: f"12M Double Fly: {x}")
+
     historical_spreads_3M = _reconstruct_derivative(spreads_3M_df_prefixed, reconstructed_prices_df, derivative_type='spread')
     historical_butterflies_3M = _reconstruct_derivative(butterflies_3M_df_prefixed, reconstructed_prices_df, derivative_type='fly')
     
@@ -347,7 +397,13 @@ def reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_
     historical_spreads_12M = _reconstruct_derivative(spreads_12M_df_prefixed, reconstructed_prices_df, derivative_type='spread')
     historical_butterflies_12M = _reconstruct_derivative(butterflies_12M_df_prefixed, reconstructed_prices_df, derivative_type='fly')
     
-    return historical_outrights, historical_spreads_3M, historical_butterflies_3M, historical_spreads_6M, historical_butterflies_6M, historical_spreads_12M, historical_butterflies_12M, spreads_3M_df_no_prefix
+    # New Double Butterfly reconstructions
+    historical_double_butterflies_3M = _reconstruct_derivative(double_butterflies_3M_df_prefixed, reconstructed_prices_df, derivative_type='dbfly')
+    historical_double_butterflies_6M = _reconstruct_derivative(double_butterflies_6M_df_prefixed, reconstructed_prices_df, derivative_type='dbfly')
+    historical_double_butterflies_12M = _reconstruct_derivative(double_butterflies_12M_df_prefixed, reconstructed_prices_df, derivative_type='dbfly')
+
+    # MODIFIED: Return the new historical double butterfly DFs
+    return historical_outrights, historical_spreads_3M, historical_butterflies_3M, historical_spreads_6M, historical_butterflies_6M, historical_spreads_12M, historical_butterflies_12M, historical_double_butterflies_3M, historical_double_butterflies_6M, historical_double_butterflies_12M, spreads_3M_df_no_prefix
 
 
 # --- ORIGINAL HEDGING LOGIC (Section 6) ---
@@ -380,7 +436,6 @@ def calculate_best_and_worst_hedge_3M(trade_label, loadings_df, eigenvalues, pc_
     hedge for a given 3M spread trade using the reconstructed covariance matrix, 
     and returns the full results DataFrame as well. (Section 6 - 3M Spreads only)
     """
-    # NOTE: trade_label here is a simple contract spread label (e.g., Z25-H26)
     if trade_label not in loadings_df.index:
         return None, None, None
         
@@ -443,7 +498,7 @@ def calculate_best_and_worst_hedge_3M(trade_label, loadings_df, eigenvalues, pc_
 
 def calculate_derivatives_covariance_generalized(all_derivatives_df, scores_df, eigenvalues, pc_count):
     """
-    Calculates the Raw Covariance Matrix for ALL derivatives (Spreads, Flies) 
+    Calculates the Raw Covariance Matrix for ALL derivatives (Spreads, Flies, Double Flies) 
     by projecting their standardized time series onto the standardized 3M Spread PC scores.
     Returns the Raw Covariance Matrix, the aligned derivatives data, and the standardized loadings (L_D).
     """
@@ -581,14 +636,6 @@ def calculate_all_factor_hedges(trade_label, factor_name, factor_sensitivities_d
     """
     Calculates the Factor Hedge Ratio and the resulting Residual Volatility for all potential 
     hedge instruments, for a specified factor.
-    
-    Inputs:
-    - trade_label: The derivative being hedged.
-    - factor_name: The factor (Level, Slope, Curvature) to neutralize.
-    - factor_sensitivities_df: Loadings (Betas) of instruments to factors (L_D).
-    - Sigma_Raw_df: The full reconstructed raw covariance matrix of all derivatives.
-    
-    Returns: DataFrame of results sorted by Residual Volatility.
     """
     if trade_label not in factor_sensitivities_df.index:
         return pd.DataFrame(), f"Trade instrument '{trade_label}' not found in sensitivities."
@@ -636,8 +683,6 @@ def calculate_all_factor_hedges(trade_label, factor_name, factor_sensitivities_d
             })
             
         except Exception as e:
-            # Handle case where covariance or sensitivity might be missing (shouldn't happen if alignment is correct)
-            # print(f"Error processing hedge {hedge_instrument}: {e}")
             continue
 
     if not results:
@@ -737,17 +782,22 @@ if not price_df_filtered.empty:
     # 3M (k=1) - Used for PCA input
     spreads_3M_df_raw = calculate_k_step_spreads(analysis_curve_df, 1) # No prefix here
     butterflies_3M_df = calculate_k_step_butterflies(analysis_curve_df, 1)
+    double_butterflies_3M_df = calculate_k_step_double_butterflies(analysis_curve_df, 1) # <--- NEW
     
     # 6M (k=2)
     spreads_6M_df = calculate_k_step_spreads(analysis_curve_df, 2)
     butterflies_6M_df = calculate_k_step_butterflies(analysis_curve_df, 2)
+    double_butterflies_6M_df = calculate_k_step_double_butterflies(analysis_curve_df, 2) # <--- NEW
     
     # 12M (k=4)
     spreads_12M_df = calculate_k_step_spreads(analysis_curve_df, 4)
     butterflies_12M_df = calculate_k_step_butterflies(analysis_curve_df, 4)
+    double_butterflies_12M_df = calculate_k_step_double_butterflies(analysis_curve_df, 4) # <--- NEW
     
     st.markdown("##### 3-Month Outright Spreads (k=1, e.g., Z25-H26)")
     st.dataframe(spreads_3M_df_raw.head(5))
+    st.markdown("##### 3-Month Double Butterfly (k=1, e.g., $Z25-3 \cdot H26+3 \cdot M26-Z26$)") # <--- NEW
+    st.dataframe(double_butterflies_3M_df.head(5)) # <--- NEW
     
     if spreads_3M_df_raw.empty:
         st.warning("3M Spreads could not be calculated. Need at least two contracts in the analysis curve.")
@@ -763,7 +813,7 @@ if not price_df_filtered.empty:
 
     if loadings_spread is not None and loadings_outright_direct is not None:
         
-        # --- Explained Variance Visualization ---
+        # --- Explained Variance Visualization (Section 2) ---
         st.header("2. Explained Variance")
         variance_df = pd.DataFrame({
             'Principal Component': [f'PC{i+1}' for i in range(len(explained_variance_ratio))],
@@ -789,7 +839,7 @@ if not price_df_filtered.empty:
             st.info(f"The selected **{pc_count} PCs** explain **{total_explained:.2f}%** of the total variance in the spreads. This is the risk model used.")
         
         
-        # --- Component Loadings Heatmaps ---
+        # --- Component Loadings Heatmaps (Section 3) ---
         st.header("3. PC Loadings")
         
         # --- 3.1 Spread Loadings (Standard Method) ---
@@ -853,7 +903,7 @@ if not price_df_filtered.empty:
         st.pyplot(fig_outright_loading)
         
         
-        # --- PC Scores Time Series Plot ---
+        # --- PC Scores Time Series Plot (Section 4) ---
         def plot_pc_scores(scores_df, explained_variance_ratio):
             """Plots the time series of the first 3 PC scores."""
             
@@ -901,7 +951,6 @@ if not price_df_filtered.empty:
         
         reconstructed_scaled = scores_used @ loadings_used.T
         
-        # NOTE: The reconstructed spreads DF still uses the simple, unprefixed labels
         reconstructed_spreads_3M = pd.DataFrame(
             reconstructed_scaled * data_std.values + data_mean.values,
             index=spreads_3M_df_clean.index, 
@@ -909,8 +958,9 @@ if not price_df_filtered.empty:
         )
 
         # 2. Reconstruct Outright Prices and ALL Derivatives (3M, 6M, 12M)
-        historical_outrights_df, historical_spreads_3M_df, historical_butterflies_3M_df, historical_spreads_6M_df, historical_butterflies_6M_df, historical_spreads_12M_df, historical_butterflies_12M_df, spreads_3M_df_no_prefix = \
-            reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_3M, spreads_3M_df_raw, spreads_6M_df, butterflies_3M_df, butterflies_6M_df, spreads_12M_df, butterflies_12M_df)
+        # MODIFIED: Passes and receives the new Double Butterfly DFs
+        historical_outrights_df, historical_spreads_3M_df, historical_butterflies_3M_df, historical_spreads_6M_df, historical_butterflies_6M_df, historical_spreads_12M_df, historical_butterflies_12M_df, historical_double_butterflies_3M_df, historical_double_butterflies_6M_df, historical_double_butterflies_12M_df, spreads_3M_df_no_prefix = \
+            reconstruct_prices_and_derivatives(analysis_curve_df, reconstructed_spreads_3M, spreads_3M_df_raw, spreads_6M_df, butterflies_3M_df, butterflies_6M_df, spreads_12M_df, butterflies_12M_df, double_butterflies_3M_df, double_butterflies_6M_df, double_butterflies_12M_df)
 
         
         # --- HELPER FUNCTION FOR PLOTTING SNAPSHOTS (defined here to use local variables) ---
@@ -1106,31 +1156,52 @@ if not price_df_filtered.empty:
         else:
             st.info("Not enough contracts (need 3 or more) to calculate and plot 3M butterfly snapshot.")
             
+        # --- 5.4 Double Butterfly (DBF) Snapshot (3M) --- <--- NEW SUBSECTION
+        if not historical_double_butterflies_3M_df.empty:
+            st.subheader(r"5.4 3M Double Butterfly (DBF) Snapshot ($k=1$, e.g., $Z25-3 \cdot H26+3 \cdot M26-Z26$)")
+            plot_snapshot(historical_double_butterflies_3M_df, "3M Double Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 4 or more) to calculate and plot 3M double butterfly snapshot.")
+
         # --------------------------- 6-Month (k=2) Derivatives ---------------------------
         
-        # --- 5.4 Spread Snapshot (6M) ---
-        st.subheader("5.4 6M Spread Snapshot (k=2, e.g., Z25-M26)")
+        # --- 5.5 Spread Snapshot (6M) ---
+        st.subheader("5.5 6M Spread Snapshot (k=2, e.g., Z25-M26)")
         plot_snapshot(historical_spreads_6M_df, "6M Spread", analysis_dt, pc_count)
 
-        # --- 5.5 Butterfly (Fly) Snapshot (6M) ---
+        # --- 5.6 Butterfly (Fly) Snapshot (6M) ---
         if not historical_butterflies_6M_df.empty:
-            st.subheader("5.5 6M Butterfly (Fly) Snapshot (k=2, e.g., Z25-2xM26+Z26)")
+            st.subheader("5.6 6M Butterfly (Fly) Snapshot (k=2, e.g., Z25-2xM26+Z26)")
             plot_snapshot(historical_butterflies_6M_df, "6M Butterfly", analysis_dt, pc_count)
         else:
             st.info("Not enough contracts (need 5 or more) to calculate and plot 6M butterfly snapshot.")
 
+        # --- 5.7 Double Butterfly (DBF) Snapshot (6M) --- <--- NEW SUBSECTION
+        if not historical_double_butterflies_6M_df.empty:
+            st.subheader(r"5.7 6M Double Butterfly (DBF) Snapshot ($k=2$, e.g., $Z25-3 \cdot M26+3 \cdot Z26-M27$)")
+            plot_snapshot(historical_double_butterflies_6M_df, "6M Double Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 7 or more) to calculate and plot 6M double butterfly snapshot.")
+
         # --------------------------- 12-Month (k=4) Derivatives ---------------------------
             
-        # --- 5.6 Spread Snapshot (12M) ---
-        st.subheader("5.6 12M Spread Snapshot (k=4, e.g., Z25-Z26)")
+        # --- 5.8 Spread Snapshot (12M) ---
+        st.subheader("5.8 12M Spread Snapshot (k=4, e.g., Z25-Z26)")
         plot_snapshot(historical_spreads_12M_df, "12M Spread", analysis_dt, pc_count)
 
-        # --- 5.7 Butterfly (Fly) Snapshot (12M) ---
+        # --- 5.9 Butterfly (Fly) Snapshot (12M) ---
         if not historical_butterflies_12M_df.empty:
-            st.subheader("5.7 12M Butterfly (Fly) Snapshot (k=4, e.g., Z25-2xZ26+Z27)")
+            st.subheader("5.9 12M Butterfly (Fly) Snapshot (k=4, e.g., Z25-2xZ26+Z27)")
             plot_snapshot(historical_butterflies_12M_df, "12M Butterfly", analysis_dt, pc_count)
         else:
             st.info("Not enough contracts (need 9 or more) to calculate and plot 12M butterfly snapshot.")
+
+        # --- 5.10 Double Butterfly (DBF) Snapshot (12M) --- <--- NEW SUBSECTION
+        if not historical_double_butterflies_12M_df.empty:
+            st.subheader(r"5.10 12M Double Butterfly (DBF) Snapshot ($k=4$, e.g., $Z25-3 \cdot Z26+3 \cdot Z27-Z28$)")
+            plot_snapshot(historical_double_butterflies_12M_df, "12M Double Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 13 or more) to calculate and plot 12M double butterfly snapshot.")
 
 
         # --------------------------- 6. PCA-Based Hedging Strategy (3M Spreads ONLY - Original Section) ---------------------------
@@ -1211,13 +1282,17 @@ if not price_df_filtered.empty:
         # --- HEDGING DATA PREPARATION (FOR SECTIONS 7 & 8) ---
         # 1. Combine all historical derivative time series into one DataFrame
         # **CRITICAL: Ensure all derivatives have unique, explicit prefixes**
+        # MODIFIED: Includes the new Double Butterfly DFs
         all_derivatives_list = [
             spreads_3M_df_raw.rename(columns=lambda x: f"3M Spread: {x}"), # Uses raw spread DF (no prefix)
             butterflies_3M_df.rename(columns=lambda x: f"3M Fly: {x}"),
+            double_butterflies_3M_df.rename(columns=lambda x: f"3M Double Fly: {x}"), # <--- NEW
             spreads_6M_df.rename(columns=lambda x: f"6M Spread: {x}"),
             butterflies_6M_df.rename(columns=lambda x: f"6M Fly: {x}"),
+            double_butterflies_6M_df.rename(columns=lambda x: f"6M Double Fly: {x}"), # <--- NEW
             spreads_12M_df.rename(columns=lambda x: f"12M Spread: {x}"),
             butterflies_12M_df.rename(columns=lambda x: f"12M Fly: {x}"),
+            double_butterflies_12M_df.rename(columns=lambda x: f"12M Double Fly: {x}"), # <--- NEW
         ]
         
         all_derivatives_df = pd.concat(all_derivatives_list, axis=1)
