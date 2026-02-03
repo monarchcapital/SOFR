@@ -1317,7 +1317,7 @@ if not price_df_filtered.empty:
                 ax.plot(
                     comparison.index,
                     comparison['Original'],
-                    label=f'vwap {derivative_type}',
+                    label=f'vwap',
                     marker='o',
                     linestyle='-',
                     linewidth=2.5,
@@ -1326,7 +1326,7 @@ if not price_df_filtered.empty:
                 ax.plot(
                     comparison.index,
                     comparison['PCA Fair'],
-                    label=f'PCA,
+                    label=f'PCA',
                     marker='x',
                     linestyle='--',
                     linewidth=2.5,
