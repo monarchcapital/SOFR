@@ -1317,7 +1317,7 @@ if not price_df_filtered.empty:
                 ax.plot(
                     comparison.index,
                     comparison['Original'],
-                    label=f'Today Original {derivative_type} ({current_date.strftime("%Y-%m-%d")})',
+                    label=f'vwap {derivative_type} ({current_date.strftime("%Y-%m-%d")})',
                     marker='o',
                     linestyle='-',
                     linewidth=2.5,
@@ -1326,7 +1326,7 @@ if not price_df_filtered.empty:
                 ax.plot(
                     comparison.index,
                     comparison['PCA Fair'],
-                    label=f'Today PCA Fair {derivative_type} ({pc_count} PCs)',
+                    label=f'PCA {derivative_type} ({pc_count} PCs)',
                     marker='x',
                     linestyle='--',
                     linewidth=2.5,
@@ -1338,7 +1338,7 @@ if not price_df_filtered.empty:
                     ax.plot(
                         prev_series.index,
                         prev_series.values,
-                        label=f'Prev Day Original {derivative_type} ({prev_date.strftime("%Y-%m-%d")})',
+                        label=f'settle {derivative_type} ({prev_date.strftime("%Y-%m-%d")})',
                         marker='s',
                         linestyle='-.',
                         linewidth=2.0,
