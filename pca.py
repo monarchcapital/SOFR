@@ -1456,8 +1456,7 @@ if not price_df_filtered.empty:
             ax.set_xlabel('Instrument')
             ax.set_ylabel('Value (Price Points)')
             ax.grid(True, linestyle=':', alpha=0.6)
-            ax.legend(loc='upper left', bbox_to_anchor=(1, 1)); ax.grid(True, alpha=0.15)
-            st.pyplot(fig)
+            ax.legend(loc='upper right')
             plt.xticks(rotation=45, ha='right')
             plt.tight_layout()
             st.pyplot(fig)
@@ -1527,9 +1526,9 @@ if not price_df_filtered.empty:
             ax_curve.set_title('Market Price Curve vs. PCA Fair Value Curve (Price = 100 - Rate, Today vs Prev Day)', fontsize=16)
             ax_curve.set_xlabel('Contract Maturity')
             ax_curve.set_ylabel('Price (100 - Rate)')
-            ax.legend(loc='upper left', bbox_to_anchor=(1, 1)); ax.grid(True, alpha=0.15)
-            st.pyplot(fig)
-            
+            ax_curve.legend(loc='upper right')
+            ax_curve.grid(True, linestyle=':', alpha=0.6)
+
             plt.xticks(rotation=45, ha='right')
             plt.tight_layout()
             st.pyplot(fig_curve)
