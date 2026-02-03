@@ -16,7 +16,7 @@ SECTION9_FIGURES = []
 
 
 # --- Configuration ---
-st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
+st.set_page_config(layout="wide", page_title="SONIA Futures PCA Analyzer")
 
 # --- Helper Functions for Data Processing ---
 
@@ -977,12 +977,12 @@ def create_instrument_universe_table(factor_sensitivities_df, Sigma_Raw_df, misp
 
 # --- Streamlit Application Layout ---
 
-st.title("SOFR Futures PCA Analyzer")
+st.title("SONIA Futures PCA Analyzer")
 
 # --- Sidebar Inputs ---
 st.sidebar.header("1. Data Uploads")
 price_file = st.sidebar.file_uploader(
-    "Upload Historical Price Data (e.g., 'sofr rates.csv')", 
+    "Upload Historical Price Data (e.g., 'SONIA rates.csv')", 
     type=['csv'], 
     key='price_upload'
 )
@@ -1205,7 +1205,7 @@ if not price_df_filtered.empty:
                 ax.set_title(f'{pc_label} Factor Score (Explaining {variance_pct:.2f}% of Spread Variance)', fontsize=14)
                 ax.grid(True, linestyle=':', alpha=0.6)
                 ax.set_ylabel('Score Value')
-                ax.legend(loc='upper left')
+                ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
 
             plt.xlabel('Date')
             plt.tight_layout(rect=[0, 0.03, 1, 0.98])
