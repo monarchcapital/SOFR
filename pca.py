@@ -1367,7 +1367,7 @@ if not price_df_filtered.empty:
                 ax.set_title(f'Market {derivative_type} vs. PCA Fair {derivative_type} (Today vs Prev Day)', fontsize=16)
                 ax.set_xlabel(f'{derivative_type} Contract')
                 ax.set_ylabel(f'{derivative_type} Value (Price Difference)')
-                ax.legend(loc='upper right')
+                ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
                 ax.grid(True, linestyle=':', alpha=0.6)
 
                 plt.xticks(rotation=45, ha='right')
@@ -1456,7 +1456,7 @@ if not price_df_filtered.empty:
             ax.set_xlabel('Instrument')
             ax.set_ylabel('Value (Price Points)')
             ax.grid(True, linestyle=':', alpha=0.6)
-            ax.legend(loc='upper right')
+            ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
             plt.xticks(rotation=45, ha='right')
             plt.tight_layout()
             st.pyplot(fig)
