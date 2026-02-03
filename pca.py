@@ -16,7 +16,7 @@ SECTION9_FIGURES = []
 
 
 # --- Configuration ---
-st.set_page_config(layout="wide", page_title="SONIA Futures PCA Analyzer")
+st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
 
 # --- Helper Functions for Data Processing ---
 
@@ -977,12 +977,12 @@ def create_instrument_universe_table(factor_sensitivities_df, Sigma_Raw_df, misp
 
 # --- Streamlit Application Layout ---
 
-st.title("SONIA Futures PCA Analyzer")
+st.title("SOFR Futures PCA Analyzer")
 
 # --- Sidebar Inputs ---
 st.sidebar.header("1. Data Uploads")
 price_file = st.sidebar.file_uploader(
-    "Upload Historical Price Data (e.g., 'SONIA rates.csv')", 
+    "Upload Historical Price Data (e.g., 'SOFR rates.csv')", 
     type=['csv'], 
     key='price_upload'
 )
@@ -1639,7 +1639,7 @@ if not price_df_filtered.empty:
             st.download_button(
                 label="📥 Download Section 5 Snapshots as PDF",
                 data=pdf_buffer_5,
-                file_name="Section5_Snapshots.pdf",
+                file_name="SOFR.pdf",
                 mime="application/pdf",
             )
 
