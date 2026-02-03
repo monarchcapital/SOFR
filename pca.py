@@ -1205,7 +1205,7 @@ if not price_df_filtered.empty:
                 ax.set_title(f'{pc_label} Factor Score (Explaining {variance_pct:.2f}% of Spread Variance)', fontsize=14)
                 ax.grid(True, linestyle=':', alpha=0.6)
                 ax.set_ylabel('Score Value')
-                ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+                ax_curve.legend(loc='upper left', bbox_to_anchor=(1, 1))
 
             plt.xlabel('Date')
             plt.tight_layout(rect=[0, 0.03, 1, 0.98])
@@ -1367,7 +1367,7 @@ if not price_df_filtered.empty:
                 ax.set_title(f'Market {derivative_type} vs. PCA Fair {derivative_type} (Today vs Prev Day)', fontsize=16)
                 ax.set_xlabel(f'{derivative_type} Contract')
                 ax.set_ylabel(f'{derivative_type} Value (Price Difference)')
-                ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+                ax_curve.legend(loc='upper left', bbox_to_anchor=(1, 1))
                 ax.grid(True, linestyle=':', alpha=0.6)
 
                 plt.xticks(rotation=45, ha='right')
@@ -1456,7 +1456,7 @@ if not price_df_filtered.empty:
             ax.set_xlabel('Instrument')
             ax.set_ylabel('Value (Price Points)')
             ax.grid(True, linestyle=':', alpha=0.6)
-            ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+            ax_curve.legend(loc='upper left', bbox_to_anchor=(1, 1))
             plt.xticks(rotation=45, ha='right')
             plt.tight_layout()
             st.pyplot(fig)
@@ -1526,7 +1526,7 @@ if not price_df_filtered.empty:
             ax_curve.set_title('Market Price Curve vs. PCA Fair Value Curve (Price = 100 - Rate, Today vs Prev Day)', fontsize=16)
             ax_curve.set_xlabel('Contract Maturity')
             ax_curve.set_ylabel('Price (100 - Rate)')
-            ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+            ax_curve.legend(loc='upper left', bbox_to_anchor=(1, 1))
             ax_curve.grid(True, linestyle=':', alpha=0.6)
 
             plt.xticks(rotation=45, ha='right')
@@ -2559,7 +2559,7 @@ def plot_with_stats_table(df, label, analysis_dt, window):
 
     ax.set_xticks(x); ax.set_xticklabels(plot_df["Instrument"], rotation=45, ha='right')
     ax.set_title(f"{label} Curve: Statistical Boundaries (Max-Rolling {window}d)", fontsize=14)
-    ax.legend(loc='upper left', bbox_to_anchor=(1, 1)); ax.grid(True, alpha=0.15)
+    ax_curve.legend(loc='upper left', bbox_to_anchor=(1, 1)); ax.grid(True, alpha=0.15)
     st.pyplot(fig)
 
     # --- TABLE ---
