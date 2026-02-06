@@ -2775,17 +2775,14 @@ import pandas as pd
 import streamlit as st
 
 # ------------------------------------------------------------
-# 12.0 Expression quality of the SELECTED instrument
+# 12.0 Expression quality of selected instrument
 # ------------------------------------------------------------
 
 def compute_expression_quality(instr, factor_df, Sigma, mispricing):
     betas = factor_df.loc[instr]
     mis = abs(mispricing.get(instr, np.nan))
 
-    # Factor purity: how single-factor the instrument is
     factor_purity = betas.abs().max() / betas.abs().sum()
-
-    # Avg absolute correlation vs entire universe (proxy-ness)
     avg_abs_corr = Sigma.corr().abs().mean().get(instr, np.nan)
 
     expr_quality = mis * factor_purity / (1 + avg_abs_corr)
@@ -2800,11 +2797,10 @@ def compute_expression_quality(instr, factor_df, Sigma, mispricing):
 
 
 # ------------------------------------------------------------
-# 12.1 Alternative expressions of the SAME distortion
+# 12.1 Alternative expressions
 # ------------------------------------------------------------
 
 def find_alternatives(T, universe_df, factor_df, Sigma, mispricing, top_n=5):
-
     T_b = factor_df.loc[T]
     T_mis = abs(mispricing.get(T, np.nan))
 
@@ -2823,12 +2819,10 @@ def find_alternatives(T, universe_df, factor_df, Sigma, mispricing, top_n=5):
 
         C_b = factor_df.loc[C]
 
-        # Factor alignment (cosine similarity)
         alignment = np.dot(T_b, C_b) / (
             np.linalg.norm(T_b) * np.linalg.norm(C_b)
         )
 
-        # Pairwise correlation vs selected instrument
         corr_vs_T = Sigma.loc[T, C] / np.sqrt(
             Sigma.loc[T, T] * Sigma.loc[C, C]
         )
@@ -2850,22 +2844,18 @@ def find_alternatives(T, universe_df, factor_df, Sigma, mispricing, top_n=5):
 
 
 # ------------------------------------------------------------
-# 12.2 Build factor-isolated combo trade
+# 12.2 Build combo
 # ------------------------------------------------------------
 
-def build_combo(T, H, factor_df, Sigma, mispricing):
-
+def build_combo(T, H, factor_df, Sigma):
     T_b = factor_df.loc[T]
     H_b = factor_df.loc[H]
 
     target_factor = T_b.abs().idxmax()
-
-    # Hedge ratio removes target factor
     k = T_b[target_factor] / H_b[target_factor]
 
     residuals = T_b - k * H_b
 
-    # Residual risk (rate space)
     var_T = Sigma.loc[T, T]
     var_H = Sigma.loc[H, H]
     cov_TH = Sigma.loc[T, H]
@@ -2884,11 +2874,10 @@ def build_combo(T, H, factor_df, Sigma, mispricing):
 
 
 # ------------------------------------------------------------
-# 12.3 PCA mispricing capture (NOT dollar PnL)
+# 12.3 PCA mispricing capture
 # ------------------------------------------------------------
 
 def backtest_mispricing_capture(T, H, k, hist_list, holding_days):
-
     mis_ts = {}
     for df in hist_list:
         for col in df.columns:
@@ -2925,37 +2914,16 @@ st.header("12. Trade Structuring & PCA Mispricing Capture")
 # ---------- Explanation ----------
 with st.expander("ℹ️ Definitions & formulas"):
     st.markdown(r"""
-**Mispricing (Rate %)**  
+**Combo**  
 \[
-(\text{Market} - \text{PCA Fair}) \times 100
+\text{Trade} = T - kH
 \]
 
-**Factor Purity**  
-\[
-\frac{\max(|\beta_L|,|\beta_S|,|\beta_C|)}
-{|\beta_L|+|\beta_S|+|\beta_C|}
-\]
+**Primary sign** → from mispricing (rich = sell, cheap = buy)  
+**Hedge sign** → from sign of \(k\)
 
-**Avg Abs Correlation (bad if high)**  
-\[
-\frac{1}{N}\sum_{j\neq i}|\rho(i,j)|
-\]
-
-**Expression Quality**  
-\[
-\frac{|\text{Mispricing}|\times\text{Factor Purity}}
-{1+\text{Avg Abs Corr}}
-\]
-
-**Combo trade**  
-\[
-\text{Combo} = T - kH
-\]
-
-**Mispricing capture (NOT \$ PnL)**  
-\[
-(M_T - kM_H)_t - (M_T - kM_H)_{t+N}
-\]
+**Factor bars**  
+Primary + (−k × Hedge) = Residual
 """)
 
 # ---------- Step 1 ----------
@@ -2996,51 +2964,71 @@ combo = build_combo(
     selected_instr,
     trade_instr,
     factor_sensitivities_df,
-    Sigma_Raw_df,
-    mispricing_series
+    Sigma_Raw_df
 )
 
 k = combo["Hedge Ratio (k)"]
 
-# Correct signed legs
-if mispricing_series.get(selected_instr, 0) > 0:
-    prim_side = "SELL / RECEIVE"
-else:
-    prim_side = "BUY / PAY"
+# Correct sign logic
+primary_side = (
+    "SELL / RECEIVE" if mispricing_series.get(selected_instr, 0) > 0
+    else "BUY / PAY"
+)
 
 hedge_side = "SELL / RECEIVE" if k > 0 else "BUY / PAY"
 
 st.code(f"""
 EXECUTABLE TRADE
 ----------------
-{prim_side:<16}  1.00 × {combo['Primary Instrument']}
+{primary_side:<16}  1.00 × {combo['Primary Instrument']}
 {hedge_side:<16}  {abs(k):.2f} × {combo['Hedge Instrument']}
 """)
 
-# ---------- NEW: Factor-by-factor contribution ----------
-st.subheader("D. Factor-by-factor contribution (before vs after hedge)")
+# ---- Residual diagnostics (DO NOT REMOVE)
+st.markdown("### Residual factor exposure after hedging")
+
+residual_diag = pd.DataFrame({
+    "Metric": [
+        "Target Factor Removed",
+        "Residual Level",
+        "Residual Slope",
+        "Residual Curvature",
+        "Residual Risk (Rate %)"
+    ],
+    "Value": [
+        combo["Target Factor"],
+        combo["Residuals"].get("Level (Whole Curve Shift)", np.nan),
+        combo["Residuals"].get("Slope (Steepening/Flattening)", np.nan),
+        combo["Residuals"].get("Curvature (Fly Risk)", np.nan),
+        combo["Residual Risk (Rate %)"]
+    ]
+})
+
+st.table(residual_diag)
+
+# ---- NEW: Factor contribution bars (ADDED, not replacing)
+st.markdown("### Factor-by-factor contribution (Primary / Hedge / Residual)")
 
 T_beta = factor_sensitivities_df.loc[selected_instr]
 H_beta = factor_sensitivities_df.loc[trade_instr]
 res_beta = combo["Residuals"]
 
-contrib_df = pd.DataFrame({
+factor_bar_df = pd.DataFrame({
     "Primary": T_beta,
-    "Hedge (k×)": -k * H_beta,
+    "Hedge (−k×)": -k * H_beta,
     "Residual": res_beta
 })
 
-st.bar_chart(contrib_df)
+st.bar_chart(factor_bar_df)
 
 st.caption("""
-• Bars show **factor exposure contribution**
-• Hedge bar = −k × hedge betas
-• Residual bar = what you are ACTUALLY left trading
-• Goal: isolate one factor, suppress others
+• Primary bar = original exposure  
+• Hedge bar = −k × hedge exposure  
+• Residual bar = what you are ACTUALLY trading  
 """)
 
-# ---------- E ----------
-st.subheader("E. PCA mispricing capture (NOT $ PnL)")
+# ---------- D ----------
+st.subheader("D. PCA mispricing capture (NOT $ PnL)")
 
 holding_days = st.slider("Holding period (days)", 1, 20, 5)
 
