@@ -2770,9 +2770,9 @@ plot_snapshot(
 # SECTION 12: TRADE STRUCTURING & PCA MISPRICING CAPTURE
 # ============================================================
 
-# ------------------------------------------------------------
-# 12.0 Expression quality of the SELECTED (distorted) instrument
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# 12.0 EXPRESSION QUALITY OF THE SELECTED (DISTORTED) INSTRUMENT
+# -------------------------------------------------------------------
 
 def compute_expression_quality(
     instrument,
@@ -2781,29 +2781,54 @@ def compute_expression_quality(
     mispricing_series
 ):
     """
-    Measures whether THIS instrument is a good vehicle to trade.
+    EXPRESSION QUALITY = "Is this instrument itself a good trading vehicle?"
 
-    Expression Quality answers:
-    - Is the mispricing meaningful?
-    - Is the exposure mostly to ONE factor (level / slope / curvature)?
-    - Is it not just a noisy proxy for everything else?
+    This is an ABSOLUTE score for the selected instrument.
+    It does NOT compare against alternatives.
 
-    IMPORTANT:
-    - This is NOT PnL
-    - This is NOT relative to alternatives
-    - This is an absolute quality score for the instrument itself
+    Components:
+    -----------
+    1) Mispricing:
+       |Market - PCA Fair| in Rate %
+       -> How large is the distortion?
+
+    2) Factor Purity:
+       max(|Level|, |Slope|, |Curvature|) /
+       (|Level| + |Slope| + |Curvature|)
+
+       -> Close to 1  : clean single-factor trade
+       -> Close to 0  : messy mix of multiple factors
+
+    3) Avg Abs Correlation:
+       Average absolute correlation of this instrument
+       versus ALL other instruments in the universe.
+
+       -> High  : proxy / crowded / noisy trade
+       -> Low   : differentiated / clean trade
+
+       IMPORTANT:
+       Avg Abs Correlation answers:
+       "Does this trade move with everything else?"
+
+    Final score:
+    ------------
+    Expression Quality =
+        Mispricing × Factor Purity / (1 + Avg Abs Correlation)
+
+    This penalizes:
+    - small distortions
+    - mixed factor exposure
+    - crowded proxy trades
     """
 
     betas = factor_sensitivities_df.loc[instrument]
     mispricing = abs(mispricing_series.get(instrument, np.nan))
 
-    # Factor purity:
-    # Close to 1  -> clean single-factor exposure
-    # Close to 0  -> messy mix of level/slope/curvature
+    # ---- Factor purity (clean intent vs mixed risk)
     factor_purity = betas.abs().max() / betas.abs().sum()
 
-    # Redundancy penalty:
-    # Instruments highly correlated with everything else are noisy proxies
+    # ---- Avg absolute correlation vs the ENTIRE universe
+    # This measures how "proxy-like" the instrument is
     avg_abs_corr = (
         Sigma_Raw_df.corr()
         .abs()
@@ -2811,7 +2836,6 @@ def compute_expression_quality(
         .get(instrument, np.nan)
     )
 
-    # Final expression quality
     expression_quality = mispricing * factor_purity / (1 + avg_abs_corr)
 
     return {
@@ -2823,9 +2847,9 @@ def compute_expression_quality(
     }
 
 
-# ------------------------------------------------------------
-# 12.1 Alternative STRUCTURAL expressions of the same distortion
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# 12.1 ALTERNATIVE STRUCTURAL EXPRESSIONS OF THE SAME DISTORTION
+# -------------------------------------------------------------------
 
 def find_alternative_expressions(
     selected_instrument,
@@ -2836,18 +2860,44 @@ def find_alternative_expressions(
     top_n=5
 ):
     """
-    Finds OTHER instruments that express the SAME distortion,
-    but potentially in a cleaner / more efficient structure.
+    This section answers:
+    --------------------
+    "I see a distortion HERE.
+     Is there a BETTER instrument to express the SAME idea?"
 
-    This answers:
-    'Should I trade this fly, or is there a better wrapper?'
+    Key difference vs Section 12.0:
+    --------------------------------
+    - Section 12.0: absolute quality of ONE instrument
+    - Section 12.1: relative quality of ALTERNATIVES
+
+    Two new quantities appear here:
+
+    1) Factor Alignment:
+       Cosine similarity between factor vectors of:
+       - selected instrument (T)
+       - alternative instrument (C)
+
+       -> Close to 1 : expresses the SAME factor distortion
+       -> Close to 0 : different trade idea
+
+    2) Correlation vs Selected:
+       Pairwise correlation between T and C.
+
+       IMPORTANT:
+       This is NOT Avg Abs Correlation.
+
+       Correlation vs Selected answers:
+       "Does this alternative move like the thing I noticed?"
+
+       High correlation here is GOOD.
+       It means we are trading the SAME regional distortion.
     """
 
     T = selected_instrument
     T_betas = factor_sensitivities_df.loc[T]
     T_mis = abs(mispricing_series.get(T, np.nan))
 
-    # Restrict to same maturity bucket (avoid nonsense comparisons)
+    # Restrict alternatives to same maturity bucket
     maturity_tag = (
         "3M" if "3M" in T else
         "6M" if "6M" in T else
@@ -2866,24 +2916,25 @@ def find_alternative_expressions(
 
         C_betas = factor_sensitivities_df.loc[C]
 
-        # Factor alignment:
-        # Are we trading the SAME thing?
+        # ---- Factor alignment (same idea or not?)
         alignment = np.dot(T_betas, C_betas) / (
             np.linalg.norm(T_betas) * np.linalg.norm(C_betas)
         )
 
-        # Correlation penalty
-        corr = Sigma_Raw_df.loc[T, C] / np.sqrt(
+        # ---- Pairwise correlation vs the SELECTED instrument
+        corr_vs_selected = Sigma_Raw_df.loc[T, C] / np.sqrt(
             Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C]
         )
 
-        # Relative expression quality
-        relative_score = T_mis * abs(alignment) / (1 + abs(corr))
+        # ---- Relative expression score
+        # Uses the SELECTED instrument's mispricing
+        # Answers: "Is this a cleaner wrapper for the SAME distortion?"
+        relative_score = T_mis * abs(alignment) / (1 + abs(corr_vs_selected))
 
         rows.append({
             "Alternative Instrument": C,
             "Factor Alignment": alignment,
-            "Correlation vs Selected": corr,
+            "Correlation vs Selected": corr_vs_selected,
             "Relative Expression Score": relative_score
         })
 
@@ -2891,9 +2942,9 @@ def find_alternative_expressions(
     return df.sort_values("Relative Expression Score", ascending=False).head(top_n)
 
 
-# ------------------------------------------------------------
-# 12.2 Build FACTOR-ISOLATED combo trade
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# 12.2 FACTOR-ISOLATED COMBO TRADE (STRUCTURING, NOT SIGNAL)
+# -------------------------------------------------------------------
 
 def build_factor_isolated_combo(
     primary_instr,
@@ -2903,12 +2954,17 @@ def build_factor_isolated_combo(
     mispricing_series
 ):
     """
-    Builds:
-        Primary - k * Hedge
+    Builds a STRUCTURED trade:
 
-    where k removes the DOMINANT factor of the primary trade.
+        Primary - k × Hedge
 
-    This is trade STRUCTURING, not signal generation.
+    where k neutralizes the DOMINANT factor of the primary trade.
+
+    This answers:
+    "How do I isolate the factor I actually want to trade?"
+
+    This is NOT PnL.
+    This is trade construction.
     """
 
     T = primary_instr
@@ -2919,13 +2975,12 @@ def build_factor_isolated_combo(
 
     dominant_factor = T_betas.abs().idxmax()
 
-    # Hedge ratio to neutralize dominant factor
+    # Hedge ratio removes dominant factor
     k = T_betas[dominant_factor] / H_betas[dominant_factor]
 
-    # Residual factor exposures after hedging
     residuals = T_betas - k * H_betas
 
-    # Residual variance (risk left after hedging)
+    # Residual risk after hedging
     var_T = Sigma_Raw_df.loc[T, T]
     var_H = Sigma_Raw_df.loc[H, H]
     cov_TH = Sigma_Raw_df.loc[T, H]
@@ -2942,8 +2997,8 @@ def build_factor_isolated_combo(
         "Primary Instrument": T,
         "Hedge Instrument": H,
         "Trade Direction": direction,
-        "Hedge Ratio (k)": k,
         "Target Factor": dominant_factor,
+        "Hedge Ratio (k)": k,
         "Residual Level": residuals.get("Level (Whole Curve Shift)", np.nan),
         "Residual Slope": residuals.get("Slope (Steepening/Flattening)", np.nan),
         "Residual Curvature": residuals.get("Curvature (Fly Risk)", np.nan),
@@ -2951,9 +3006,9 @@ def build_factor_isolated_combo(
     }
 
 
-# ------------------------------------------------------------
-# 12.3 PCA MISPRICING CAPTURE (NOT dollar PnL)
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# 12.3 PCA MISPRICING CAPTURE (NOT $ PnL)
+# -------------------------------------------------------------------
 
 def backtest_pca_mispricing_capture(
     primary_instr,
@@ -2963,12 +3018,21 @@ def backtest_pca_mispricing_capture(
     holding_days=5
 ):
     """
-    Measures how much PCA mispricing historically CLOSED.
+    Measures how much PCA MISPRICING historically CLOSED.
 
-    IMPORTANT:
+    VERY IMPORTANT:
+    ---------------
     - Units are Rate %
     - This is NOT dollar PnL
-    - This tests mean-reversion, not profitability per contract
+    - No tick value or DV01 is assumed
+
+    This answers:
+    "When distortions like this appeared before,
+     did they tend to mean-revert?"
+
+    Mispricing Capture:
+        (Mis_T - k·Mis_H)_today
+      - (Mis_T - k·Mis_H)_future
     """
 
     mis_ts = {}
@@ -2995,67 +3059,7 @@ def backtest_pca_mispricing_capture(
 
     return {
         "Total Mispricing Captured (Rate %)": cum_capture.iloc[-1],
-        "Mean Reversion Sharpe": capture.mean() / capture.std() * np.sqrt(252),
+        "Mean-Reversion Sharpe": capture.mean() / capture.std() * np.sqrt(252),
         "Hit Rate": (capture > 0).mean(),
         "Max Drawdown (Rate %)": (cum_capture - cum_capture.cummax()).min()
     }
-
-
-# ------------------------------------------------------------
-# 12.4 Streamlit UI
-# ------------------------------------------------------------
-
-st.header("12. Trade Structuring & PCA Mispricing Capture")
-
-selected_instr = st.selectbox(
-    "1️⃣ Select instrument where you see distortion",
-    instrument_universe_df["Instrument"].values,
-    key="s12_select"
-)
-
-if selected_instr:
-
-    st.subheader("A. Is this a good instrument to trade?")
-    quality = compute_expression_quality(
-        selected_instr,
-        factor_sensitivities_df,
-        Sigma_Raw_df,
-        mispricing_series
-    )
-    st.table(pd.DataFrame(quality, index=["Value"]).T)
-
-    st.subheader("B. Alternative ways to express the SAME distortion")
-    alt_df = find_alternative_expressions(
-        selected_instr,
-        instrument_universe_df,
-        factor_sensitivities_df,
-        Sigma_Raw_df,
-        mispricing_series
-    )
-    st.dataframe(alt_df, use_container_width=True)
-
-    trade_instr = st.selectbox(
-        "2️⃣ Choose instrument to trade",
-        alt_df["Alternative Instrument"].values,
-        key="s12_trade"
-    )
-
-    st.subheader("C. Structured combo trade")
-    combo = build_factor_isolated_combo(
-        selected_instr,
-        trade_instr,
-        factor_sensitivities_df,
-        Sigma_Raw_df,
-        mispricing_series
-    )
-    st.table(pd.DataFrame(combo, index=["Value"]).T)
-
-    st.subheader("D. Historical PCA mispricing capture (NOT $ PnL)")
-    stats = backtest_pca_mispricing_capture(
-        selected_instr,
-        trade_instr,
-        combo["Hedge Ratio (k)"],
-        all_historical_derivatives_list
-    )
-    if stats:
-        st.table(pd.DataFrame(stats, index=["Value"]).T)
