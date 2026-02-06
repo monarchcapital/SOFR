@@ -2779,17 +2779,13 @@ import streamlit as st
 # ------------------------------------------------------------
 
 def compute_expression_quality(instr, factor_df, Sigma, mispricing):
-    """
-    ABSOLUTE quality of ONE instrument as a trading vehicle.
-    """
-
     betas = factor_df.loc[instr]
     mis = abs(mispricing.get(instr, np.nan))
 
-    # Factor purity: single-factor vs mixed exposure
+    # Factor purity: how single-factor the instrument is
     factor_purity = betas.abs().max() / betas.abs().sum()
 
-    # Avg abs correlation vs entire universe (proxy-ness)
+    # Avg absolute correlation vs entire universe (proxy-ness)
     avg_abs_corr = Sigma.corr().abs().mean().get(instr, np.nan)
 
     expr_quality = mis * factor_purity / (1 + avg_abs_corr)
@@ -2812,7 +2808,6 @@ def find_alternatives(T, universe_df, factor_df, Sigma, mispricing, top_n=5):
     T_b = factor_df.loc[T]
     T_mis = abs(mispricing.get(T, np.nan))
 
-    # Same maturity bucket only
     maturity_tag = (
         "3M" if "3M" in T else
         "6M" if "6M" in T else
@@ -2833,7 +2828,7 @@ def find_alternatives(T, universe_df, factor_df, Sigma, mispricing, top_n=5):
             np.linalg.norm(T_b) * np.linalg.norm(C_b)
         )
 
-        # Pairwise correlation vs SELECTED instrument
+        # Pairwise correlation vs selected instrument
         corr_vs_T = Sigma.loc[T, C] / np.sqrt(
             Sigma.loc[T, T] * Sigma.loc[C, C]
         )
@@ -2878,17 +2873,12 @@ def build_combo(T, H, factor_df, Sigma, mispricing):
     res_var = var_T + k**2 * var_H - 2 * k * cov_TH
     res_vol = np.sqrt(max(res_var, 0)) * 100
 
-    direction = "Sell / Receive" if mispricing.get(T, 0) > 0 else "Buy / Pay"
-
     return {
         "Primary Instrument": T,
         "Hedge Instrument": H,
-        "Trade Direction": direction,
         "Target Factor": target_factor,
         "Hedge Ratio (k)": k,
-        "Residual Level": residuals.get("Level (Whole Curve Shift)", np.nan),
-        "Residual Slope": residuals.get("Slope (Steepening/Flattening)", np.nan),
-        "Residual Curvature": residuals.get("Curvature (Fly Risk)", np.nan),
+        "Residuals": residuals,
         "Residual Risk (Rate %)": res_vol
     }
 
@@ -2927,13 +2917,13 @@ def backtest_mispricing_capture(T, H, k, hist_list, holding_days):
 
 
 # ------------------------------------------------------------
-# 12.4 STREAMLIT UI (WITH EXPLANATIONS + SIGNED LEGS)
+# 12.4 STREAMLIT UI
 # ------------------------------------------------------------
 
 st.header("12. Trade Structuring & PCA Mispricing Capture")
 
-# ---------- Explanation panel ----------
-with st.expander("ℹ️ How to read Section 12 (definitions & formulas)"):
+# ---------- Explanation ----------
+with st.expander("ℹ️ Definitions & formulas"):
     st.markdown(r"""
 **Mispricing (Rate %)**  
 \[
@@ -2946,7 +2936,7 @@ with st.expander("ℹ️ How to read Section 12 (definitions & formulas)"):
 {|\beta_L|+|\beta_S|+|\beta_C|}
 \]
 
-**Avg Abs Correlation** (vs ALL instruments – bad if high)  
+**Avg Abs Correlation (bad if high)**  
 \[
 \frac{1}{N}\sum_{j\neq i}|\rho(i,j)|
 \]
@@ -2957,20 +2947,15 @@ with st.expander("ℹ️ How to read Section 12 (definitions & formulas)"):
 {1+\text{Avg Abs Corr}}
 \]
 
-**Factor Alignment** (cosine similarity)  
-≈ 1 means same distortion
-
-**Correlation vs Selected**  
+**Combo trade**  
 \[
-\rho(i,j)
+\text{Combo} = T - kH
 \]
-High = GOOD (same regional move)
 
-**PCA Mispricing Capture (NOT \$ PnL)**  
+**Mispricing capture (NOT \$ PnL)**  
 \[
 (M_T - kM_H)_t - (M_T - kM_H)_{t+N}
 \]
-Units are **Rate %**, not dollars.
 """)
 
 # ---------- Step 1 ----------
@@ -2980,7 +2965,7 @@ selected_instr = st.selectbox(
 )
 
 # ---------- A ----------
-st.subheader("A. Is this a good instrument to trade?")
+st.subheader("A. Instrument quality")
 quality = compute_expression_quality(
     selected_instr,
     factor_sensitivities_df,
@@ -2990,7 +2975,7 @@ quality = compute_expression_quality(
 st.table(pd.DataFrame(quality, index=["Value"]).T)
 
 # ---------- B ----------
-st.subheader("B. Alternative ways to express the SAME distortion")
+st.subheader("B. Alternative expressions")
 alt_df = find_alternatives(
     selected_instr,
     instrument_universe_df,
@@ -3017,39 +3002,46 @@ combo = build_combo(
 
 k = combo["Hedge Ratio (k)"]
 
-if combo["Trade Direction"] == "Sell / Receive":
-    prim_leg = "SELL / RECEIVE"
-    hedge_leg = "BUY / PAY"
+# Correct signed legs
+if mispricing_series.get(selected_instr, 0) > 0:
+    prim_side = "SELL / RECEIVE"
 else:
-    prim_leg = "BUY / PAY"
-    hedge_leg = "SELL / RECEIVE"
+    prim_side = "BUY / PAY"
+
+hedge_side = "SELL / RECEIVE" if k > 0 else "BUY / PAY"
 
 st.code(f"""
 EXECUTABLE TRADE
 ----------------
-{prim_leg:<16}  1.00 × {combo['Primary Instrument']}
-{hedge_leg:<16}  {abs(k):.2f} × {combo['Hedge Instrument']}
+{prim_side:<16}  1.00 × {combo['Primary Instrument']}
+{hedge_side:<16}  {abs(k):.2f} × {combo['Hedge Instrument']}
 """)
 
-st.table(pd.DataFrame({
-    "Metric": [
-        "Target Factor Removed",
-        "Residual Level",
-        "Residual Slope",
-        "Residual Curvature",
-        "Residual Risk (Rate %)"
-    ],
-    "Value": [
-        combo["Target Factor"],
-        combo["Residual Level"],
-        combo["Residual Slope"],
-        combo["Residual Curvature"],
-        combo["Residual Risk (Rate %)"]
-    ]
-}))
+# ---------- NEW: Factor-by-factor contribution ----------
+st.subheader("D. Factor-by-factor contribution (before vs after hedge)")
 
-# ---------- D ----------
-st.subheader("D. PCA mispricing capture (NOT $ PnL)")
+T_beta = factor_sensitivities_df.loc[selected_instr]
+H_beta = factor_sensitivities_df.loc[trade_instr]
+res_beta = combo["Residuals"]
+
+contrib_df = pd.DataFrame({
+    "Primary": T_beta,
+    "Hedge (k×)": -k * H_beta,
+    "Residual": res_beta
+})
+
+st.bar_chart(contrib_df)
+
+st.caption("""
+• Bars show **factor exposure contribution**
+• Hedge bar = −k × hedge betas
+• Residual bar = what you are ACTUALLY left trading
+• Goal: isolate one factor, suppress others
+""")
+
+# ---------- E ----------
+st.subheader("E. PCA mispricing capture (NOT $ PnL)")
+
 holding_days = st.slider("Holding period (days)", 1, 20, 5)
 
 stats = backtest_mispricing_capture(
