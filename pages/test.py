@@ -2958,6 +2958,141 @@ if selected_instr:
             st.table(pd.DataFrame(combo, index=['Value']).T)
         else:
             st.warning("Unable to construct a valid hedge (zero exposure).")
+     # ======================
+# SECTION 12.3: PCA-REVERSION BACKTEST (COMBO TRADE)
+# ======================
+
+def backtest_pca_reversion_combo(
+    T,
+    H,
+    k,
+    historical_derivatives_list,
+    start_date=None,
+    end_date=None,
+    holding_days=5
+):
+    """
+    Backtest PCA reversion for combo trade:
+        PnL_t = (Mis_T[t] - k * Mis_H[t]) - (Mis_T[t+N] - k * Mis_H[t+N])
+    """
+
+    # --- Build mispricing time series for all derivatives ---
+    mis_ts = {}
+
+    for df in historical_derivatives_list:
+        if df.empty:
+            continue
+
+        for col in df.columns:
+            if col.endswith("(Original)"):
+                base = col.replace(" (Original)", "")
+                pca_col = col.replace("(Original)", "(PCA)")
+                if pca_col in df.columns:
+                    mis_ts[base] = (df[col] - df[pca_col]) * 100  # Rate %
+
+    mis_df = pd.DataFrame(mis_ts).dropna(how="all")
+
+    if T not in mis_df.columns or H not in mis_df.columns:
+        return None, "Mispricing history not available for selected instruments."
+
+    # --- Date filtering ---
+    if start_date:
+        mis_df = mis_df[mis_df.index >= start_date]
+    if end_date:
+        mis_df = mis_df[mis_df.index <= end_date]
+
+    # --- Combo mispricing ---
+    combo_mis = mis_df[T] - k * mis_df[H]
+
+    # --- Forward reversion PnL ---
+    pnl = combo_mis - combo_mis.shift(-holding_days)
+    pnl = pnl.dropna()
+
+    if pnl.empty:
+        return None, "Not enough data for selected horizon."
+
+    # --- Performance metrics ---
+    cum_pnl = pnl.cumsum()
+    sharpe = pnl.mean() / pnl.std() * np.sqrt(252) if pnl.std() > 0 else np.nan
+    hit_rate = (pnl > 0).mean()
+    drawdown = cum_pnl - cum_pnl.cummax()
+    max_dd = drawdown.min()
+
+    stats = {
+        "Holding Days": holding_days,
+        "Total PnL (Rate %)": cum_pnl.iloc[-1],
+        "Annualized Sharpe": sharpe,
+        "Hit Rate": hit_rate,
+        "Max Drawdown (Rate %)": max_dd
+    }
+
+    results_df = pd.DataFrame({
+        "PnL": pnl,
+        "Cumulative PnL": cum_pnl,
+        "Drawdown": drawdown
+    })
+
+    return results_df, stats
+
+
+# --------------------------------------------------
+# Streamlit UI
+# --------------------------------------------------
+
+st.subheader("12.3 PCA-Reversion Backtest (Combo Trade)")
+
+if selected_instr and hedge_instr:
+
+    holding_days = st.slider(
+        "Holding Period (days)",
+        min_value=1,
+        max_value=20,
+        value=5,
+        step=1,
+        key="bt_holding_days"
+    )
+
+    bt_df, bt_stats = backtest_pca_reversion_combo(
+        selected_instr,
+        hedge_instr,
+        combo["Hedge Ratio (k)"],
+        all_historical_derivatives_list,
+        start_date=None,
+        end_date=None,
+        holding_days=holding_days
+    )
+
+    if bt_df is None:
+        st.warning(bt_stats)
+    else:
+        st.markdown("### 📊 Backtest Performance")
+
+        st.table(pd.DataFrame(bt_stats, index=["Value"]).T.style.format({
+            "Total PnL (Rate %)": "{:.3f}",
+            "Annualized Sharpe": "{:.2f}",
+            "Hit Rate": "{:.2%}",
+            "Max Drawdown (Rate %)": "{:.3f}"
+        }))
+
+        # --- Plot ---
+        fig, ax = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+
+        ax[0].plot(bt_df.index, bt_df["Cumulative PnL"], label="Cumulative PnL")
+        ax[0].axhline(0, color="gray", linestyle="--")
+        ax[0].set_title("PCA-Reversion Strategy: Cumulative PnL")
+        ax[0].grid(True, linestyle=":")
+
+        ax[1].plot(bt_df.index, bt_df["Drawdown"], color="red", label="Drawdown")
+        ax[1].set_title("Drawdown")
+        ax[1].grid(True, linestyle=":")
+
+        plt.tight_layout()
+        st.pyplot(fig)
+
+# ======================
+# END SECTION 12.3
+# ======================
+
 
 # ======================
 # END SECTION 12
