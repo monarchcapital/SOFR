@@ -2767,8 +2767,7 @@ plot_snapshot(
 # ============================
 # END SECTION 11
 # ============================================================
-# SECTION 12: TRADE STRUCTURING & PCA MISPRICING CAPTURE
-# (MINIMUM-VARIANCE HEDGE, SIGNED MISPRICING)
+# SECTION 12: TRADE STRUCTURING & MISPRICING (NO NAMEERROR)
 # ============================================================
 
 import numpy as np
@@ -2776,24 +2775,30 @@ import pandas as pd
 import streamlit as st
 
 # ------------------------------------------------------------
-# ASSUMPTION (IMPORTANT)
+# 12.0 BUILD SIGNED + ABS MISPRICING (FROM EXISTING DATA)
 # ------------------------------------------------------------
-# You MUST already have:
-# market_price_df  : latest market prices (indexed by Instrument)
-# pca_fair_df      : PCA fair values (indexed by Instrument)
-#
-# If not, adapt the two lines below to your data objects.
+# We reconstruct mispricing using the SAME PCA residual logic
+# used elsewhere in your app — but keep the sign.
+
+latest_df = all_historical_derivatives_list[-1]
+
+signed_mispricing_series = {}
+abs_mispricing_series = {}
+
+for col in latest_df.columns:
+    if col.endswith("(Original)"):
+        instr = col.replace(" (Original)", "")
+        pca_col = col.replace("(Original)", "(PCA)")
+        if pca_col in latest_df.columns:
+            signed = latest_df[col] - latest_df[pca_col]
+            signed_mispricing_series[instr] = signed
+            abs_mispricing_series[instr] = abs(signed)
+
+signed_mispricing_series = pd.Series(signed_mispricing_series)
+abs_mispricing_series = pd.Series(abs_mispricing_series)
+
 # ------------------------------------------------------------
-
-signed_mispricing_series = (
-    market_price_df["Price"] - pca_fair_df["PCA_Fair"]
-)
-
-abs_mispricing_series = signed_mispricing_series.abs()
-
-
-# ------------------------------------------------------------
-# 12.0 Instrument quality (ranking only, NOT direction)
+# 12.1 Instrument quality (ranking only)
 # ------------------------------------------------------------
 
 def compute_expression_quality(instr, factor_df, Sigma, abs_mis):
@@ -2805,7 +2810,7 @@ def compute_expression_quality(instr, factor_df, Sigma, abs_mis):
     score = abs_mis[instr] * factor_purity / (1 + avg_abs_corr)
 
     return {
-        "Mispricing (Rate %)": abs_mis[instr],
+        "Abs Mispricing": abs_mis[instr],
         "Dominant Factor": betas.abs().idxmax(),
         "Factor Purity": factor_purity,
         "Avg Abs Correlation": avg_abs_corr,
@@ -2814,7 +2819,7 @@ def compute_expression_quality(instr, factor_df, Sigma, abs_mis):
 
 
 # ------------------------------------------------------------
-# 12.1 Alternative expressions (ranking only)
+# 12.2 Alternative expressions (ranking only)
 # ------------------------------------------------------------
 
 def find_alternatives(T, universe_df, factor_df, Sigma, abs_mis, top_n=5):
@@ -2852,7 +2857,7 @@ def find_alternatives(T, universe_df, factor_df, Sigma, abs_mis, top_n=5):
 
 
 # ------------------------------------------------------------
-# 12.2 Minimum-variance hedge construction (Option 3)
+# 12.3 MINIMUM-VARIANCE HEDGE (OPTION 3)
 # ------------------------------------------------------------
 
 def build_variance_hedge(T, H, Sigma):
@@ -2866,43 +2871,8 @@ def build_variance_hedge(T, H, Sigma):
     residual_vol = np.sqrt(max(residual_var, 0)) * 100
 
     return {
-        "Primary Instrument": T,
-        "Hedge Instrument": H,
         "Hedge Ratio (k*)": k_star,
-        "Residual Risk (Rate %)": residual_vol
-    }
-
-
-# ------------------------------------------------------------
-# 12.3 PCA mispricing capture (RATE %, NOT $)
-# ------------------------------------------------------------
-
-def backtest_mispricing_capture(T, H, k_star, hist_list, holding_days):
-    mis_ts = {}
-
-    for df in hist_list:
-        for col in df.columns:
-            if col.endswith("(Original)"):
-                base = col.replace(" (Original)", "")
-                pca_col = col.replace("(Original)", "(PCA)")
-                if pca_col in df.columns:
-                    mis_ts[base] = df[col] - df[pca_col]
-
-    mis_df = pd.DataFrame(mis_ts).dropna()
-
-    if T not in mis_df or H not in mis_df:
-        return None
-
-    portfolio = mis_df[T] - k_star * mis_df[H]
-    capture = portfolio - portfolio.shift(-holding_days)
-    capture = capture.dropna()
-    cum = capture.cumsum()
-
-    return {
-        "Total Mispricing Captured (Rate %)": cum.iloc[-1],
-        "Mean-Reversion Sharpe": capture.mean() / capture.std() * np.sqrt(252),
-        "Hit Rate": (capture > 0).mean(),
-        "Max Drawdown (Rate %)": (cum - cum.cummax()).min()
+        "Residual Risk": residual_vol
     }
 
 
@@ -2910,15 +2880,13 @@ def backtest_mispricing_capture(T, H, k_star, hist_list, holding_days):
 # 12.4 STREAMLIT UI
 # ------------------------------------------------------------
 
-st.header("12. Trade Structuring & PCA Mispricing Capture")
+st.header("12. Trade Structuring & Mispricing")
 
-# ---------- Step 1 ----------
 selected_instr = st.selectbox(
-    "1️⃣ Select instrument where you see distortion",
+    "1️⃣ Select instrument",
     instrument_universe_df["Instrument"].values
 )
 
-# ---------- A ----------
 st.subheader("A. Instrument quality")
 quality = compute_expression_quality(
     selected_instr,
@@ -2928,7 +2896,6 @@ quality = compute_expression_quality(
 )
 st.table(pd.DataFrame(quality, index=["Value"]).T)
 
-# ---------- B ----------
 st.subheader("B. Alternative expressions")
 alt_df = find_alternatives(
     selected_instr,
@@ -2940,12 +2907,11 @@ alt_df = find_alternatives(
 st.dataframe(alt_df, use_container_width=True)
 
 trade_instr = st.selectbox(
-    "2️⃣ Choose instrument to trade",
+    "2️⃣ Choose hedge instrument",
     alt_df["Alternative Instrument"].values
 )
 
-# ---------- C ----------
-st.subheader("C. Structured trade (minimum-variance hedge)")
+st.subheader("C. Structured trade (variance hedge)")
 
 combo = build_variance_hedge(
     selected_instr,
@@ -2955,7 +2921,7 @@ combo = build_variance_hedge(
 
 k_star = combo["Hedge Ratio (k*)"]
 
-# 🔑 THIS IS THE FIX: SIGNED PORTFOLIO RESIDUAL
+# 🔑 SIGNED PORTFOLIO RESIDUAL (FIX)
 portfolio_residual = (
     signed_mispricing_series[selected_instr]
     - k_star * signed_mispricing_series[trade_instr]
@@ -2970,41 +2936,18 @@ primary_side = portfolio_side
 hedge_side = "BUY / PAY" if portfolio_side == "SELL / RECEIVE" else "SELL / RECEIVE"
 
 st.code(f"""
-EXECUTABLE TRADE (Variance-Hedged)
----------------------------------
+EXECUTABLE TRADE
+----------------
 {primary_side:<16}  1.00 × {selected_instr}
 {hedge_side:<16}  {abs(k_star):.2f} × {trade_instr}
 """)
 
-st.markdown("### Portfolio residual (signed)")
-st.write(f"{portfolio_residual:.4f}")
+st.markdown("**Signed portfolio residual:**")
+st.write(float(portfolio_residual))
 
-st.markdown("### Residual risk after hedge")
-st.table(pd.DataFrame({
-    "Metric": ["Residual Risk (Rate %)"],
-    "Value": [combo["Residual Risk (Rate %)"]]
-}))
+st.markdown("**Residual risk (variance):**")
+st.write(combo["Residual Risk"])
 
-# ---------- D ----------
-st.subheader("D. PCA mispricing capture (NOT $ PnL)")
-
-holding_days = st.slider("Holding period (days)", 1, 20, 5)
-
-stats = backtest_mispricing_capture(
-    selected_instr,
-    trade_instr,
-    k_star,
-    all_historical_derivatives_list,
-    holding_days
-)
-
-if stats:
-    st.table(pd.DataFrame(stats, index=["Value"]).T)
-
-# ======================
+# ============================================================
 # END SECTION 12
-# ======================
-
-
-
-
+# ============================================================
