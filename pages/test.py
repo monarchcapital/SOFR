@@ -3045,6 +3045,82 @@ stats = backtest_pca_mispricing_capture(
 if stats:
     st.subheader("D. PCA mispricing capture (NOT $ PnL)")
     st.table(pd.DataFrame(stats, index=["Value"]).T)
+# ===================== Section 12: Instrument Curves Over Time =====================
+
+st.header("12. Instrument Curves Over Time (Primary, Hedge, Hedged)")
+
+# --- Safety checks ---
+if primary_series is None or hedge_series is None:
+    st.warning("Primary or Hedge series not available for Section 12.")
+else:
+    # --- Align time indices ---
+    common_index = primary_series.index.intersection(hedge_series.index)
+
+    if len(common_index) < 5:
+        st.warning("Not enough overlapping history between Primary and Hedge instruments.")
+    else:
+        primary_aligned = primary_series.loc[common_index]
+        hedge_aligned   = hedge_series.loc[common_index]
+
+        # --- Hedged instrument curve (LEVEL, not PnL) ---
+        hedged_curve = primary_aligned - k_star * hedge_aligned
+
+        # --- Optional normalization (toggle) ---
+        normalize = st.checkbox(
+            "Normalize curves to start at 0 (shape comparison)",
+            value=True,
+            key="section12_normalize"
+        )
+
+        if normalize:
+            base_date = common_index[0]
+            primary_plot = primary_aligned - primary_aligned.loc[base_date]
+            hedge_plot   = hedge_aligned - hedge_aligned.loc[base_date]
+            hedged_plot  = hedged_curve - hedged_curve.loc[base_date]
+            ylabel = "Normalized Instrument Value"
+        else:
+            primary_plot = primary_aligned
+            hedge_plot   = hedge_aligned
+            hedged_plot  = hedged_curve
+            ylabel = "Instrument Level"
+
+        # --- Plot ---
+        fig, ax = plt.subplots(figsize=(15, 6))
+
+        ax.plot(
+            primary_plot.index,
+            primary_plot.values,
+            label="Primary Instrument",
+            linewidth=2.5
+        )
+
+        ax.plot(
+            hedge_plot.index,
+            hedge_plot.values,
+            label=f"Hedge Instrument (k* = {k_star:.3f})",
+            linestyle="--",
+            alpha=0.85
+        )
+
+        ax.plot(
+            hedged_plot.index,
+            hedged_plot.values,
+            label="Hedged Instrument Curve",
+            linewidth=3.0
+        )
+
+        ax.set_title(
+            "Section 12: Instrument Curves Over Past Days",
+            fontsize=15
+        )
+        ax.set_xlabel("Date")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="best")
+        ax.grid(True, linestyle=":", alpha=0.6)
+
+        plt.tight_layout()
+        st.pyplot(fig)
+
 
 # ======================
 # END SECTION 12
