@@ -2767,130 +2767,210 @@ plot_snapshot(
 # ============================
 # END SECTION 11
 # ============================================================
-# SECTION 12: TRADE CONSTRUCTION + EXPRESSION SCORE + PnL
+# SECTION 12: TRADE STRUCTURING & PCA MISPRICING CAPTURE
 # ============================================================
 
 # ------------------------------------------------------------
-# 12.0 Find best alternative expressions of a distortion
+# 12.0 Expression quality of the SELECTED (distorted) instrument
 # ------------------------------------------------------------
 
-def recommend_best_expression(
-    selected_instrument,
-    instrument_universe_df,
-    Sigma_Raw_df,
-    factor_sensitivities_df,
-    mispricing_series,
-    top_n=5
-):
-    if selected_instrument not in instrument_universe_df['Instrument'].values:
-        return pd.DataFrame()
-
-    T = selected_instrument
-    T_factors = factor_sensitivities_df.loc[T]
-    T_mis = mispricing_series.get(T, np.nan)
-
-    dominant_factor = T_factors.abs().idxmax()
-
-    maturity_tag = (
-        '3M' if '3M' in T else
-        '6M' if '6M' in T else
-        '12M' if '12M' in T else ''
-    )
-
-    local_df = instrument_universe_df[
-        instrument_universe_df['Instrument'].str.contains(maturity_tag)
-    ].copy()
-
-    local_df = local_df[local_df['Instrument'] != T]
-
-    rows = []
-
-    for _, r in local_df.iterrows():
-        C = r['Instrument']
-        if C not in factor_sensitivities_df.index:
-            continue
-
-        C_factors = factor_sensitivities_df.loc[C]
-
-        # Factor alignment
-        num = np.dot(T_factors.values, C_factors.values)
-        den = np.linalg.norm(T_factors.values) * np.linalg.norm(C_factors.values)
-        alignment = num / den if den > 0 else 0.0
-
-        # Correlation
-        corr = Sigma_Raw_df.loc[T, C] / np.sqrt(
-            Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C]
-        )
-
-        # Expression score
-        expr_score = abs(T_mis) * abs(alignment) / (1 + abs(corr))
-
-        rows.append({
-            'Alternative Instrument': C,
-            'Structure': r['Derivative Group'],
-            'Dominant Factor': dominant_factor,
-            'Factor Alignment': alignment,
-            'Correlation': corr,
-            'Expression Score': expr_score
-        })
-
-    df = pd.DataFrame(rows)
-    return df.sort_values('Expression Score', ascending=False).head(top_n)
-
-
-# ------------------------------------------------------------
-# 12.1 Build combo trade
-# ------------------------------------------------------------
-
-def build_optimal_combo_trade(
-    T,
-    H,
+def compute_expression_quality(
+    instrument,
     factor_sensitivities_df,
     Sigma_Raw_df,
     mispricing_series
 ):
-    T_f = factor_sensitivities_df.loc[T]
-    H_f = factor_sensitivities_df.loc[H]
+    """
+    Measures whether THIS instrument is a good vehicle to trade.
 
-    dominant_factor = T_f.abs().idxmax()
+    Expression Quality answers:
+    - Is the mispricing meaningful?
+    - Is the exposure mostly to ONE factor (level / slope / curvature)?
+    - Is it not just a noisy proxy for everything else?
 
-    k = T_f[dominant_factor] / H_f[dominant_factor]
+    IMPORTANT:
+    - This is NOT PnL
+    - This is NOT relative to alternatives
+    - This is an absolute quality score for the instrument itself
+    """
 
-    residuals = T_f - k * H_f
+    betas = factor_sensitivities_df.loc[instrument]
+    mispricing = abs(mispricing_series.get(instrument, np.nan))
 
-    Var_T = Sigma_Raw_df.loc[T, T]
-    Var_H = Sigma_Raw_df.loc[H, H]
-    Cov_TH = Sigma_Raw_df.loc[T, H]
+    # Factor purity:
+    # Close to 1  -> clean single-factor exposure
+    # Close to 0  -> messy mix of level/slope/curvature
+    factor_purity = betas.abs().max() / betas.abs().sum()
 
-    res_var = Var_T + k**2 * Var_H - 2 * k * Cov_TH
-    res_vol = np.sqrt(max(res_var, 0)) * 100
+    # Redundancy penalty:
+    # Instruments highly correlated with everything else are noisy proxies
+    avg_abs_corr = (
+        Sigma_Raw_df.corr()
+        .abs()
+        .mean()
+        .get(instrument, np.nan)
+    )
 
-    trade_dir = "Sell / Receive" if mispricing_series.get(T, 0) > 0 else "Buy / Pay"
+    # Final expression quality
+    expression_quality = mispricing * factor_purity / (1 + avg_abs_corr)
 
     return {
-        'Primary Instrument': T,
-        'Hedge Instrument': H,
-        'Trade Direction': trade_dir,
-        'Hedge Ratio (k)': k,
-        'Dominant Factor': dominant_factor,
-        'Residual Level': residuals.get('Level (Whole Curve Shift)', np.nan),
-        'Residual Slope': residuals.get('Slope (Steepening/Flattening)', np.nan),
-        'Residual Curvature': residuals.get('Curvature (Fly Risk)', np.nan),
-        'Residual Volatility (Rate %)': res_vol
+        "Mispricing (Rate %)": mispricing,
+        "Dominant Factor": betas.abs().idxmax(),
+        "Factor Purity": factor_purity,
+        "Avg Abs Correlation": avg_abs_corr,
+        "Expression Quality Score": expression_quality
     }
 
 
 # ------------------------------------------------------------
-# 12.2 Backtest PCA-reversion PnL
+# 12.1 Alternative STRUCTURAL expressions of the same distortion
 # ------------------------------------------------------------
 
-def backtest_combo_pnl(
-    T,
-    H,
+def find_alternative_expressions(
+    selected_instrument,
+    instrument_universe_df,
+    factor_sensitivities_df,
+    Sigma_Raw_df,
+    mispricing_series,
+    top_n=5
+):
+    """
+    Finds OTHER instruments that express the SAME distortion,
+    but potentially in a cleaner / more efficient structure.
+
+    This answers:
+    'Should I trade this fly, or is there a better wrapper?'
+    """
+
+    T = selected_instrument
+    T_betas = factor_sensitivities_df.loc[T]
+    T_mis = abs(mispricing_series.get(T, np.nan))
+
+    # Restrict to same maturity bucket (avoid nonsense comparisons)
+    maturity_tag = (
+        "3M" if "3M" in T else
+        "6M" if "6M" in T else
+        "12M" if "12M" in T else ""
+    )
+
+    local_universe = instrument_universe_df[
+        instrument_universe_df["Instrument"].str.contains(maturity_tag)
+    ]
+
+    rows = []
+
+    for C in local_universe["Instrument"]:
+        if C == T or C not in factor_sensitivities_df.index:
+            continue
+
+        C_betas = factor_sensitivities_df.loc[C]
+
+        # Factor alignment:
+        # Are we trading the SAME thing?
+        alignment = np.dot(T_betas, C_betas) / (
+            np.linalg.norm(T_betas) * np.linalg.norm(C_betas)
+        )
+
+        # Correlation penalty
+        corr = Sigma_Raw_df.loc[T, C] / np.sqrt(
+            Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C]
+        )
+
+        # Relative expression quality
+        relative_score = T_mis * abs(alignment) / (1 + abs(corr))
+
+        rows.append({
+            "Alternative Instrument": C,
+            "Factor Alignment": alignment,
+            "Correlation vs Selected": corr,
+            "Relative Expression Score": relative_score
+        })
+
+    df = pd.DataFrame(rows)
+    return df.sort_values("Relative Expression Score", ascending=False).head(top_n)
+
+
+# ------------------------------------------------------------
+# 12.2 Build FACTOR-ISOLATED combo trade
+# ------------------------------------------------------------
+
+def build_factor_isolated_combo(
+    primary_instr,
+    hedge_instr,
+    factor_sensitivities_df,
+    Sigma_Raw_df,
+    mispricing_series
+):
+    """
+    Builds:
+        Primary - k * Hedge
+
+    where k removes the DOMINANT factor of the primary trade.
+
+    This is trade STRUCTURING, not signal generation.
+    """
+
+    T = primary_instr
+    H = hedge_instr
+
+    T_betas = factor_sensitivities_df.loc[T]
+    H_betas = factor_sensitivities_df.loc[H]
+
+    dominant_factor = T_betas.abs().idxmax()
+
+    # Hedge ratio to neutralize dominant factor
+    k = T_betas[dominant_factor] / H_betas[dominant_factor]
+
+    # Residual factor exposures after hedging
+    residuals = T_betas - k * H_betas
+
+    # Residual variance (risk left after hedging)
+    var_T = Sigma_Raw_df.loc[T, T]
+    var_H = Sigma_Raw_df.loc[H, H]
+    cov_TH = Sigma_Raw_df.loc[T, H]
+
+    residual_var = var_T + k**2 * var_H - 2 * k * cov_TH
+    residual_vol = np.sqrt(max(residual_var, 0)) * 100  # Rate %
+
+    direction = (
+        "Sell / Receive" if mispricing_series.get(T, 0) > 0
+        else "Buy / Pay"
+    )
+
+    return {
+        "Primary Instrument": T,
+        "Hedge Instrument": H,
+        "Trade Direction": direction,
+        "Hedge Ratio (k)": k,
+        "Target Factor": dominant_factor,
+        "Residual Level": residuals.get("Level (Whole Curve Shift)", np.nan),
+        "Residual Slope": residuals.get("Slope (Steepening/Flattening)", np.nan),
+        "Residual Curvature": residuals.get("Curvature (Fly Risk)", np.nan),
+        "Residual Risk (Rate %)": residual_vol
+    }
+
+
+# ------------------------------------------------------------
+# 12.3 PCA MISPRICING CAPTURE (NOT dollar PnL)
+# ------------------------------------------------------------
+
+def backtest_pca_mispricing_capture(
+    primary_instr,
+    hedge_instr,
     k,
     historical_derivatives_list,
     holding_days=5
 ):
+    """
+    Measures how much PCA mispricing historically CLOSED.
+
+    IMPORTANT:
+    - Units are Rate %
+    - This is NOT dollar PnL
+    - This tests mean-reversion, not profitability per contract
+    """
+
     mis_ts = {}
 
     for df in historical_derivatives_list:
@@ -2903,95 +2983,79 @@ def backtest_combo_pnl(
 
     mis_df = pd.DataFrame(mis_ts).dropna()
 
-    if T not in mis_df.columns or H not in mis_df.columns:
+    if primary_instr not in mis_df or hedge_instr not in mis_df:
         return None
 
-    combo_mis = mis_df[T] - k * mis_df[H]
-    pnl = combo_mis - combo_mis.shift(-holding_days)
-    pnl = pnl.dropna()
+    combo_mis = mis_df[primary_instr] - k * mis_df[hedge_instr]
 
-    cum_pnl = pnl.cumsum()
+    capture = combo_mis - combo_mis.shift(-holding_days)
+    capture = capture.dropna()
+
+    cum_capture = capture.cumsum()
 
     return {
-        'Total PnL (Rate %)': cum_pnl.iloc[-1],
-        'Sharpe': pnl.mean() / pnl.std() * np.sqrt(252),
-        'Hit Rate': (pnl > 0).mean(),
-        'Max Drawdown (Rate %)': (cum_pnl - cum_pnl.cummax()).min()
+        "Total Mispricing Captured (Rate %)": cum_capture.iloc[-1],
+        "Mean Reversion Sharpe": capture.mean() / capture.std() * np.sqrt(252),
+        "Hit Rate": (capture > 0).mean(),
+        "Max Drawdown (Rate %)": (cum_capture - cum_capture.cummax()).min()
     }
 
 
 # ------------------------------------------------------------
-# 12.3 Streamlit UI
+# 12.4 Streamlit UI
 # ------------------------------------------------------------
 
-st.header("12. Trade Construction: Expression Quality & PnL")
+st.header("12. Trade Structuring & PCA Mispricing Capture")
 
 selected_instr = st.selectbox(
-    "1️⃣ Select distorted instrument",
-    instrument_universe_df['Instrument'].values,
-    key="s12_distorted"
+    "1️⃣ Select instrument where you see distortion",
+    instrument_universe_df["Instrument"].values,
+    key="s12_select"
 )
 
 if selected_instr:
 
-    struct_df = recommend_best_expression(
+    st.subheader("A. Is this a good instrument to trade?")
+    quality = compute_expression_quality(
+        selected_instr,
+        factor_sensitivities_df,
+        Sigma_Raw_df,
+        mispricing_series
+    )
+    st.table(pd.DataFrame(quality, index=["Value"]).T)
+
+    st.subheader("B. Alternative ways to express the SAME distortion")
+    alt_df = find_alternative_expressions(
         selected_instr,
         instrument_universe_df,
-        Sigma_Raw_df,
         factor_sensitivities_df,
+        Sigma_Raw_df,
         mispricing_series
     )
-
-    st.subheader("2️⃣ Alternative trade expressions (ranked)")
-
-    st.dataframe(
-        struct_df.style.format({
-            'Factor Alignment': '{:.2f}',
-            'Correlation': '{:.2f}',
-            'Expression Score': '{:.4f}'
-        }),
-        use_container_width=True
-    )
+    st.dataframe(alt_df, use_container_width=True)
 
     trade_instr = st.selectbox(
-        "3️⃣ Choose the instrument to trade",
-        struct_df['Alternative Instrument'].values,
-        key="s12_trade_instr"
+        "2️⃣ Choose instrument to trade",
+        alt_df["Alternative Instrument"].values,
+        key="s12_trade"
     )
 
-    # Extract expression score
-    expr_score = struct_df.set_index('Alternative Instrument').loc[trade_instr]['Expression Score']
-
-    combo = build_optimal_combo_trade(
+    st.subheader("C. Structured combo trade")
+    combo = build_factor_isolated_combo(
         selected_instr,
         trade_instr,
         factor_sensitivities_df,
         Sigma_Raw_df,
         mispricing_series
     )
+    st.table(pd.DataFrame(combo, index=["Value"]).T)
 
-    st.subheader("4️⃣ Trade structure")
-
-    st.table(pd.DataFrame(combo, index=['Value']).T)
-
-    st.metric("Expression Score (quality of structure)", f"{expr_score:.4f}")
-
-    bt_stats = backtest_combo_pnl(
+    st.subheader("D. Historical PCA mispricing capture (NOT $ PnL)")
+    stats = backtest_pca_mispricing_capture(
         selected_instr,
         trade_instr,
-        combo['Hedge Ratio (k)'],
+        combo["Hedge Ratio (k)"],
         all_historical_derivatives_list
     )
-
-    if bt_stats:
-        st.subheader("5️⃣ Historical PCA-reversion PnL")
-
-        st.table(pd.DataFrame(bt_stats, index=['Value']).T.style.format({
-            'Total PnL (Rate %)': '{:.3f}',
-            'Sharpe': '{:.2f}',
-            'Hit Rate': '{:.1%}',
-            'Max Drawdown (Rate %)': '{:.3f}'
-        }))
-
-
-
+    if stats:
+        st.table(pd.DataFrame(stats, index=["Value"]).T)
