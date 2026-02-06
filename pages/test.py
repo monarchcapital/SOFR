@@ -2773,7 +2773,7 @@ plot_snapshot(
 st.header("12. Trade Structuring & PCA Mispricing Capture")
 
 # ---------------------------------------------------------------------
-# 12.1 Explanations & Definitions
+# 12.1 Explanations
 # ---------------------------------------------------------------------
 with st.expander("ℹ️ How to read Section 12 (definitions & formulas)", expanded=False):
     st.markdown(r"""
@@ -2781,33 +2781,6 @@ with st.expander("ℹ️ How to read Section 12 (definitions & formulas)", expan
 \[
 (\text{Market} - \text{PCA Fair}) \times 100
 \]
-
-### Factor Purity
-\[
-\frac{\max(|\beta_L|,|\beta_S|,|\beta_C|)}
-{|\beta_L|+|\beta_S|+|\beta_C|}
-\]
-
-### Avg Abs Correlation
-\[
-\frac{1}{N}\sum_{j\neq i} |\rho(i,j)|
-\]
-High = proxy / crowded (BAD)
-
-### Expression Quality Score
-\[
-\frac{|\text{Mispricing}|\times \text{Factor Purity}}
-{1+\text{Avg Abs Corr}}
-\]
-
-### Factor Alignment
-Cosine similarity of factor vectors (≈1 means same idea)
-
-### Correlation vs Selected
-\[
-\rho(i,j)
-\]
-High = GOOD (same regional distortion)
 
 ### PCA Mispricing Capture (NOT $PnL)
 \[
@@ -2818,100 +2791,113 @@ Units are **Rate %**, not dollars.
 """)
 
 # ---------------------------------------------------------------------
-# 12.2 Select Instrument with Observed Distortion
+# 12.2 Select instrument with distortion
 # ---------------------------------------------------------------------
 selected_instr = st.selectbox(
     "1️⃣ Select instrument where you see distortion",
     instrument_universe_df["Instrument"].values
 )
 
-quality = compute_expression_quality(
-    selected_instr,
-    factor_sensitivities_df,
-    Sigma_Raw_df,
-    mispricing_series
-)
-
+# ---------------------------------------------------------------------
+# 12.3 Instrument quality (SAFE)
+# ---------------------------------------------------------------------
 st.subheader("A. Instrument Quality")
-st.table(pd.DataFrame(quality, index=["Value"]).T)
+
+if "compute_expression_quality" in globals():
+    quality = compute_expression_quality(
+        selected_instr,
+        factor_sensitivities_df,
+        Sigma_Raw_df,
+        mispricing_series
+    )
+    st.table(pd.DataFrame(quality, index=["Value"]).T)
+else:
+    st.info("Instrument quality metrics unavailable (helper not loaded).")
 
 # ---------------------------------------------------------------------
-# 12.3 Find Alternative Expressions
+# 12.4 Alternative expressions (SAFE)
 # ---------------------------------------------------------------------
-alt_df = find_alternative_expressions(
-    selected_instr,
-    instrument_universe_df,
-    factor_sensitivities_df,
-    Sigma_Raw_df,
-    mispricing_series
-)
-
 st.subheader("B. Alternative Expressions")
-st.dataframe(alt_df, use_container_width=True)
+
+if "find_alternative_expressions" in globals():
+    alt_df = find_alternative_expressions(
+        selected_instr,
+        instrument_universe_df,
+        factor_sensitivities_df,
+        Sigma_Raw_df,
+        mispricing_series
+    )
+    st.dataframe(alt_df, use_container_width=True)
+else:
+    st.warning("Alternative expression engine unavailable.")
+    alt_df = pd.DataFrame(columns=["Alternative Instrument"])
 
 # ---------------------------------------------------------------------
-# 12.4 Build Structured Trade (Primary vs Hedge)
+# 12.5 Choose trade instrument
 # ---------------------------------------------------------------------
+if alt_df.empty:
+    st.stop()
+
 trade_instr = st.selectbox(
     "2️⃣ Choose instrument to trade",
     alt_df["Alternative Instrument"].values
 )
 
-combo = build_factor_isolated_combo(
-    selected_instr,
-    trade_instr,
-    factor_sensitivities_df,
-    Sigma_Raw_df,
-    mispricing_series
-)
-
+# ---------------------------------------------------------------------
+# 12.6 Structured trade (SAFE)
+# ---------------------------------------------------------------------
 st.subheader("C. Structured Trade")
-st.table(pd.DataFrame(combo, index=["Value"]).T)
 
-# ---------------------------------------------------------------------
-# 12.5 PCA Mispricing Capture Backtest
-# ---------------------------------------------------------------------
-holding_days = st.slider(
-    "Holding period (days)",
-    min_value=1,
-    max_value=20,
-    value=5
-)
-
-stats = backtest_pca_mispricing_capture(
-    selected_instr,
-    trade_instr,
-    combo["Hedge Ratio (k)"],
-    all_historical_derivatives_list,
-    holding_days
-)
-
-if stats is not None:
-    st.subheader("D. PCA Mispricing Capture Statistics")
-    st.table(pd.DataFrame(stats, index=["Value"]).T)
+if "build_factor_isolated_combo" in globals():
+    combo = build_factor_isolated_combo(
+        selected_instr,
+        trade_instr,
+        factor_sensitivities_df,
+        Sigma_Raw_df,
+        mispricing_series
+    )
+    st.table(pd.DataFrame(combo, index=["Value"]).T)
+    k_star = combo["Hedge Ratio (k)"]
 else:
-    st.info("Not enough data to compute mispricing capture statistics.")
+    st.error("Structured trade builder unavailable.")
+    st.stop()
 
 # ---------------------------------------------------------------------
-# 12.6 Instrument LEVEL Curves (Primary / Hedge / Hedged)
+# 12.7 Mispricing capture backtest (SAFE)
+# ---------------------------------------------------------------------
+holding_days = st.slider("Holding period (days)", 1, 20, 5)
+
+if "backtest_pca_mispricing_capture" in globals():
+    stats = backtest_pca_mispricing_capture(
+        selected_instr,
+        trade_instr,
+        k_star,
+        all_historical_derivatives_list,
+        holding_days
+    )
+
+    if stats is not None:
+        st.subheader("D. PCA Mispricing Capture Statistics")
+        st.table(pd.DataFrame(stats, index=["Value"]).T)
+    else:
+        st.info("Not enough data for mispricing capture stats.")
+else:
+    stats = None
+    st.info("Mispricing capture backtest unavailable.")
+
+# ---------------------------------------------------------------------
+# 12.8 Instrument LEVEL curves (Primary / Hedge / Hedged)
 # ---------------------------------------------------------------------
 st.subheader("E. Instrument Level Curves (Primary, Hedge, Hedged)")
 
 if stats is None:
-    st.info("Instrument curves available after structured trade is defined.")
+    st.info("Instrument curves available once a valid structure is defined.")
 else:
-    primary_instr = selected_instr
-    hedge_instr   = trade_instr
-    k_star        = combo["Hedge Ratio (k)"]
-
     # Combine historical derivatives (Original levels)
-    derivative_universe = pd.concat(
-        all_historical_derivatives_list,
-        axis=1
-    )
+    derivative_universe = pd.concat(all_historical_derivatives_list, axis=1)
 
-    primary_col = f"{primary_instr} (Original)"
-    hedge_col   = f"{hedge_instr} (Original)"
+    primary_col = f"{selected_instr} (Original)"
+    hedge_col   = f"{trade_instr} (Original)"
 
     if primary_col not in derivative_universe.columns or hedge_col not in derivative_universe.columns:
         st.warning("Original level series not found for selected instruments.")
@@ -2919,7 +2905,6 @@ else:
         primary_series = derivative_universe[primary_col].dropna()
         hedge_series   = derivative_universe[hedge_col].dropna()
 
-        # Align history
         common_index = primary_series.index.intersection(hedge_series.index)
 
         if len(common_index) < 10:
@@ -2928,7 +2913,6 @@ else:
             primary_series = primary_series.loc[common_index]
             hedge_series   = hedge_series.loc[common_index]
 
-            # Hedged synthetic instrument (LEVEL)
             hedged_series = primary_series - k_star * hedge_series
 
             normalize = st.checkbox(
@@ -2949,38 +2933,18 @@ else:
                 hedged_plot  = hedged_series
                 ylabel = "Instrument Level"
 
-            # Plot
             fig, ax = plt.subplots(figsize=(15, 6))
 
-            ax.plot(
-                primary_plot.index,
-                primary_plot.values,
-                label=f"Primary: {primary_instr}",
-                linewidth=2.5
-            )
+            ax.plot(primary_plot.index, primary_plot, label=f"Primary: {selected_instr}", linewidth=2.5)
+            ax.plot(hedge_plot.index, hedge_plot, label=f"Hedge: {trade_instr} (k={k_star:.3f})", linestyle="--")
+            ax.plot(hedged_plot.index, hedged_plot, label="Hedged Synthetic Instrument", linewidth=3)
 
-            ax.plot(
-                hedge_plot.index,
-                hedge_plot.values,
-                label=f"Hedge: {hedge_instr} (k={k_star:.3f})",
-                linestyle="--",
-                alpha=0.85
-            )
-
-            ax.plot(
-                hedged_plot.index,
-                hedged_plot.values,
-                label="Hedged Synthetic Instrument",
-                linewidth=3.0
-            )
-
-            ax.set_title("Instrument Level Curves over Time", fontsize=14)
+            ax.set_title("Instrument Level Curves over Time")
             ax.set_xlabel("Date")
             ax.set_ylabel(ylabel)
-            ax.legend(loc="best")
+            ax.legend()
             ax.grid(True, linestyle=":", alpha=0.6)
 
-            plt.tight_layout()
             st.pyplot(fig)
 
 # ============================ END SECTION 12 ============================
