@@ -2844,7 +2844,7 @@ def find_alternatives(T, universe_df, factor_df, Sigma, mispricing, top_n=5):
 
 
 # ------------------------------------------------------------
-# 12.2 Build factor-isolated combo (BCA-CORRECT)
+# 12.2 Build factor-isolated combo (BCA-correct)
 # ------------------------------------------------------------
 
 def build_combo(T, H, factor_df, Sigma):
@@ -2853,9 +2853,8 @@ def build_combo(T, H, factor_df, Sigma):
 
     target_factor = T_b.abs().idxmax()
 
-    # ✅ CORRECT hedge weight (DO NOT flip sign again later)
+    # CORRECT BCA hedge weight
     hedge_weight = - T_b[target_factor] / H_b[target_factor]
-    k = abs(hedge_weight)
 
     residuals = T_b + hedge_weight * H_b
 
@@ -2871,7 +2870,7 @@ def build_combo(T, H, factor_df, Sigma):
         "Hedge Instrument": H,
         "Target Factor": target_factor,
         "Hedge Weight": hedge_weight,
-        "Hedge Size (|w|)": k,
+        "Hedge Size": abs(hedge_weight),
         "Residuals": residuals,
         "Residual Risk (Rate %)": res_vol
     }
@@ -2918,27 +2917,18 @@ st.header("12. Trade Structuring & PCA Mispricing Capture")
 
 with st.expander("ℹ️ Definitions & formulas"):
     st.markdown(r"""
-**Combo position**
+**Combo traded**
 \[
-\text{Position} = +1\cdot T + w_H\cdot H
-\quad\text{where}\quad
-w_H = -\frac{\beta_T}{\beta_H}
+\text{Combo}(t) = T(t) + w_H \cdot H(t),
+\quad w_H = -\frac{\beta_T}{\beta_H}
 \]
 
-**Primary direction**
-- Rich → SELL / RECEIVE
-- Cheap → BUY / PAY
+**Direction rule (IMPORTANT)**  
+You trade the **COMBO**, not the legs.
 
-**Hedge direction**
-- Comes from sign of \(w_H\)
-- May be SAME side as primary
-
-**Residual check**
-\[
-\beta_T + w_H\beta_H \approx 0
-\]
+- Combo rich → SELL combo
+- Combo cheap → BUY combo
 """)
-
 
 # ---------- Step 1 ----------
 selected_instr = st.selectbox(
@@ -2982,23 +2972,34 @@ combo = build_combo(
     Sigma_Raw_df
 )
 
-hedge_weight = combo["Hedge Weight"]
-
-primary_side = (
-    "SELL / RECEIVE" if mispricing_series.get(selected_instr, 0) > 0
-    else "BUY / PAY"
+# ---- COMBO-LEVEL MISPRICING (THIS IS THE FIX)
+combo_mispricing = (
+    mispricing_series.get(selected_instr, 0)
+    + combo["Hedge Weight"] * mispricing_series.get(trade_instr, 0)
 )
 
-hedge_side = "BUY / PAY" if hedge_weight > 0 else "SELL / RECEIVE"
+combo_side = "SELL / RECEIVE" if combo_mispricing > 0 else "BUY / PAY"
+
+# Primary leg follows combo
+primary_side = combo_side
+
+# Hedge leg direction from effective hedge weight
+effective_hedge_weight = (
+    combo["Hedge Weight"]
+    if combo_side == "SELL / RECEIVE"
+    else -combo["Hedge Weight"]
+)
+
+hedge_side = "BUY / PAY" if effective_hedge_weight > 0 else "SELL / RECEIVE"
 
 st.code(f"""
 EXECUTABLE TRADE
 ----------------
 {primary_side:<16}  1.00 × {combo['Primary Instrument']}
-{hedge_side:<16}  {combo['Hedge Size (|w|)']:.2f} × {combo['Hedge Instrument']}
+{hedge_side:<16}  {combo['Hedge Size']:.2f} × {combo['Hedge Instrument']}
 """)
 
-# ---- Residual diagnostics (UNCHANGED)
+# ---- Residual diagnostics
 st.markdown("### Residual factor exposure after hedging")
 
 residual_diag = pd.DataFrame({
@@ -3020,7 +3021,7 @@ residual_diag = pd.DataFrame({
 
 st.table(residual_diag)
 
-# ---- Factor contribution bars (UNCHANGED)
+# ---- Factor contribution bars
 st.markdown("### Factor-by-factor contribution")
 
 T_beta = factor_sensitivities_df.loc[selected_instr]
@@ -3029,7 +3030,7 @@ res_beta = combo["Residuals"]
 
 factor_bar_df = pd.DataFrame({
     "Primary": T_beta,
-    "Hedge (w×)": hedge_weight * H_beta,
+    "Hedge (w×)": combo["Hedge Weight"] * H_beta,
     "Residual": res_beta
 })
 
@@ -3043,7 +3044,7 @@ holding_days = st.slider("Holding period (days)", 1, 20, 5)
 stats = backtest_mispricing_capture(
     selected_instr,
     trade_instr,
-    hedge_weight,
+    combo["Hedge Weight"],
     all_historical_derivatives_list,
     holding_days
 )
@@ -3054,5 +3055,6 @@ if stats:
 # ======================
 # END SECTION 12
 # ======================
+
 
 
