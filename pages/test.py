@@ -2782,10 +2782,7 @@ def compute_expression_quality(instr, factor_df, Sigma, mispricing):
     betas = factor_df.loc[instr]
     mis = abs(mispricing.get(instr, np.nan))
 
-    # How single-factor the instrument is
     factor_purity = betas.abs().max() / betas.abs().sum()
-
-    # Proxy / crowdedness vs whole universe
     avg_abs_corr = Sigma.corr().abs().mean().get(instr, np.nan)
 
     expr_quality = mis * factor_purity / (1 + avg_abs_corr)
@@ -2822,12 +2819,10 @@ def find_alternatives(T, universe_df, factor_df, Sigma, mispricing, top_n=5):
 
         C_b = factor_df.loc[C]
 
-        # Same factor or not?
         alignment = np.dot(T_b, C_b) / (
             np.linalg.norm(T_b) * np.linalg.norm(C_b)
         )
 
-        # Pairwise correlation vs selected
         corr_vs_T = Sigma.loc[T, C] / np.sqrt(
             Sigma.loc[T, T] * Sigma.loc[C, C]
         )
@@ -2849,7 +2844,7 @@ def find_alternatives(T, universe_df, factor_df, Sigma, mispricing, top_n=5):
 
 
 # ------------------------------------------------------------
-# 12.2 Build factor-isolated combo (BCA-correct)
+# 12.2 Build factor-isolated combo (BCA-CORRECT)
 # ------------------------------------------------------------
 
 def build_combo(T, H, factor_df, Sigma):
@@ -2858,11 +2853,9 @@ def build_combo(T, H, factor_df, Sigma):
 
     target_factor = T_b.abs().idxmax()
 
-    # k is PURELY a magnitude ratio
-    k = T_b[target_factor] / H_b[target_factor]
-
-    # True hedge weight (this is the actual position)
-    hedge_weight = -k
+    # ✅ CORRECT hedge weight (DO NOT flip sign again later)
+    hedge_weight = - T_b[target_factor] / H_b[target_factor]
+    k = abs(hedge_weight)
 
     residuals = T_b + hedge_weight * H_b
 
@@ -2877,15 +2870,15 @@ def build_combo(T, H, factor_df, Sigma):
         "Primary Instrument": T,
         "Hedge Instrument": H,
         "Target Factor": target_factor,
-        "Hedge Ratio (k)": k,
-        "Hedge Weight (−k)": hedge_weight,
+        "Hedge Weight": hedge_weight,
+        "Hedge Size (|w|)": k,
         "Residuals": residuals,
         "Residual Risk (Rate %)": res_vol
     }
 
 
 # ------------------------------------------------------------
-# 12.3 PCA mispricing capture (rate %, NOT $)
+# 12.3 PCA mispricing capture (RATE %, NOT $)
 # ------------------------------------------------------------
 
 def backtest_mispricing_capture(T, H, hedge_weight, hist_list, holding_days):
@@ -2923,12 +2916,13 @@ def backtest_mispricing_capture(T, H, hedge_weight, hist_list, holding_days):
 
 st.header("12. Trade Structuring & PCA Mispricing Capture")
 
-# ---------- Explanation ----------
 with st.expander("ℹ️ Definitions & formulas"):
     st.markdown(r"""
-**Combo trade**
+**Combo position**
 \[
-\text{Position} = +1\cdot T + w_H \cdot H,\quad w_H = -k
+\text{Position} = +1\cdot T + w_H\cdot H
+\quad\text{where}\quad
+w_H = -\frac{\beta_T}{\beta_H}
 \]
 
 **Primary direction**
@@ -2936,20 +2930,15 @@ with st.expander("ℹ️ Definitions & formulas"):
 - Cheap → BUY / PAY
 
 **Hedge direction**
-- Comes from sign of \(w_H = -k\)
+- Comes from sign of \(w_H\)
 - May be SAME side as primary
 
-**Factor bars**
+**Residual check**
 \[
-\text{Primary} + (w_H \times \text{Hedge}) = \text{Residual}
+\beta_T + w_H\beta_H \approx 0
 \]
-
-**Mispricing capture**
-\[
-M_t - M_{t+N}
-\]
-Units are **Rate %**, not dollars.
 """)
+
 
 # ---------- Step 1 ----------
 selected_instr = st.selectbox(
@@ -2985,6 +2974,7 @@ trade_instr = st.selectbox(
 
 # ---------- C ----------
 st.subheader("C. Structured trade (explicit signed legs)")
+
 combo = build_combo(
     selected_instr,
     trade_instr,
@@ -2992,26 +2982,23 @@ combo = build_combo(
     Sigma_Raw_df
 )
 
-k = combo["Hedge Ratio (k)"]
-hedge_weight = combo["Hedge Weight (−k)"]
+hedge_weight = combo["Hedge Weight"]
 
-# Primary sign from mispricing
 primary_side = (
     "SELL / RECEIVE" if mispricing_series.get(selected_instr, 0) > 0
     else "BUY / PAY"
 )
 
-# Hedge sign from hedge weight (THIS IS THE FIX)
 hedge_side = "BUY / PAY" if hedge_weight > 0 else "SELL / RECEIVE"
 
 st.code(f"""
 EXECUTABLE TRADE
 ----------------
 {primary_side:<16}  1.00 × {combo['Primary Instrument']}
-{hedge_side:<16}  {abs(hedge_weight):.2f} × {combo['Hedge Instrument']}
+{hedge_side:<16}  {combo['Hedge Size (|w|)']:.2f} × {combo['Hedge Instrument']}
 """)
 
-# ---- Residual diagnostics (kept)
+# ---- Residual diagnostics (UNCHANGED)
 st.markdown("### Residual factor exposure after hedging")
 
 residual_diag = pd.DataFrame({
@@ -3033,7 +3020,7 @@ residual_diag = pd.DataFrame({
 
 st.table(residual_diag)
 
-# ---- Factor contribution bars (ADDED)
+# ---- Factor contribution bars (UNCHANGED)
 st.markdown("### Factor-by-factor contribution")
 
 T_beta = factor_sensitivities_df.loc[selected_instr]
@@ -3042,7 +3029,7 @@ res_beta = combo["Residuals"]
 
 factor_bar_df = pd.DataFrame({
     "Primary": T_beta,
-    "Hedge (w_H×)": hedge_weight * H_beta,
+    "Hedge (w×)": hedge_weight * H_beta,
     "Residual": res_beta
 })
 
@@ -3067,4 +3054,5 @@ if stats:
 # ======================
 # END SECTION 12
 # ======================
+
 
