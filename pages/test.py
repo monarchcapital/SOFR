@@ -3046,86 +3046,51 @@ if stats:
     st.subheader("D. PCA mispricing capture (NOT $ PnL)")
     st.table(pd.DataFrame(stats, index=["Value"]).T)
 # ---------------------------------------------------------------------
-# 12.X Instrument LEVEL Curves over Time (Primary / Hedge / Hedged)
+# Clean Instrument Level Curves (Separate Plots, Actual Levels)
 # ---------------------------------------------------------------------
 
-st.subheader("Instrument Level Curves (Primary, Hedge, Hedged)")
+st.subheader("Instrument Level Curves (Separate Views, Actual Levels)")
 
-# Build a single universe of historical ORIGINAL levels
-historical_levels_df = pd.concat(all_historical_derivatives_list, axis=1)
+# --- PRIMARY INSTRUMENT ---
+fig1, ax1 = plt.subplots(figsize=(15, 4))
+ax1.plot(
+    primary_series.index,
+    primary_series.values,
+    linewidth=2.5
+)
+ax1.set_title(f"Primary Instrument Level: {selected_instr}", fontsize=14)
+ax1.set_ylabel("Instrument Level")
+ax1.grid(True, linestyle=":", alpha=0.6)
+st.pyplot(fig1)
 
-primary_col = f"{selected_instr} (Original)"
-hedge_col   = f"{trade_instr} (Original)"
-k_star      = combo["Hedge Ratio (k)"]
+# --- HEDGE INSTRUMENT ---
+fig2, ax2 = plt.subplots(figsize=(15, 4))
+ax2.plot(
+    hedge_series.index,
+    hedge_series.values,
+    linewidth=2.5,
+    linestyle="--"
+)
+ax2.set_title(f"Hedge Instrument Level: {trade_instr}", fontsize=14)
+ax2.set_ylabel("Instrument Level")
+ax2.grid(True, linestyle=":", alpha=0.6)
+st.pyplot(fig2)
 
-if primary_col not in historical_levels_df.columns or hedge_col not in historical_levels_df.columns:
-    st.warning("Original level series not available for selected instruments.")
-else:
-    primary_series = historical_levels_df[primary_col].dropna()
-    hedge_series   = historical_levels_df[hedge_col].dropna()
-
-    # Align dates
-    common_idx = primary_series.index.intersection(hedge_series.index)
-
-    if len(common_idx) < 10:
-        st.warning("Not enough overlapping history for level curves.")
-    else:
-        primary_series = primary_series.loc[common_idx]
-        hedge_series   = hedge_series.loc[common_idx]
-
-        # Hedged synthetic instrument (LEVEL)
-        hedged_series = primary_series - k_star * hedge_series
-
-        normalize = st.checkbox(
-            "Normalize curves to start at zero (shape comparison)",
-            value=True,
-            key="section12_level_curves_norm"
-        )
-
-        if normalize:
-            base = common_idx[0]
-            primary_plot = primary_series - primary_series.loc[base]
-            hedge_plot   = hedge_series - hedge_series.loc[base]
-            hedged_plot  = hedged_series - hedged_series.loc[base]
-            ylabel = "Normalized Level"
-        else:
-            primary_plot = primary_series
-            hedge_plot   = hedge_series
-            hedged_plot  = hedged_series
-            ylabel = "Instrument Level"
-
-        fig, ax = plt.subplots(figsize=(15, 6))
-
-        ax.plot(
-            primary_plot.index,
-            primary_plot.values,
-            label=f"Primary: {selected_instr}",
-            linewidth=2.5
-        )
-
-        ax.plot(
-            hedge_plot.index,
-            hedge_plot.values,
-            label=f"Hedge: {trade_instr} (k={k_star:.3f})",
-            linestyle="--",
-            alpha=0.85
-        )
-
-        ax.plot(
-            hedged_plot.index,
-            hedged_plot.values,
-            label="Hedged Synthetic Instrument",
-            linewidth=3.0
-        )
-
-        ax.set_title("Instrument Level Curves over Time", fontsize=14)
-        ax.set_xlabel("Date")
-        ax.set_ylabel(ylabel)
-        ax.legend(loc="best")
-        ax.grid(True, linestyle=":", alpha=0.6)
-
-        plt.tight_layout()
-        st.pyplot(fig)
+# --- HEDGED SYNTHETIC INSTRUMENT ---
+fig3, ax3 = plt.subplots(figsize=(15, 4))
+ax3.plot(
+    hedged_series.index,
+    hedged_series.values,
+    linewidth=2.8
+)
+ax3.set_title(
+    f"Hedged Synthetic Instrument Level (Primary − {k_star:.3f} × Hedge)",
+    fontsize=14
+)
+ax3.set_xlabel("Date")
+ax3.set_ylabel("Instrument Level")
+ax3.grid(True, linestyle=":", alpha=0.6)
+st.pyplot(fig3)
 
 
 # ======================
