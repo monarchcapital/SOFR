@@ -2767,13 +2767,13 @@ plot_snapshot(
 # ============================
 # END SECTION 11
 # ============================
-# ======================
-# SECTION 12: INSTRUMENT-CENTRIC TRADE CONSTRUCTION
-# ======================
+# ============================================================
+# SECTION 12: TRADE CONSTRUCTION (INSTRUMENT → STRATEGY → COMBO)
+# ============================================================
 
-# --------------------------------------------------
-# 12.0 Helper: Recommend best expression of a distortion
-# --------------------------------------------------
+# ------------------------------------------------------------
+# 12.0 Find best alternative expressions of a distortion
+# ------------------------------------------------------------
 
 def recommend_best_expression(
     selected_instrument,
@@ -2784,8 +2784,8 @@ def recommend_best_expression(
     top_n=5
 ):
     """
-    Given a selected instrument, find better structural expressions
-    of the SAME distortion (outright vs spread vs fly etc).
+    Given a distorted instrument, find better structural ways
+    (outright / spread / fly) to express the SAME distortion.
     """
 
     if selected_instrument not in instrument_universe_df['Instrument'].values:
@@ -2793,13 +2793,14 @@ def recommend_best_expression(
 
     T = selected_instrument
 
+    # Factor exposures of selected instrument
     T_factors = factor_sensitivities_df.loc[T]
     T_mis = mispricing_series.get(T, np.nan)
 
-    # Dominant factor
+    # Dominant factor (Level / Slope / Curvature)
     dominant_factor = T_factors.abs().idxmax()
 
-    # Limit to same maturity bucket (3M / 6M / 12M)
+    # Restrict search to same maturity bucket
     maturity_tag = (
         '3M' if '3M' in T else
         '6M' if '6M' in T else
@@ -2826,12 +2827,12 @@ def recommend_best_expression(
         den = np.linalg.norm(T_factors.values) * np.linalg.norm(C_factors.values)
         alignment = num / den if den > 0 else 0.0
 
-        # Correlation
+        # Correlation penalty
         corr = Sigma_Raw_df.loc[T, C] / np.sqrt(
             Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C]
         )
 
-        # Expression score
+        # Expression quality score
         score = abs(T_mis) * abs(alignment) / (1 + abs(corr))
 
         rows.append({
@@ -2847,9 +2848,9 @@ def recommend_best_expression(
     return df.sort_values('Expression Score', ascending=False).head(top_n)
 
 
-# --------------------------------------------------
-# 12.1 Helper: Build optimal combo trade T - k*H
-# --------------------------------------------------
+# ------------------------------------------------------------
+# 12.1 Build the actual trading combo: T - k * H
+# ------------------------------------------------------------
 
 def build_optimal_combo_trade(
     T,
@@ -2859,12 +2860,14 @@ def build_optimal_combo_trade(
     mispricing_series
 ):
     """
-    Build T - k*H to neutralize dominant factor of T.
+    Build a combo trade that neutralizes the dominant factor
+    of T using hedge instrument H.
     """
 
     T_f = factor_sensitivities_df.loc[T]
     H_f = factor_sensitivities_df.loc[H]
 
+    # Dominant factor of T
     dominant_factor = T_f.abs().idxmax()
 
     T_exp = T_f[dominant_factor]
@@ -2902,22 +2905,22 @@ def build_optimal_combo_trade(
     }
 
 
-# --------------------------------------------------
-# 12.2 Streamlit UI
-# --------------------------------------------------
+# ------------------------------------------------------------
+# 12.2 Streamlit UI (explicit trade selection)
+# ------------------------------------------------------------
 
-st.header("12. Trade Construction: Best Way to Trade a Selected Distortion")
+st.header("12. Trade Construction: From Distortion to Trade")
 
+# Step 1: Select distorted instrument
 selected_instr = st.selectbox(
-    "Select any instrument (outright / spread / fly / DBF)",
+    "1️⃣ Select the instrument where you see distortion",
     instrument_universe_df['Instrument'].values,
-    key="trade_structuring_select"
+    key="section12_distorted_instr"
 )
 
 if selected_instr:
 
-    st.subheader("12.1 Best Structural Expressions")
-
+    # Step 2: Show alternative expressions
     struct_df = recommend_best_expression(
         selected_instr,
         instrument_universe_df,
@@ -2927,8 +2930,10 @@ if selected_instr:
     )
 
     if struct_df.empty:
-        st.info("No alternative expressions found.")
+        st.info("No alternative expressions found for this region.")
     else:
+        st.subheader("2️⃣ Better ways to express this distortion")
+
         st.dataframe(
             struct_df.style.format({
                 'Factor Alignment': '{:.2f}',
@@ -2938,163 +2943,30 @@ if selected_instr:
             use_container_width=True
         )
 
-        st.subheader("12.2 Auto-Built Combo Trade")
-
-        hedge_instr = st.selectbox(
-            "Choose hedge instrument",
+        # Step 3: YOU choose the trade to put on
+        trade_instr = st.selectbox(
+            "3️⃣ Choose which instrument you want to trade",
             struct_df['Alternative Instrument'].values,
-            key="combo_hedge_select"
+            key="section12_trade_instr"
         )
 
+        # Step 4: Build combo trade
         combo = build_optimal_combo_trade(
             selected_instr,
-            hedge_instr,
+            trade_instr,
             factor_sensitivities_df,
             Sigma_Raw_df,
             mispricing_series
         )
 
         if combo:
+            st.subheader("4️⃣ Suggested trading combo")
             st.table(pd.DataFrame(combo, index=['Value']).T)
         else:
-            st.warning("Unable to construct a valid hedge (zero exposure).")
-     # ======================
-# SECTION 12.3: PCA-REVERSION BACKTEST (COMBO TRADE)
-# ======================
-
-def backtest_pca_reversion_combo(
-    T,
-    H,
-    k,
-    historical_derivatives_list,
-    start_date=None,
-    end_date=None,
-    holding_days=5
-):
-    """
-    Backtest PCA reversion for combo trade:
-        PnL_t = (Mis_T[t] - k * Mis_H[t]) - (Mis_T[t+N] - k * Mis_H[t+N])
-    """
-
-    # --- Build mispricing time series for all derivatives ---
-    mis_ts = {}
-
-    for df in historical_derivatives_list:
-        if df.empty:
-            continue
-
-        for col in df.columns:
-            if col.endswith("(Original)"):
-                base = col.replace(" (Original)", "")
-                pca_col = col.replace("(Original)", "(PCA)")
-                if pca_col in df.columns:
-                    mis_ts[base] = (df[col] - df[pca_col]) * 100  # Rate %
-
-    mis_df = pd.DataFrame(mis_ts).dropna(how="all")
-
-    if T not in mis_df.columns or H not in mis_df.columns:
-        return None, "Mispricing history not available for selected instruments."
-
-    # --- Date filtering ---
-    if start_date:
-        mis_df = mis_df[mis_df.index >= start_date]
-    if end_date:
-        mis_df = mis_df[mis_df.index <= end_date]
-
-    # --- Combo mispricing ---
-    combo_mis = mis_df[T] - k * mis_df[H]
-
-    # --- Forward reversion PnL ---
-    pnl = combo_mis - combo_mis.shift(-holding_days)
-    pnl = pnl.dropna()
-
-    if pnl.empty:
-        return None, "Not enough data for selected horizon."
-
-    # --- Performance metrics ---
-    cum_pnl = pnl.cumsum()
-    sharpe = pnl.mean() / pnl.std() * np.sqrt(252) if pnl.std() > 0 else np.nan
-    hit_rate = (pnl > 0).mean()
-    drawdown = cum_pnl - cum_pnl.cummax()
-    max_dd = drawdown.min()
-
-    stats = {
-        "Holding Days": holding_days,
-        "Total PnL (Rate %)": cum_pnl.iloc[-1],
-        "Annualized Sharpe": sharpe,
-        "Hit Rate": hit_rate,
-        "Max Drawdown (Rate %)": max_dd
-    }
-
-    results_df = pd.DataFrame({
-        "PnL": pnl,
-        "Cumulative PnL": cum_pnl,
-        "Drawdown": drawdown
-    })
-
-    return results_df, stats
-
-
-# --------------------------------------------------
-# Streamlit UI
-# --------------------------------------------------
-
-st.subheader("12.3 PCA-Reversion Backtest (Combo Trade)")
-
-if selected_instr and hedge_instr:
-
-    holding_days = st.slider(
-        "Holding Period (days)",
-        min_value=1,
-        max_value=20,
-        value=5,
-        step=1,
-        key="bt_holding_days"
-    )
-
-    bt_df, bt_stats = backtest_pca_reversion_combo(
-        selected_instr,
-        hedge_instr,
-        combo["Hedge Ratio (k)"],
-        all_historical_derivatives_list,
-        start_date=None,
-        end_date=None,
-        holding_days=holding_days
-    )
-
-    if bt_df is None:
-        st.warning(bt_stats)
-    else:
-        st.markdown("### 📊 Backtest Performance")
-
-        st.table(pd.DataFrame(bt_stats, index=["Value"]).T.style.format({
-            "Total PnL (Rate %)": "{:.3f}",
-            "Annualized Sharpe": "{:.2f}",
-            "Hit Rate": "{:.2%}",
-            "Max Drawdown (Rate %)": "{:.3f}"
-        }))
-
-        # --- Plot ---
-        fig, ax = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-
-        ax[0].plot(bt_df.index, bt_df["Cumulative PnL"], label="Cumulative PnL")
-        ax[0].axhline(0, color="gray", linestyle="--")
-        ax[0].set_title("PCA-Reversion Strategy: Cumulative PnL")
-        ax[0].grid(True, linestyle=":")
-
-        ax[1].plot(bt_df.index, bt_df["Drawdown"], color="red", label="Drawdown")
-        ax[1].set_title("Drawdown")
-        ax[1].grid(True, linestyle=":")
-
-        plt.tight_layout()
-        st.pyplot(fig)
-
-# ======================
-# END SECTION 12.3
-# ======================
-
+            st.warning("Unable to construct a valid hedge for this choice.")
 
 # ======================
 # END SECTION 12
 # ======================
+
 
