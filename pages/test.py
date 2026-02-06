@@ -2767,7 +2767,13 @@ plot_snapshot(
 # ============================
 # END SECTION 11
 # ============================
-# ------------------- Section 12: Instrument-Centric Trade Structuring -------------------
+# ======================
+# SECTION 12: INSTRUMENT-CENTRIC TRADE CONSTRUCTION
+# ======================
+
+# --------------------------------------------------
+# 12.0 Helper: Recommend best expression of a distortion
+# --------------------------------------------------
 
 def recommend_best_expression(
     selected_instrument,
@@ -2778,80 +2784,141 @@ def recommend_best_expression(
     top_n=5
 ):
     """
-    Given a selected instrument, recommend the best structural way
-    to trade that SAME distortion.
+    Given a selected instrument, find better structural expressions
+    of the SAME distortion (outright vs spread vs fly etc).
     """
 
     if selected_instrument not in instrument_universe_df['Instrument'].values:
-        return pd.DataFrame(), "Selected instrument not found."
+        return pd.DataFrame()
 
     T = selected_instrument
 
-    # --- Trade attributes ---
-    T_row = instrument_universe_df.set_index('Instrument').loc[T]
     T_factors = factor_sensitivities_df.loc[T]
     T_mis = mispricing_series.get(T, np.nan)
 
     # Dominant factor
     dominant_factor = T_factors.abs().idxmax()
 
-    # --- Local candidate set ---
-    maturity = T_row['Type'].split()[0] if ' ' in T_row['Type'] else ''
+    # Limit to same maturity bucket (3M / 6M / 12M)
+    maturity_tag = (
+        '3M' if '3M' in T else
+        '6M' if '6M' in T else
+        '12M' if '12M' in T else ''
+    )
+
     local_df = instrument_universe_df[
-        instrument_universe_df['Type'].str.contains(maturity)
+        instrument_universe_df['Instrument'].str.contains(maturity_tag)
     ].copy()
 
     local_df = local_df[local_df['Instrument'] != T]
 
-    results = []
+    rows = []
 
-    for _, row in local_df.iterrows():
-        C = row['Instrument']
-
+    for _, r in local_df.iterrows():
+        C = r['Instrument']
         if C not in factor_sensitivities_df.index:
             continue
 
-        # --- Factor alignment (cosine similarity) ---
         C_factors = factor_sensitivities_df.loc[C]
-        num = np.dot(T_factors, C_factors)
-        den = np.linalg.norm(T_factors) * np.linalg.norm(C_factors)
-        alignment = num / den if den > 0 else 0
 
-        # --- Correlation penalty ---
-        corr = Sigma_Raw_df.loc[T, C] / (
-            np.sqrt(Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C])
+        # Factor alignment (cosine similarity)
+        num = np.dot(T_factors.values, C_factors.values)
+        den = np.linalg.norm(T_factors.values) * np.linalg.norm(C_factors.values)
+        alignment = num / den if den > 0 else 0.0
+
+        # Correlation
+        corr = Sigma_Raw_df.loc[T, C] / np.sqrt(
+            Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C]
         )
 
-        # --- Expression score ---
-        score = (
-            abs(T_mis)
-            * abs(alignment)
-            / (1 + abs(corr))
-        )
+        # Expression score
+        score = abs(T_mis) * abs(alignment) / (1 + abs(corr))
 
-        results.append({
+        rows.append({
             'Alternative Instrument': C,
-            'Structure': row['Derivative Group'],
+            'Structure': r['Derivative Group'],
             'Dominant Factor': dominant_factor,
             'Factor Alignment': alignment,
             'Correlation': corr,
             'Expression Score': score
         })
 
-    result_df = pd.DataFrame(results)
-    result_df = result_df.sort_values('Expression Score', ascending=False)
+    df = pd.DataFrame(rows)
+    return df.sort_values('Expression Score', ascending=False).head(top_n)
 
-    return result_df.head(top_n), None
-st.header("12. Trade Structuring: Best Way to Express a Distortion")
+
+# --------------------------------------------------
+# 12.1 Helper: Build optimal combo trade T - k*H
+# --------------------------------------------------
+
+def build_optimal_combo_trade(
+    T,
+    H,
+    factor_sensitivities_df,
+    Sigma_Raw_df,
+    mispricing_series
+):
+    """
+    Build T - k*H to neutralize dominant factor of T.
+    """
+
+    T_f = factor_sensitivities_df.loc[T]
+    H_f = factor_sensitivities_df.loc[H]
+
+    dominant_factor = T_f.abs().idxmax()
+
+    T_exp = T_f[dominant_factor]
+    H_exp = H_f[dominant_factor]
+
+    if abs(H_exp) < 1e-8:
+        return None
+
+    # Hedge ratio
+    k = T_exp / H_exp
+
+    # Residual factor exposures
+    residuals = T_f - k * H_f
+
+    # Residual volatility
+    Var_T = Sigma_Raw_df.loc[T, T]
+    Var_H = Sigma_Raw_df.loc[H, H]
+    Cov_TH = Sigma_Raw_df.loc[T, H]
+
+    res_var = Var_T + k**2 * Var_H - 2 * k * Cov_TH
+    res_vol = np.sqrt(max(res_var, 0)) * 100  # Rate %
+
+    trade_dir = "Sell / Receive" if mispricing_series.get(T, 0) > 0 else "Buy / Pay"
+
+    return {
+        'Primary Instrument': T,
+        'Hedge Instrument': H,
+        'Trade Direction': trade_dir,
+        'Hedge Ratio (k)': k,
+        'Dominant Factor': dominant_factor,
+        'Residual Level': residuals.get('Level (Whole Curve Shift)', np.nan),
+        'Residual Slope': residuals.get('Slope (Steepening/Flattening)', np.nan),
+        'Residual Curvature': residuals.get('Curvature (Fly Risk)', np.nan),
+        'Residual Volatility (Rate %)': res_vol
+    }
+
+
+# --------------------------------------------------
+# 12.2 Streamlit UI
+# --------------------------------------------------
+
+st.header("12. Trade Construction: Best Way to Trade a Selected Distortion")
 
 selected_instr = st.selectbox(
-    "Select an instrument to trade",
+    "Select any instrument (outright / spread / fly / DBF)",
     instrument_universe_df['Instrument'].values,
     key="trade_structuring_select"
 )
 
 if selected_instr:
-    recos, err = recommend_best_expression(
+
+    st.subheader("12.1 Best Structural Expressions")
+
+    struct_df = recommend_best_expression(
         selected_instr,
         instrument_universe_df,
         Sigma_Raw_df,
@@ -2859,20 +2926,40 @@ if selected_instr:
         mispricing_series
     )
 
-    if err:
-        st.warning(err)
+    if struct_df.empty:
+        st.info("No alternative expressions found.")
     else:
-        st.markdown("""
-        **Interpretation**
-        - Higher *Expression Score* = cleaner way to trade the SAME distortion
-        - Look for higher alignment + lower correlation
-        """)
-
         st.dataframe(
-            recos.style.format({
+            struct_df.style.format({
                 'Factor Alignment': '{:.2f}',
                 'Correlation': '{:.2f}',
                 'Expression Score': '{:.4f}'
             }),
             use_container_width=True
         )
+
+        st.subheader("12.2 Auto-Built Combo Trade")
+
+        hedge_instr = st.selectbox(
+            "Choose hedge instrument",
+            struct_df['Alternative Instrument'].values,
+            key="combo_hedge_select"
+        )
+
+        combo = build_optimal_combo_trade(
+            selected_instr,
+            hedge_instr,
+            factor_sensitivities_df,
+            Sigma_Raw_df,
+            mispricing_series
+        )
+
+        if combo:
+            st.table(pd.DataFrame(combo, index=['Value']).T)
+        else:
+            st.warning("Unable to construct a valid hedge (zero exposure).")
+
+# ======================
+# END SECTION 12
+# ======================
+
