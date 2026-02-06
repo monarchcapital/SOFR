@@ -2766,9 +2766,8 @@ plot_snapshot(
 
 # ============================
 # END SECTION 11
-# ============================
 # ============================================================
-# SECTION 12: TRADE CONSTRUCTION (INSTRUMENT → STRATEGY → COMBO)
+# SECTION 12: TRADE CONSTRUCTION + EXPRESSION SCORE + PnL
 # ============================================================
 
 # ------------------------------------------------------------
@@ -2783,24 +2782,15 @@ def recommend_best_expression(
     mispricing_series,
     top_n=5
 ):
-    """
-    Given a distorted instrument, find better structural ways
-    (outright / spread / fly) to express the SAME distortion.
-    """
-
     if selected_instrument not in instrument_universe_df['Instrument'].values:
         return pd.DataFrame()
 
     T = selected_instrument
-
-    # Factor exposures of selected instrument
     T_factors = factor_sensitivities_df.loc[T]
     T_mis = mispricing_series.get(T, np.nan)
 
-    # Dominant factor (Level / Slope / Curvature)
     dominant_factor = T_factors.abs().idxmax()
 
-    # Restrict search to same maturity bucket
     maturity_tag = (
         '3M' if '3M' in T else
         '6M' if '6M' in T else
@@ -2822,18 +2812,18 @@ def recommend_best_expression(
 
         C_factors = factor_sensitivities_df.loc[C]
 
-        # Factor alignment (cosine similarity)
+        # Factor alignment
         num = np.dot(T_factors.values, C_factors.values)
         den = np.linalg.norm(T_factors.values) * np.linalg.norm(C_factors.values)
         alignment = num / den if den > 0 else 0.0
 
-        # Correlation penalty
+        # Correlation
         corr = Sigma_Raw_df.loc[T, C] / np.sqrt(
             Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C]
         )
 
-        # Expression quality score
-        score = abs(T_mis) * abs(alignment) / (1 + abs(corr))
+        # Expression score
+        expr_score = abs(T_mis) * abs(alignment) / (1 + abs(corr))
 
         rows.append({
             'Alternative Instrument': C,
@@ -2841,7 +2831,7 @@ def recommend_best_expression(
             'Dominant Factor': dominant_factor,
             'Factor Alignment': alignment,
             'Correlation': corr,
-            'Expression Score': score
+            'Expression Score': expr_score
         })
 
     df = pd.DataFrame(rows)
@@ -2849,7 +2839,7 @@ def recommend_best_expression(
 
 
 # ------------------------------------------------------------
-# 12.1 Build the actual trading combo: T - k * H
+# 12.1 Build combo trade
 # ------------------------------------------------------------
 
 def build_optimal_combo_trade(
@@ -2859,36 +2849,21 @@ def build_optimal_combo_trade(
     Sigma_Raw_df,
     mispricing_series
 ):
-    """
-    Build a combo trade that neutralizes the dominant factor
-    of T using hedge instrument H.
-    """
-
     T_f = factor_sensitivities_df.loc[T]
     H_f = factor_sensitivities_df.loc[H]
 
-    # Dominant factor of T
     dominant_factor = T_f.abs().idxmax()
 
-    T_exp = T_f[dominant_factor]
-    H_exp = H_f[dominant_factor]
+    k = T_f[dominant_factor] / H_f[dominant_factor]
 
-    if abs(H_exp) < 1e-8:
-        return None
-
-    # Hedge ratio
-    k = T_exp / H_exp
-
-    # Residual factor exposures
     residuals = T_f - k * H_f
 
-    # Residual volatility
     Var_T = Sigma_Raw_df.loc[T, T]
     Var_H = Sigma_Raw_df.loc[H, H]
     Cov_TH = Sigma_Raw_df.loc[T, H]
 
     res_var = Var_T + k**2 * Var_H - 2 * k * Cov_TH
-    res_vol = np.sqrt(max(res_var, 0)) * 100  # Rate %
+    res_vol = np.sqrt(max(res_var, 0)) * 100
 
     trade_dir = "Sell / Receive" if mispricing_series.get(T, 0) > 0 else "Buy / Pay"
 
@@ -2906,21 +2881,59 @@ def build_optimal_combo_trade(
 
 
 # ------------------------------------------------------------
-# 12.2 Streamlit UI (explicit trade selection)
+# 12.2 Backtest PCA-reversion PnL
 # ------------------------------------------------------------
 
-st.header("12. Trade Construction: From Distortion to Trade")
+def backtest_combo_pnl(
+    T,
+    H,
+    k,
+    historical_derivatives_list,
+    holding_days=5
+):
+    mis_ts = {}
 
-# Step 1: Select distorted instrument
+    for df in historical_derivatives_list:
+        for col in df.columns:
+            if col.endswith("(Original)"):
+                base = col.replace(" (Original)", "")
+                pca_col = col.replace("(Original)", "(PCA)")
+                if pca_col in df.columns:
+                    mis_ts[base] = (df[col] - df[pca_col]) * 100
+
+    mis_df = pd.DataFrame(mis_ts).dropna()
+
+    if T not in mis_df.columns or H not in mis_df.columns:
+        return None
+
+    combo_mis = mis_df[T] - k * mis_df[H]
+    pnl = combo_mis - combo_mis.shift(-holding_days)
+    pnl = pnl.dropna()
+
+    cum_pnl = pnl.cumsum()
+
+    return {
+        'Total PnL (Rate %)': cum_pnl.iloc[-1],
+        'Sharpe': pnl.mean() / pnl.std() * np.sqrt(252),
+        'Hit Rate': (pnl > 0).mean(),
+        'Max Drawdown (Rate %)': (cum_pnl - cum_pnl.cummax()).min()
+    }
+
+
+# ------------------------------------------------------------
+# 12.3 Streamlit UI
+# ------------------------------------------------------------
+
+st.header("12. Trade Construction: Expression Quality & PnL")
+
 selected_instr = st.selectbox(
-    "1️⃣ Select the instrument where you see distortion",
+    "1️⃣ Select distorted instrument",
     instrument_universe_df['Instrument'].values,
-    key="section12_distorted_instr"
+    key="s12_distorted"
 )
 
 if selected_instr:
 
-    # Step 2: Show alternative expressions
     struct_df = recommend_best_expression(
         selected_instr,
         instrument_universe_df,
@@ -2929,44 +2942,56 @@ if selected_instr:
         mispricing_series
     )
 
-    if struct_df.empty:
-        st.info("No alternative expressions found for this region.")
-    else:
-        st.subheader("2️⃣ Better ways to express this distortion")
+    st.subheader("2️⃣ Alternative trade expressions (ranked)")
 
-        st.dataframe(
-            struct_df.style.format({
-                'Factor Alignment': '{:.2f}',
-                'Correlation': '{:.2f}',
-                'Expression Score': '{:.4f}'
-            }),
-            use_container_width=True
-        )
+    st.dataframe(
+        struct_df.style.format({
+            'Factor Alignment': '{:.2f}',
+            'Correlation': '{:.2f}',
+            'Expression Score': '{:.4f}'
+        }),
+        use_container_width=True
+    )
 
-        # Step 3: YOU choose the trade to put on
-        trade_instr = st.selectbox(
-            "3️⃣ Choose which instrument you want to trade",
-            struct_df['Alternative Instrument'].values,
-            key="section12_trade_instr"
-        )
+    trade_instr = st.selectbox(
+        "3️⃣ Choose the instrument to trade",
+        struct_df['Alternative Instrument'].values,
+        key="s12_trade_instr"
+    )
 
-        # Step 4: Build combo trade
-        combo = build_optimal_combo_trade(
-            selected_instr,
-            trade_instr,
-            factor_sensitivities_df,
-            Sigma_Raw_df,
-            mispricing_series
-        )
+    # Extract expression score
+    expr_score = struct_df.set_index('Alternative Instrument').loc[trade_instr]['Expression Score']
 
-        if combo:
-            st.subheader("4️⃣ Suggested trading combo")
-            st.table(pd.DataFrame(combo, index=['Value']).T)
-        else:
-            st.warning("Unable to construct a valid hedge for this choice.")
+    combo = build_optimal_combo_trade(
+        selected_instr,
+        trade_instr,
+        factor_sensitivities_df,
+        Sigma_Raw_df,
+        mispricing_series
+    )
 
-# ======================
-# END SECTION 12
-# ======================
+    st.subheader("4️⃣ Trade structure")
+
+    st.table(pd.DataFrame(combo, index=['Value']).T)
+
+    st.metric("Expression Score (quality of structure)", f"{expr_score:.4f}")
+
+    bt_stats = backtest_combo_pnl(
+        selected_instr,
+        trade_instr,
+        combo['Hedge Ratio (k)'],
+        all_historical_derivatives_list
+    )
+
+    if bt_stats:
+        st.subheader("5️⃣ Historical PCA-reversion PnL")
+
+        st.table(pd.DataFrame(bt_stats, index=['Value']).T.style.format({
+            'Total PnL (Rate %)': '{:.3f}',
+            'Sharpe': '{:.2f}',
+            'Hit Rate': '{:.1%}',
+            'Max Drawdown (Rate %)': '{:.3f}'
+        }))
+
 
 
