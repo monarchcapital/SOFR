@@ -2767,4 +2767,132 @@ plot_snapshot(
 # ============================
 # END SECTION 11
 # ============================
+# ------------------- Section 12: Trade Recommendation Engine -------------------
+
+def build_trade_recommendations(
+    instrument_universe_df,
+    Sigma_Raw_df,
+    mispricing_threshold=0.02,   # Rate %
+    top_n=10
+):
+    """
+    Recommends trades based on:
+    1) Distortion vs PCA Fair (mispricing)
+    2) Factor purity (clean expression)
+    3) Low redundancy (correlation penalty)
+    """
+
+    if instrument_universe_df.empty or Sigma_Raw_df.empty:
+        return pd.DataFrame()
+
+    df = instrument_universe_df.copy()
+
+    # --- 1. Filter meaningful distortions ---
+    df = df.dropna(subset=['Mispricing (Rate %)', 'Total Volatility (Rate %)'])
+    df = df[df['Mispricing (Rate %)'].abs() >= mispricing_threshold]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # --- 2. Factor Purity ---
+    df['Factor Purity'] = (
+        df[['Level Sensitivity', 'Slope Sensitivity', 'Curvature Sensitivity']]
+        .abs()
+        .max(axis=1)
+        /
+        df[['Level Sensitivity', 'Slope Sensitivity', 'Curvature Sensitivity']]
+        .abs()
+        .sum(axis=1)
+    )
+
+    # --- 3. Correlation penalty ---
+    corr = Sigma_Raw_df.corr().abs()
+    avg_corr = corr.mean()
+    df['Avg Abs Correlation'] = df['Instrument'].map(avg_corr)
+
+    # --- 4. Trade score ---
+    df['Trade Score'] = (
+        df['Mispricing (Rate %)'].abs()
+        * df['Factor Purity']
+        / (1 + df['Avg Abs Correlation'])
+    )
+
+    # --- 5. Trade direction ---
+    df['Trade Direction'] = np.where(
+        df['Mispricing (Rate %)'] > 0,
+        'Sell / Receive',
+        'Buy / Pay'
+    )
+
+    # --- 6. Recommended structure ---
+    def infer_structure(instr):
+        if 'Double Fly' in instr:
+            return 'Curvature (Double Fly)'
+        elif 'Fly' in instr:
+            return 'Butterfly'
+        elif 'Spread' in instr:
+            return 'Curve Spread'
+        else:
+            return 'Outright'
+
+    df['Recommended Structure'] = df['Instrument'].apply(infer_structure)
+
+    return (
+        df.sort_values('Trade Score', ascending=False)
+          .head(top_n)
+          .reset_index(drop=True)
+    )
+
+
+# ------------------- Streamlit UI -------------------
+
+st.header("12. Trade Recommendation Engine")
+
+mispricing_cutoff = st.slider(
+    "Minimum Mispricing Threshold (Rate %)",
+    min_value=0.0,
+    max_value=0.10,
+    value=0.02,
+    step=0.005,
+    key="trade_mispricing_cutoff"
+)
+
+trade_recos = build_trade_recommendations(
+    instrument_universe_df,
+    Sigma_Raw_df,
+    mispricing_threshold=mispricing_cutoff,
+    top_n=10
+)
+
+if trade_recos.empty:
+    st.info("No instruments meet the distortion + quality criteria.")
+else:
+    st.markdown("""
+    **How to read this**
+    - **Trade Score**: distortion × factor purity ÷ redundancy  
+    - **Factor Purity → 1** means clean single-factor expression  
+    - Prefer high score + low avg correlation
+    """)
+
+    st.dataframe(
+        trade_recos[[
+            'Instrument',
+            'Type',
+            'Trade Direction',
+            'Recommended Structure',
+            'Mispricing (Rate %)',
+            'Factor Purity',
+            'Avg Abs Correlation',
+            'Trade Score'
+        ]].style.format({
+            'Mispricing (Rate %)': '{:.4f}',
+            'Factor Purity': '{:.2f}',
+            'Avg Abs Correlation': '{:.2f}',
+            'Trade Score': '{:.4f}'
+        }),
+        use_container_width=True
+    )
+
+# ------------------- End Section 12 -------------------
+
 
