@@ -2842,3 +2842,37 @@ def recommend_best_expression(
     result_df = result_df.sort_values('Expression Score', ascending=False)
 
     return result_df.head(top_n), None
+st.header("12. Trade Structuring: Best Way to Express a Distortion")
+
+selected_instr = st.selectbox(
+    "Select an instrument to trade",
+    instrument_universe_df['Instrument'].values,
+    key="trade_structuring_select"
+)
+
+if selected_instr:
+    recos, err = recommend_best_expression(
+        selected_instr,
+        instrument_universe_df,
+        Sigma_Raw_df,
+        factor_sensitivities_df,
+        mispricing_series
+    )
+
+    if err:
+        st.warning(err)
+    else:
+        st.markdown("""
+        **Interpretation**
+        - Higher *Expression Score* = cleaner way to trade the SAME distortion
+        - Look for higher alignment + lower correlation
+        """)
+
+        st.dataframe(
+            recos.style.format({
+                'Factor Alignment': '{:.2f}',
+                'Correlation': '{:.2f}',
+                'Expression Score': '{:.4f}'
+            }),
+            use_container_width=True
+        )
