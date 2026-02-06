@@ -2767,7 +2767,7 @@ plot_snapshot(
 # ============================
 # END SECTION 11
 # ============================================================
-# SECTION 12: TRADE STRUCTURING & MISPRICING (NO NAMEERROR)
+# SECTION 12: TRADE STRUCTURING & MISPRICING (FIXED HEDGE)
 # ============================================================
 
 import numpy as np
@@ -2775,11 +2775,9 @@ import pandas as pd
 import streamlit as st
 
 # ------------------------------------------------------------
-# 12.0 BUILD SIGNED + ABS MISPRICING (FROM EXISTING DATA)
+# 12.0 BUILD SIGNED + ABS MISPRICING
 # ------------------------------------------------------------
-# We reconstruct mispricing using the SAME PCA residual logic
-# used elsewhere in your app — but keep the sign.
-
+# Use the latest available historical data point
 latest_df = all_historical_derivatives_list[-1]
 
 signed_mispricing_series = {}
@@ -2790,6 +2788,7 @@ for col in latest_df.columns:
         instr = col.replace(" (Original)", "")
         pca_col = col.replace("(Original)", "(PCA)")
         if pca_col in latest_df.columns:
+            # Mispricing = Actual Price - PCA Fair Value
             signed = latest_df[col] - latest_df[pca_col]
             signed_mispricing_series[instr] = signed
             abs_mispricing_series[instr] = abs(signed)
@@ -2800,13 +2799,10 @@ abs_mispricing_series = pd.Series(abs_mispricing_series)
 # ------------------------------------------------------------
 # 12.1 Instrument quality (ranking only)
 # ------------------------------------------------------------
-
 def compute_expression_quality(instr, factor_df, Sigma, abs_mis):
     betas = factor_df.loc[instr]
-
     factor_purity = betas.abs().max() / betas.abs().sum()
     avg_abs_corr = Sigma.corr().abs().mean().get(instr, np.nan)
-
     score = abs_mis[instr] * factor_purity / (1 + avg_abs_corr)
 
     return {
@@ -2817,136 +2813,89 @@ def compute_expression_quality(instr, factor_df, Sigma, abs_mis):
         "Expression Quality Score": score
     }
 
-
 # ------------------------------------------------------------
 # 12.2 Alternative expressions (ranking only)
 # ------------------------------------------------------------
-
 def find_alternatives(T, universe_df, factor_df, Sigma, abs_mis, top_n=5):
     T_b = factor_df.loc[T]
-
     rows = []
     for C in universe_df["Instrument"]:
         if C == T or C not in factor_df.index:
             continue
-
         C_b = factor_df.loc[C]
-
-        alignment = np.dot(T_b, C_b) / (
-            np.linalg.norm(T_b) * np.linalg.norm(C_b)
-        )
-
-        corr_vs_T = Sigma.loc[T, C] / np.sqrt(
-            Sigma.loc[T, T] * Sigma.loc[C, C]
-        )
-
+        alignment = np.dot(T_b, C_b) / (np.linalg.norm(T_b) * np.linalg.norm(C_b))
+        corr_vs_T = Sigma.loc[T, C] / np.sqrt(Sigma.loc[T, T] * Sigma.loc[C, C])
         score = abs_mis[T] * abs(alignment) / (1 + abs(corr_vs_T))
-
         rows.append({
             "Alternative Instrument": C,
             "Factor Alignment": alignment,
             "Correlation vs Selected": corr_vs_T,
             "Relative Expression Score": score
         })
-
-    return (
-        pd.DataFrame(rows)
-        .sort_values("Relative Expression Score", ascending=False)
-        .head(top_n)
-    )
-
+    return pd.DataFrame(rows).sort_values("Relative Expression Score", ascending=False).head(top_n)
 
 # ------------------------------------------------------------
-# 12.3 MINIMUM-VARIANCE HEDGE (OPTION 3)
+# 12.3 MINIMUM-VARIANCE HEDGE
 # ------------------------------------------------------------
-
 def build_variance_hedge(T, H, Sigma):
     cov_TH = Sigma.loc[T, H]
     var_H = Sigma.loc[H, H]
-
-    k_star = cov_TH / var_H
-
+    k_star = cov_TH / var_H  # The Beta (Hedge Ratio)
+    
     var_T = Sigma.loc[T, T]
-    residual_var = var_T + k_star**2 * var_H - 2 * k_star * cov_TH
+    residual_var = var_T + (k_star**2 * var_H) - (2 * k_star * cov_TH)
     residual_vol = np.sqrt(max(residual_var, 0)) * 100
-
-    return {
-        "Hedge Ratio (k*)": k_star,
-        "Residual Risk": residual_vol
-    }
-
+    return {"Hedge Ratio (k*)": k_star, "Residual Risk": residual_vol}
 
 # ------------------------------------------------------------
-# 12.4 STREAMLIT UI
+# 12.4 STREAMLIT UI (DIRECTION LOGIC FIX)
 # ------------------------------------------------------------
-
 st.header("12. Trade Structuring & Mispricing")
 
-selected_instr = st.selectbox(
-    "1️⃣ Select instrument",
-    instrument_universe_df["Instrument"].values
-)
+selected_instr = st.selectbox("1️⃣ Select instrument", instrument_universe_df["Instrument"].values)
 
 st.subheader("A. Instrument quality")
-quality = compute_expression_quality(
-    selected_instr,
-    factor_sensitivities_df,
-    Sigma_Raw_df,
-    abs_mispricing_series
-)
+quality = compute_expression_quality(selected_instr, factor_sensitivities_df, Sigma_Raw_df, abs_mispricing_series)
 st.table(pd.DataFrame(quality, index=["Value"]).T)
 
 st.subheader("B. Alternative expressions")
-alt_df = find_alternatives(
-    selected_instr,
-    instrument_universe_df,
-    factor_sensitivities_df,
-    Sigma_Raw_df,
-    abs_mispricing_series
-)
+alt_df = find_alternatives(selected_instr, instrument_universe_df, factor_sensitivities_df, Sigma_Raw_df, abs_mispricing_series)
 st.dataframe(alt_df, use_container_width=True)
 
-trade_instr = st.selectbox(
-    "2️⃣ Choose hedge instrument",
-    alt_df["Alternative Instrument"].values
-)
+trade_instr = st.selectbox("2️⃣ Choose hedge instrument", alt_df["Alternative Instrument"].values)
 
 st.subheader("C. Structured trade (variance hedge)")
-
-combo = build_variance_hedge(
-    selected_instr,
-    trade_instr,
-    Sigma_Raw_df
-)
-
+combo = build_variance_hedge(selected_instr, trade_instr, Sigma_Raw_df)
 k_star = combo["Hedge Ratio (k*)"]
 
-# 🔑 SIGNED PORTFOLIO RESIDUAL (FIX)
+# --- CALCULATE PORTFOLIO RESIDUAL ---
+# Residual of Portfolio = Residual(Primary) - k* * Residual(Hedge)
 portfolio_residual = (
-    signed_mispricing_series[selected_instr]
-    - k_star * signed_mispricing_series[trade_instr]
+    signed_mispricing_series[selected_instr] 
+    - (k_star * signed_mispricing_series[trade_instr])
 )
 
-portfolio_side = (
-    "SELL / RECEIVE" if portfolio_residual > 0
-    else "BUY / PAY"
-)
-
-primary_side = portfolio_side
-hedge_side = "BUY / PAY" if portfolio_side == "SELL / RECEIVE" else "SELL / RECEIVE"
+# --- CORRECT DIRECTION LOGIC ---
+# If portfolio_residual > 0, the Primary is too expensive relative to the Hedge.
+# Therefore: SELL Primary, BUY Hedge.
+if portfolio_residual > 0:
+    primary_side = "SELL / RECEIVE"
+    hedge_side   = "BUY / PAY"
+else:
+    primary_side = "BUY / PAY"
+    hedge_side   = "SELL / RECEIVE"
 
 st.code(f"""
-EXECUTABLE TRADE
-----------------
+EXECUTABLE TRADE (Mathematically Neutral)
+------------------------------------------
 {primary_side:<16}  1.00 × {selected_instr}
 {hedge_side:<16}  {abs(k_star):.2f} × {trade_instr}
 """)
 
-st.markdown("**Signed portfolio residual:**")
-st.write(float(portfolio_residual))
-
-st.markdown("**Residual risk (variance):**")
-st.write(combo["Residual Risk"])
+# Visual confirmation
+col1, col2 = st.columns(2)
+col1.metric("Signed Portfolio Residual", f"{float(portfolio_residual):.4f}")
+col2.metric("Residual Vol (Hedged)", f"{combo['Residual Risk']:.2f} bps")
 
 # ============================================================
 # END SECTION 12
