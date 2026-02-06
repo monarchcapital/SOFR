@@ -2770,72 +2770,27 @@ plot_snapshot(
 # SECTION 12: TRADE STRUCTURING & PCA MISPRICING CAPTURE
 # ============================================================
 
+import numpy as np
+import pandas as pd
+import streamlit as st
+
 # -------------------------------------------------------------------
-# 12.0 EXPRESSION QUALITY OF THE SELECTED (DISTORTED) INSTRUMENT
+# 12.0 EXPRESSION QUALITY OF THE SELECTED INSTRUMENT
 # -------------------------------------------------------------------
 
-def compute_expression_quality(
-    instrument,
-    factor_sensitivities_df,
-    Sigma_Raw_df,
-    mispricing_series
-):
+def compute_expression_quality(instrument, factor_sensitivities_df, Sigma_Raw_df, mispricing_series):
     """
-    EXPRESSION QUALITY answers:
-
-    "Is THIS instrument itself a good trading vehicle?"
-
-    This is an ABSOLUTE assessment of the selected instrument.
-    It does NOT compare against alternatives.
-
-    Components
-    ----------
-    1) Mispricing (Rate %)
-       |Market - PCA Fair|
-       -> size of the distortion
-
-    2) Factor Purity
-       max(|Level|, |Slope|, |Curvature|)
-       ---------------------------------
-         |Level| + |Slope| + |Curvature|
-
-       -> close to 1  : clean single-factor trade
-       -> close to 0  : mixed / messy exposure
-
-    3) Avg Abs Correlation
-       Average absolute correlation of this instrument
-       versus ALL other instruments in the universe.
-
-       -> high  : proxy / crowded / noisy trade
-       -> low   : differentiated trade
-
-    Avg Abs Correlation answers:
-    "Does this trade move with everything else?"
-
-    Final score
-    -----------
-    Expression Quality =
-        Mispricing × Factor Purity / (1 + Avg Abs Correlation)
-
-    This penalizes:
-    - small distortions
-    - mixed factor exposure
-    - crowded proxy trades
+    Absolute quality of ONE instrument as a trading vehicle
     """
 
     betas = factor_sensitivities_df.loc[instrument]
     mispricing = abs(mispricing_series.get(instrument, np.nan))
 
-    # Factor purity
+    # Factor purity: single-factor vs mixed exposure
     factor_purity = betas.abs().max() / betas.abs().sum()
 
-    # Avg absolute correlation vs the ENTIRE universe
-    avg_abs_corr = (
-        Sigma_Raw_df.corr()
-        .abs()
-        .mean()
-        .get(instrument, np.nan)
-    )
+    # Avg absolute correlation vs entire universe
+    avg_abs_corr = Sigma_Raw_df.corr().abs().mean().get(instrument, np.nan)
 
     expression_quality = mispricing * factor_purity / (1 + avg_abs_corr)
 
@@ -2849,7 +2804,7 @@ def compute_expression_quality(
 
 
 # -------------------------------------------------------------------
-# 12.1 ALTERNATIVE STRUCTURAL EXPRESSIONS OF THE SAME DISTORTION
+# 12.1 ALTERNATIVE EXPRESSIONS OF THE SAME DISTORTION
 # -------------------------------------------------------------------
 
 def find_alternative_expressions(
@@ -2860,31 +2815,10 @@ def find_alternative_expressions(
     mispricing_series,
     top_n=5
 ):
-    """
-    This section answers:
-
-    "I see a distortion HERE.
-     Is there a BETTER instrument to express the SAME idea?"
-
-    IMPORTANT DISTINCTION
-    ---------------------
-    Avg Abs Correlation (Section 12.0):
-        -> correlation vs the ENTIRE universe
-        -> high = bad (proxy trade)
-
-    Correlation vs Selected (THIS section):
-        -> pairwise correlation with selected instrument
-        -> high = GOOD (same regional distortion)
-
-    Relative Expression Score answers:
-    "Is this a cleaner wrapper for the SAME distortion?"
-    """
-
     T = selected_instrument
     T_betas = factor_sensitivities_df.loc[T]
     T_mis = abs(mispricing_series.get(T, np.nan))
 
-    # Restrict to same maturity bucket to avoid nonsense comparisons
     maturity_tag = (
         "3M" if "3M" in T else
         "6M" if "6M" in T else
@@ -2903,17 +2837,16 @@ def find_alternative_expressions(
 
         C_betas = factor_sensitivities_df.loc[C]
 
-        # Factor alignment: are we trading the SAME thing?
+        # Factor alignment (cosine similarity)
         alignment = np.dot(T_betas, C_betas) / (
             np.linalg.norm(T_betas) * np.linalg.norm(C_betas)
         )
 
-        # Pairwise correlation vs SELECTED instrument
+        # Pairwise correlation vs selected instrument
         corr_vs_selected = Sigma_Raw_df.loc[T, C] / np.sqrt(
             Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C]
         )
 
-        # Relative expression quality
         relative_score = T_mis * abs(alignment) / (1 + abs(corr_vs_selected))
 
         rows.append({
@@ -2928,7 +2861,7 @@ def find_alternative_expressions(
 
 
 # -------------------------------------------------------------------
-# 12.2 FACTOR-ISOLATED COMBO TRADE (STRUCTURING)
+# 12.2 FACTOR-ISOLATED COMBO TRADE
 # -------------------------------------------------------------------
 
 def build_factor_isolated_combo(
@@ -2938,46 +2871,31 @@ def build_factor_isolated_combo(
     Sigma_Raw_df,
     mispricing_series
 ):
-    """
-    Builds a STRUCTURED trade:
-
-        Primary − k × Hedge
-
-    where k removes the DOMINANT factor of the primary instrument.
-
-    This is TRADE STRUCTURING.
-    This is NOT PnL.
-    """
-
-    T = primary_instr
-    H = hedge_instr
-
-    T_betas = factor_sensitivities_df.loc[T]
-    H_betas = factor_sensitivities_df.loc[H]
+    T_betas = factor_sensitivities_df.loc[primary_instr]
+    H_betas = factor_sensitivities_df.loc[hedge_instr]
 
     dominant_factor = T_betas.abs().idxmax()
 
-    # Hedge ratio to neutralize dominant factor
+    # Hedge ratio removes dominant factor
     k = T_betas[dominant_factor] / H_betas[dominant_factor]
 
     residuals = T_betas - k * H_betas
 
-    # Residual risk after hedging (rate space)
-    var_T = Sigma_Raw_df.loc[T, T]
-    var_H = Sigma_Raw_df.loc[H, H]
-    cov_TH = Sigma_Raw_df.loc[T, H]
+    var_T = Sigma_Raw_df.loc[primary_instr, primary_instr]
+    var_H = Sigma_Raw_df.loc[hedge_instr, hedge_instr]
+    cov_TH = Sigma_Raw_df.loc[primary_instr, hedge_instr]
 
     residual_var = var_T + k**2 * var_H - 2 * k * cov_TH
-    residual_vol = np.sqrt(max(residual_var, 0)) * 100  # Rate %
+    residual_vol = np.sqrt(max(residual_var, 0)) * 100
 
     direction = (
-        "Sell / Receive" if mispricing_series.get(T, 0) > 0
+        "Sell / Receive" if mispricing_series.get(primary_instr, 0) > 0
         else "Buy / Pay"
     )
 
     return {
-        "Primary Instrument": T,
-        "Hedge Instrument": H,
+        "Primary Instrument": primary_instr,
+        "Hedge Instrument": hedge_instr,
         "Trade Direction": direction,
         "Target Factor": dominant_factor,
         "Hedge Ratio (k)": k,
@@ -2989,7 +2907,7 @@ def build_factor_isolated_combo(
 
 
 # -------------------------------------------------------------------
-# 12.3 PCA MISPRICING CAPTURE (NOT DOLLAR PnL)
+# 12.3 PCA MISPRICING CAPTURE (NOT $ PnL)
 # -------------------------------------------------------------------
 
 def backtest_pca_mispricing_capture(
@@ -2999,20 +2917,6 @@ def backtest_pca_mispricing_capture(
     historical_derivatives_list,
     holding_days=5
 ):
-    """
-    Measures how much PCA MISPRICING historically CLOSED.
-
-    IMPORTANT:
-    ----------
-    - Units are Rate %
-    - This is NOT dollar PnL
-    - No tick value or DV01 assumed
-
-    This answers:
-    "When distortions like this appeared historically,
-     did they tend to mean-revert?"
-    """
-
     mis_ts = {}
 
     for df in historical_derivatives_list:
@@ -3029,10 +2933,8 @@ def backtest_pca_mispricing_capture(
         return None
 
     combo_mis = mis_df[primary_instr] - k * mis_df[hedge_instr]
-
     capture = combo_mis - combo_mis.shift(-holding_days)
     capture = capture.dropna()
-
     cum_capture = capture.cumsum()
 
     return {
@@ -3044,42 +2946,64 @@ def backtest_pca_mispricing_capture(
 
 
 # -------------------------------------------------------------------
-# 12.4 STREAMLIT UI
+# 12.4 STREAMLIT UI + EXPLANATIONS
 # -------------------------------------------------------------------
 
 st.header("12. Trade Structuring & PCA Mispricing Capture")
 
-# Step 1: Select distorted instrument
+with st.expander("ℹ️ How to read Section 12 (definitions & formulas)", expanded=False):
+    st.markdown(r"""
+### Mispricing (Rate %)
+\[
+(\text{Market} - \text{PCA Fair}) \times 100
+\]
+
+### Factor Purity
+\[
+\frac{\max(|\beta_L|,|\beta_S|,|\beta_C|)}
+{|\beta_L|+|\beta_S|+|\beta_C|}
+\]
+
+### Avg Abs Correlation
+\[
+\frac{1}{N}\sum_{j\neq i} |\rho(i,j)|
+\]
+High = proxy / crowded (BAD)
+
+### Expression Quality Score
+\[
+\frac{|\text{Mispricing}|\times \text{Factor Purity}}
+{1+\text{Avg Abs Corr}}
+\]
+
+### Factor Alignment
+Cosine similarity of factor vectors (≈1 means same idea)
+
+### Correlation vs Selected
+\[
+\rho(i,j)
+\]
+High = GOOD (same regional distortion)
+
+### PCA Mispricing Capture (NOT $ PnL)
+\[
+(\text{Mis}_T - k\text{Mis}_H)_t -
+(\text{Mis}_T - k\text{Mis}_H)_{t+N}
+\]
+Units are **Rate %**, not dollars.
+""")
+
 selected_instr = st.selectbox(
-    "1️⃣ Select the instrument where you see distortion",
-    instrument_universe_df["Instrument"].values,
-    key="section12_select"
+    "1️⃣ Select instrument where you see distortion",
+    instrument_universe_df["Instrument"].values
 )
-
-if not selected_instr:
-    st.stop()
-
-# ---- A. Instrument quality ----
-st.subheader("A. Is this a good instrument to trade?")
 
 quality = compute_expression_quality(
-    selected_instr,
-    factor_sensitivities_df,
-    Sigma_Raw_df,
-    mispricing_series
+    selected_instr, factor_sensitivities_df, Sigma_Raw_df, mispricing_series
 )
 
-st.table(
-    pd.DataFrame(quality, index=["Value"]).T.style.format({
-        "Mispricing (Rate %)": "{:.3f}",
-        "Factor Purity": "{:.2f}",
-        "Avg Abs Correlation": "{:.2f}",
-        "Expression Quality Score": "{:.3f}"
-    })
-)
-
-# ---- B. Alternative expressions ----
-st.subheader("B. Alternative ways to express the SAME distortion")
+st.subheader("A. Instrument quality")
+st.table(pd.DataFrame(quality, index=["Value"]).T)
 
 alt_df = find_alternative_expressions(
     selected_instr,
@@ -3089,24 +3013,13 @@ alt_df = find_alternative_expressions(
     mispricing_series
 )
 
-st.dataframe(
-    alt_df.style.format({
-        "Factor Alignment": "{:.2f}",
-        "Correlation vs Selected": "{:.2f}",
-        "Relative Expression Score": "{:.3f}"
-    }),
-    use_container_width=True
-)
+st.subheader("B. Alternative expressions")
+st.dataframe(alt_df, use_container_width=True)
 
-# Step 2: choose instrument to trade
 trade_instr = st.selectbox(
-    "2️⃣ Choose which instrument you actually want to trade",
-    alt_df["Alternative Instrument"].values,
-    key="section12_trade"
+    "2️⃣ Choose instrument to trade",
+    alt_df["Alternative Instrument"].values
 )
-
-# ---- C. Structured combo ----
-st.subheader("C. Structured trade (factor isolation)")
 
 combo = build_factor_isolated_combo(
     selected_instr,
@@ -3116,24 +3029,10 @@ combo = build_factor_isolated_combo(
     mispricing_series
 )
 
-st.table(
-    pd.DataFrame(combo, index=["Value"]).T.style.format({
-        "Hedge Ratio (k)": "{:.3f}",
-        "Residual Risk (Rate %)": "{:.3f}"
-    })
-)
+st.subheader("C. Structured trade")
+st.table(pd.DataFrame(combo, index=["Value"]).T)
 
-# ---- D. PCA mispricing capture ----
-st.subheader("D. Historical PCA mispricing capture (NOT $ PnL)")
-
-holding_days = st.slider(
-    "Holding period (days)",
-    min_value=1,
-    max_value=20,
-    value=5,
-    step=1,
-    key="section12_hold"
-)
+holding_days = st.slider("Holding period (days)", 1, 20, 5)
 
 stats = backtest_pca_mispricing_capture(
     selected_instr,
@@ -3143,16 +3042,11 @@ stats = backtest_pca_mispricing_capture(
     holding_days
 )
 
-if stats is not None:
-    st.table(
-        pd.DataFrame(stats, index=["Value"]).T.style.format({
-            "Total Mispricing Captured (Rate %)": "{:.3f}",
-            "Mean-Reversion Sharpe": "{:.2f}",
-            "Hit Rate": "{:.1%}",
-            "Max Drawdown (Rate %)": "{:.3f}"
-        })
-    )
+if stats:
+    st.subheader("D. PCA mispricing capture (NOT $ PnL)")
+    st.table(pd.DataFrame(stats, index=["Value"]).T)
 
 # ======================
 # END SECTION 12
 # ======================
+
