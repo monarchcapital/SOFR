@@ -2767,132 +2767,78 @@ plot_snapshot(
 # ============================
 # END SECTION 11
 # ============================
-# ------------------- Section 12: Trade Recommendation Engine -------------------
+# ------------------- Section 12: Instrument-Centric Trade Structuring -------------------
 
-def build_trade_recommendations(
+def recommend_best_expression(
+    selected_instrument,
     instrument_universe_df,
     Sigma_Raw_df,
-    mispricing_threshold=0.02,   # Rate %
-    top_n=10
+    factor_sensitivities_df,
+    mispricing_series,
+    top_n=5
 ):
     """
-    Recommends trades based on:
-    1) Distortion vs PCA Fair (mispricing)
-    2) Factor purity (clean expression)
-    3) Low redundancy (correlation penalty)
+    Given a selected instrument, recommend the best structural way
+    to trade that SAME distortion.
     """
 
-    if instrument_universe_df.empty or Sigma_Raw_df.empty:
-        return pd.DataFrame()
+    if selected_instrument not in instrument_universe_df['Instrument'].values:
+        return pd.DataFrame(), "Selected instrument not found."
 
-    df = instrument_universe_df.copy()
+    T = selected_instrument
 
-    # --- 1. Filter meaningful distortions ---
-    df = df.dropna(subset=['Mispricing (Rate %)', 'Total Volatility (Rate %)'])
-    df = df[df['Mispricing (Rate %)'].abs() >= mispricing_threshold]
+    # --- Trade attributes ---
+    T_row = instrument_universe_df.set_index('Instrument').loc[T]
+    T_factors = factor_sensitivities_df.loc[T]
+    T_mis = mispricing_series.get(T, np.nan)
 
-    if df.empty:
-        return pd.DataFrame()
+    # Dominant factor
+    dominant_factor = T_factors.abs().idxmax()
 
-    # --- 2. Factor Purity ---
-    df['Factor Purity'] = (
-        df[['Level Sensitivity', 'Slope Sensitivity', 'Curvature Sensitivity']]
-        .abs()
-        .max(axis=1)
-        /
-        df[['Level Sensitivity', 'Slope Sensitivity', 'Curvature Sensitivity']]
-        .abs()
-        .sum(axis=1)
-    )
+    # --- Local candidate set ---
+    maturity = T_row['Type'].split()[0] if ' ' in T_row['Type'] else ''
+    local_df = instrument_universe_df[
+        instrument_universe_df['Type'].str.contains(maturity)
+    ].copy()
 
-    # --- 3. Correlation penalty ---
-    corr = Sigma_Raw_df.corr().abs()
-    avg_corr = corr.mean()
-    df['Avg Abs Correlation'] = df['Instrument'].map(avg_corr)
+    local_df = local_df[local_df['Instrument'] != T]
 
-    # --- 4. Trade score ---
-    df['Trade Score'] = (
-        df['Mispricing (Rate %)'].abs()
-        * df['Factor Purity']
-        / (1 + df['Avg Abs Correlation'])
-    )
+    results = []
 
-    # --- 5. Trade direction ---
-    df['Trade Direction'] = np.where(
-        df['Mispricing (Rate %)'] > 0,
-        'Sell / Receive',
-        'Buy / Pay'
-    )
+    for _, row in local_df.iterrows():
+        C = row['Instrument']
 
-    # --- 6. Recommended structure ---
-    def infer_structure(instr):
-        if 'Double Fly' in instr:
-            return 'Curvature (Double Fly)'
-        elif 'Fly' in instr:
-            return 'Butterfly'
-        elif 'Spread' in instr:
-            return 'Curve Spread'
-        else:
-            return 'Outright'
+        if C not in factor_sensitivities_df.index:
+            continue
 
-    df['Recommended Structure'] = df['Instrument'].apply(infer_structure)
+        # --- Factor alignment (cosine similarity) ---
+        C_factors = factor_sensitivities_df.loc[C]
+        num = np.dot(T_factors, C_factors)
+        den = np.linalg.norm(T_factors) * np.linalg.norm(C_factors)
+        alignment = num / den if den > 0 else 0
 
-    return (
-        df.sort_values('Trade Score', ascending=False)
-          .head(top_n)
-          .reset_index(drop=True)
-    )
+        # --- Correlation penalty ---
+        corr = Sigma_Raw_df.loc[T, C] / (
+            np.sqrt(Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C])
+        )
 
+        # --- Expression score ---
+        score = (
+            abs(T_mis)
+            * abs(alignment)
+            / (1 + abs(corr))
+        )
 
-# ------------------- Streamlit UI -------------------
+        results.append({
+            'Alternative Instrument': C,
+            'Structure': row['Derivative Group'],
+            'Dominant Factor': dominant_factor,
+            'Factor Alignment': alignment,
+            'Correlation': corr,
+            'Expression Score': score
+        })
 
-st.header("12. Trade Recommendation Engine")
+    result_df = pd.DataFrame(results)
+    result_df = result_df.sort_values('Expression Score', ascending=False)
 
-mispricing_cutoff = st.slider(
-    "Minimum Mispricing Threshold (Rate %)",
-    min_value=0.0,
-    max_value=0.10,
-    value=0.02,
-    step=0.005,
-    key="trade_mispricing_cutoff"
-)
-
-trade_recos = build_trade_recommendations(
-    instrument_universe_df,
-    Sigma_Raw_df,
-    mispricing_threshold=mispricing_cutoff,
-    top_n=10
-)
-
-if trade_recos.empty:
-    st.info("No instruments meet the distortion + quality criteria.")
-else:
-    st.markdown("""
-    **How to read this**
-    - **Trade Score**: distortion × factor purity ÷ redundancy  
-    - **Factor Purity → 1** means clean single-factor expression  
-    - Prefer high score + low avg correlation
-    """)
-
-    st.dataframe(
-        trade_recos[[
-            'Instrument',
-            'Type',
-            'Trade Direction',
-            'Recommended Structure',
-            'Mispricing (Rate %)',
-            'Factor Purity',
-            'Avg Abs Correlation',
-            'Trade Score'
-        ]].style.format({
-            'Mispricing (Rate %)': '{:.4f}',
-            'Factor Purity': '{:.2f}',
-            'Avg Abs Correlation': '{:.2f}',
-            'Trade Score': '{:.4f}'
-        }),
-        use_container_width=True
-    )
-
-# ------------------- End Section 12 -------------------
-
-
+    return result_df.head(top_n), None
