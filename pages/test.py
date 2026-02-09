@@ -20,29 +20,27 @@ fomc_dates = pd.to_datetime([
 # 2. FIND FIRST FUTURE MEETING
 # ======================================================
 today = pd.Timestamp.today()
-
 future_meetings = fomc_dates[fomc_dates >= today]
 
-if len(future_meetings) == 0:
+if future_meetings.empty:
     st.error("No future FOMC meetings found.")
     st.stop()
 
 first_meeting = future_meetings.min()
 
 # ======================================================
-# 3. ANCHOR MONTH = MONTH BEFORE FIRST MEETING
+# 3. CORRECT ANCHOR MONTH (MONTH BEFORE MEETING MONTH)
 # ======================================================
-anchor_month = (first_meeting - pd.offsets.MonthBegin(1)).replace(day=1)
-
-# Build 13 months: anchor + next 12
-months = pd.date_range(
-    anchor_month,
-    periods=13,
-    freq="MS"
+anchor_month = (
+    first_meeting.to_period("M").to_timestamp()
+    - pd.DateOffset(months=1)
 )
 
+# Build 13 months: anchor + next 12
+months = pd.date_range(anchor_month, periods=13, freq="MS")
+
 # ======================================================
-# 4. MAIN INPUT TABLE (13 ZQ PRICES)
+# 4. INPUT TABLE (13 ZQ PRICES)
 # ======================================================
 st.subheader("Enter ZQ Prices (Anchor + Next 12 Months)")
 
@@ -66,7 +64,7 @@ rows = []
 
 for i, m in enumerate(months):
     month_end = m + pd.offsets.MonthEnd(1)
-    days_in_month = (month_end - m).days + 1
+    days = (month_end - m).days + 1
 
     meeting_idx = fomc_dates[
         (fomc_dates.month == m.month) &
@@ -76,26 +74,25 @@ for i, m in enumerate(months):
     meeting_date = meeting_idx[0] if len(meeting_idx) > 0 else pd.NaT
 
     if pd.notna(meeting_date):
-        pre_days = (meeting_date - m).days
-        post_days = days_in_month - pre_days
+        pre = (meeting_date - m).days
+        post = days - pre
     else:
-        pre_days = days_in_month
-        post_days = 0
+        pre, post = days, 0
 
     rows.append({
         "Month": m.strftime("%b-%Y"),
         "MonthStart": m,
         "Meeting Date": meeting_date,
-        "Days": days_in_month,
-        "Pre": pre_days,
-        "Post": post_days,
+        "Days": days,
+        "Pre": pre,
+        "Post": post,
         "Month Rate": edited_df.iloc[i]["Month Rate"]
     })
 
 df = pd.DataFrame(rows)
 
 # ======================================================
-# 6. ANCHOR (FIRST ROW — GUARANTEED PRE-MEETING)
+# 6. ANCHOR = FIRST ROW (FEB ZQ)
 # ======================================================
 anchor_rate = df.iloc[0]["Month Rate"]
 anchor_label = df.iloc[0]["Month"]
@@ -103,44 +100,41 @@ anchor_label = df.iloc[0]["Month"]
 df_work = df.iloc[1:].reset_index(drop=True)
 
 # ======================================================
-# 7. SOLVE MEETING-BY-MEETING PREMIUMS
+# 7. SOLVE MEETING PREMIUMS
 # ======================================================
 prev_rate = anchor_rate
-meeting_moves = []
+moves = []
 
 for _, r in df_work.iterrows():
     if r["Post"] == 0:
-        meeting_moves.append(0.0)
+        moves.append(0.0)
         continue
 
     w_pre = r["Pre"] / r["Days"]
     w_post = r["Post"] / r["Days"]
 
     new_rate = (r["Month Rate"] - w_pre * prev_rate) / w_post
-    meeting_moves.append((new_rate - prev_rate) * 100)  # bps
+    moves.append((new_rate - prev_rate) * 100)
     prev_rate = new_rate
 
-df_work["Meeting Premium (bps)"] = meeting_moves
+df_work["Meeting Premium (bps)"] = moves
 df_work["Policy Path"] = anchor_rate + np.cumsum(df_work["Meeting Premium (bps)"]) / 100
 
 # ======================================================
-# 8. OUTPUT (NO CHARTS)
+# 8. OUTPUT
 # ======================================================
 st.caption(
     f"As of {date.today()} | "
     f"Anchor month: {anchor_label} | "
-    f"Anchor rate: {anchor_rate:.2f}% | "
+    f"First meeting: {first_meeting.date()} | "
     f"Total priced change: {df_work['Meeting Premium (bps)'].sum():.1f} bps"
 )
 
 st.subheader("Meeting-by-Meeting Decomposition")
 
 st.dataframe(
-    df_work[[
-        "Month",
-        "Meeting Date",
-        "Meeting Premium (bps)",
-        "Policy Path"
-    ]],
+    df_work[
+        ["Month", "Meeting Date", "Meeting Premium (bps)", "Policy Path"]
+    ],
     use_container_width=True
 )
