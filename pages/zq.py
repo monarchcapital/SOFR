@@ -28,13 +28,11 @@ if future_meetings.empty:
 
 first_meeting = future_meetings.min()
 
-# Anchor = month BEFORE first meeting month
 anchor_month = (
     first_meeting.to_period("M").to_timestamp()
     - pd.DateOffset(months=1)
 )
 
-# Build 13 months: anchor + next 12
 months = pd.date_range(anchor_month, periods=13, freq="MS")
 
 # ======================================================
@@ -44,7 +42,7 @@ st.subheader("ZQ Prices (Anchor + Next 12 Months)")
 
 zq_df = pd.DataFrame({
     "Month": months.strftime("%b-%Y"),
-    "ZQ Price": [96.4] * 13
+    "ZQ Price": [94.50] * 13
 })
 
 zq_df = st.data_editor(
@@ -68,7 +66,7 @@ for i, m in enumerate(months):
         (fomc_dates.month == m.month) &
         (fomc_dates.year == m.year)
     ]
-    meeting_date = meeting_idx[0] if len(meeting_idx) > 0 else pd.NaT
+    meeting_date = meeting_idx[0] if len(meeting_idx) else pd.NaT
 
     if pd.notna(meeting_date):
         pre = (meeting_date - m).days
@@ -133,7 +131,7 @@ sr3_quarters["Start"] = pd.to_datetime(sr3_quarters["Start"])
 sr3_quarters["End"] = pd.to_datetime(sr3_quarters["End"])
 
 # ======================================================
-# 7. MAP MEETING PREMIA → SR3 (DETAIL + SUMMARY)
+# 7. MAP MEETING PREMIA → SR3
 # ======================================================
 sr3_detail_rows = []
 sr3_summary_rows = []
@@ -150,7 +148,6 @@ for _, q in sr3_quarters.iterrows():
         days_after = (q["End"] - meet).days
         weight = days_after / total_days
         contrib_bps = weight * m["Meeting Premium (bps)"]
-
         total_contribution_bps += contrib_bps
 
         sr3_detail_rows.append({
@@ -172,11 +169,7 @@ for _, q in sr3_quarters.iterrows():
         "Implied SR3 Price": round(implied_price, 3),
     })
 
-sr3_detail_df = pd.DataFrame(sr3_detail_rows)
 sr3_summary_df = pd.DataFrame(sr3_summary_rows)
-
-st.subheader("SR3 – Meeting Premium Decomposition")
-st.dataframe(sr3_detail_df, use_container_width=True)
 
 st.subheader("SR3 – Implied Rates & Prices")
 st.dataframe(sr3_summary_df, use_container_width=True)
@@ -201,7 +194,28 @@ st.subheader("ZQ Calendar Spreads (Price)")
 st.dataframe(zq_spreads_df, use_container_width=True)
 
 # ======================================================
-# 9. SR3 PRICE SPREADS (SR3H - SR3M)
+# 9. ZQ PRICE FLIES (ZQ1 - 2*ZQ2 + ZQ3)
+# ======================================================
+zq_fly_rows = []
+
+for i in range(len(zq_df) - 2):
+    zq_fly_rows.append({
+        "Fly": f"{zq_df.iloc[i]['Month']} - {zq_df.iloc[i+1]['Month']} - {zq_df.iloc[i+2]['Month']}",
+        "ZQ Fly (Price)": round(
+            zq_df.iloc[i]["ZQ Price"]
+            - 2 * zq_df.iloc[i+1]["ZQ Price"]
+            + zq_df.iloc[i+2]["ZQ Price"],
+            4
+        )
+    })
+
+zq_flies_df = pd.DataFrame(zq_fly_rows)
+
+st.subheader("ZQ Flies (Price)")
+st.dataframe(zq_flies_df, use_container_width=True)
+
+# ======================================================
+# 10. SR3 PRICE SPREADS (SR3H - SR3M)
 # ======================================================
 sr3_spread_rows = []
 
@@ -221,7 +235,7 @@ st.subheader("SR3 Calendar Spreads (Price)")
 st.dataframe(sr3_spreads_df, use_container_width=True)
 
 # ======================================================
-# 10. FOOTER
+# 11. FOOTER
 # ======================================================
 st.caption(
     f"As of {date.today()} | "
