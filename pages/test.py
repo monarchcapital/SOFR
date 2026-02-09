@@ -28,16 +28,17 @@ if future_meetings.empty:
 
 first_meeting = future_meetings.min()
 
+# Anchor = month BEFORE first meeting month
 anchor_month = (
     first_meeting.to_period("M").to_timestamp()
     - pd.DateOffset(months=1)
 )
 
-# 13 months = anchor + next 12
+# Build 13 months: anchor + next 12
 months = pd.date_range(anchor_month, periods=13, freq="MS")
 
 # ======================================================
-# 3. ZQ INPUT TABLE (ANCHOR + 12)
+# 3. ZQ INPUT TABLE (ANCHOR + 12 MONTHS)
 # ======================================================
 st.subheader("ZQ Prices (Anchor + Next 12 Months)")
 
@@ -67,7 +68,7 @@ for i, m in enumerate(months):
         (fomc_dates.month == m.month) &
         (fomc_dates.year == m.year)
     ]
-    meeting_date = meeting_idx[0] if len(meeting_idx) else pd.NaT
+    meeting_date = meeting_idx[0] if len(meeting_idx) > 0 else pd.NaT
 
     if pd.notna(meeting_date):
         pre = (meeting_date - m).days
@@ -87,7 +88,7 @@ for i, m in enumerate(months):
 month_df = pd.DataFrame(rows)
 
 # ======================================================
-# 5. ANCHOR + MEETING PREMIA (ZQ STAGE)
+# 5. ZQ → MEETING PREMIA
 # ======================================================
 anchor_rate = month_df.iloc[0]["Month Rate"]
 anchor_label = month_df.iloc[0]["Month"]
@@ -105,15 +106,15 @@ for _, r in work_df.iterrows():
     w_pre = r["Pre"] / r["Days"]
     w_post = r["Post"] / r["Days"]
 
-    new = (r["Month Rate"] - w_pre * prev) / w_post
-    premia.append((new - prev) * 100)
-    prev = new
+    new_rate = (r["Month Rate"] - w_pre * prev) / w_post
+    premia.append((new_rate - prev) * 100)
+    prev = new_rate
 
 work_df["Meeting Premium (bps)"] = premia
 work_df["Policy Path"] = anchor_rate + np.cumsum(work_df["Meeting Premium (bps)"]) / 100
 
 # ======================================================
-# 6. DISPLAY ZQ → MEETING TABLE
+# 6. DISPLAY MEETING PREMIA
 # ======================================================
 st.subheader("Implied FOMC Meeting Premia (from ZQ)")
 
@@ -138,13 +139,14 @@ sr3_quarters["Start"] = pd.to_datetime(sr3_quarters["Start"])
 sr3_quarters["End"] = pd.to_datetime(sr3_quarters["End"])
 
 # ======================================================
-# 8. MAP ZQ MEETING PREMIA → SR3
+# 8. MAP MEETING PREMIA → SR3 (FULL TRANSPARENCY)
 # ======================================================
-sr3_rows = []
+sr3_detail_rows = []
+sr3_summary_rows = []
 
 for _, q in sr3_quarters.iterrows():
     total_days = (q["End"] - q["Start"]).days
-    sr3_rate = anchor_rate
+    total_contribution_bps = 0.0
 
     for _, m in work_df.iterrows():
         meet = m["Meeting Date"]
@@ -157,27 +159,43 @@ for _, q in sr3_quarters.iterrows():
 
         days_after = (q["End"] - meet).days
         weight = days_after / total_days
+        contrib_bps = weight * m["Meeting Premium (bps)"]
 
-        sr3_rate += weight * (m["Meeting Premium (bps)"] / 100)
+        total_contribution_bps += contrib_bps
 
-    sr3_rows.append({
+        sr3_detail_rows.append({
+            "SR3": q["SR3"],
+            "Meeting Date": meet.date(),
+            "Meeting Premium (bps)": round(m["Meeting Premium (bps)"], 2),
+            "Weight in SR3": round(weight, 4),
+            "Contribution (bps)": round(contrib_bps, 2),
+        })
+
+    implied_rate = anchor_rate + total_contribution_bps / 100
+    implied_price = 100 - implied_rate
+
+    sr3_summary_rows.append({
         "SR3": q["SR3"],
-        "Start": q["Start"].date(),
-        "End": q["End"].date(),
-        "Implied SR3 Rate (%)": round(sr3_rate, 3)
+        "Anchor Rate (%)": round(anchor_rate, 3),
+        "Total Meeting Impact (bps)": round(total_contribution_bps, 2),
+        "Implied SR3 Rate (%)": round(implied_rate, 3),
+        "Implied SR3 Price": round(implied_price, 3),
     })
 
-sr3_df = pd.DataFrame(sr3_rows)
+sr3_detail_df = pd.DataFrame(sr3_detail_rows)
+sr3_summary_df = pd.DataFrame(sr3_summary_rows)
 
 # ======================================================
-# 9. DISPLAY SR3 TABLE
+# 9. DISPLAY SR3 OUTPUT
 # ======================================================
-st.subheader("Implied SR3 Rates (from ZQ Meeting Premia)")
+st.subheader("SR3 – Meeting Premium Decomposition")
+st.dataframe(sr3_detail_df, use_container_width=True)
 
-st.dataframe(sr3_df, use_container_width=True)
+st.subheader("SR3 – Implied Rates & Prices")
+st.dataframe(sr3_summary_df, use_container_width=True)
 
 # ======================================================
-# 10. HEADER INFO
+# 10. FOOTER
 # ======================================================
 st.caption(
     f"As of {date.today()} | "
