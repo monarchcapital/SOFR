@@ -22,13 +22,13 @@ fomc_dates = pd.to_datetime([
 today = pd.Timestamp.today().normalize()
 future_meetings = fomc_dates[fomc_dates >= today]
 
-if future_meetings.empty:
+if len(future_meetings) == 0:
     st.error("No future FOMC meetings found.")
     st.stop()
 
 first_meeting = future_meetings.min()
 
-# Anchor = calendar month strictly BEFORE meeting month
+# Anchor = month strictly BEFORE meeting month
 anchor_month = (
     first_meeting.to_period("M").to_timestamp()
     - pd.DateOffset(months=1)
@@ -37,7 +37,7 @@ anchor_month = (
 months = pd.date_range(anchor_month, periods=13, freq="MS")
 
 # ======================================================
-# 3. ZQ INPUT TABLE (ANCHOR + 12 MONTHS)
+# 3. ZQ INPUT TABLE (ANCHOR + 12)
 # ======================================================
 st.subheader("ZQ Prices (Anchor + Next 12 Months)")
 
@@ -52,11 +52,11 @@ zq_df = st.data_editor(
     use_container_width=True
 )
 
-# PRICE → RATE (ONLY USED INTERNALLY)
+# Price → rate (internal only)
 zq_df["Month Rate"] = 100 - zq_df["ZQ Price"]
 
 # ======================================================
-# 4. BUILD MONTH / MEETING STRUCTURE (SAFE)
+# 4. BUILD MONTH / MEETING STRUCTURE (NO .iloc BUG)
 # ======================================================
 rows = []
 
@@ -69,7 +69,8 @@ for i, m in enumerate(months):
         (fomc_dates.year == m.year)
     ]
 
-    meeting_date = meeting_idx.iloc[0] if len(meeting_idx) > 0 else pd.NaT
+    # ✅ DatetimeIndex-safe
+    meeting_date = meeting_idx[0] if len(meeting_idx) > 0 else pd.NaT
 
     if pd.notna(meeting_date):
         pre = (meeting_date - m).days
@@ -91,7 +92,7 @@ for i, m in enumerate(months):
 month_df = pd.DataFrame(rows)
 
 # ======================================================
-# 5. ZQ → MEETING PREMIA (ANCHOR SAFE)
+# 5. ZQ → MEETING PREMIA
 # ======================================================
 anchor_rate = month_df.iloc[0]["Month Rate"]
 anchor_label = month_df.iloc[0]["Month"]
@@ -123,7 +124,7 @@ st.dataframe(
 )
 
 # ======================================================
-# 6. SR3 QUARTERS (EXPLICIT MATURITY ORDER)
+# 6. SR3 QUARTERS (ORDER SAFE)
 # ======================================================
 sr3_quarters = pd.DataFrame([
     ("SR3H6", "2026-03-18", "2026-06-17"),
@@ -134,13 +135,11 @@ sr3_quarters = pd.DataFrame([
 
 sr3_quarters["Start"] = pd.to_datetime(sr3_quarters["Start"])
 sr3_quarters["End"] = pd.to_datetime(sr3_quarters["End"])
-
 sr3_quarters = sr3_quarters.sort_values("Start").reset_index(drop=True)
 
 # ======================================================
-# 7. MAP MEETING PREMIA → SR3 (AUDITED)
+# 7. MAP MEETING PREMIA → SR3
 # ======================================================
-sr3_detail_rows = []
 sr3_summary_rows = []
 
 for _, q in sr3_quarters.iterrows():
@@ -149,25 +148,12 @@ for _, q in sr3_quarters.iterrows():
 
     for _, m in work_df.iterrows():
         meet = m["Meeting Date"]
-
-        if pd.isna(meet):
-            continue
-        if meet < q["Start"] or meet >= q["End"]:
+        if pd.isna(meet) or meet < q["Start"] or meet >= q["End"]:
             continue
 
         days_after = (q["End"] - meet).days
         weight = days_after / total_days
-        contrib = weight * m["Meeting Premium (bps)"]
-
-        total_contribution_bps += contrib
-
-        sr3_detail_rows.append({
-            "SR3": q["SR3"],
-            "Meeting Date": meet.date(),
-            "Meeting Premium (bps)": round(m["Meeting Premium (bps)"], 2),
-            "Weight": round(weight, 4),
-            "Contribution (bps)": round(contrib, 2),
-        })
+        total_contribution_bps += weight * m["Meeting Premium (bps)"]
 
     implied_rate = anchor_rate + total_contribution_bps / 100
     implied_price = 100 - implied_rate
@@ -179,10 +165,11 @@ for _, q in sr3_quarters.iterrows():
         "Implied SR3 Price": round(implied_price, 3),
     })
 
-sr3_summary_df = pd.DataFrame(sr3_summary_rows)
-
-# SAFETY: enforce maturity order before spreads
-sr3_summary_df = sr3_summary_df.sort_values("Start").reset_index(drop=True)
+sr3_summary_df = (
+    pd.DataFrame(sr3_summary_rows)
+    .sort_values("Start")
+    .reset_index(drop=True)
+)
 
 st.subheader("SR3 – Implied Rates & Prices")
 st.dataframe(
@@ -191,60 +178,52 @@ st.dataframe(
 )
 
 # ======================================================
-# 8. ZQ PRICE SPREADS (ZQ1 - ZQ2)
+# 8. ZQ PRICE SPREADS
 # ======================================================
-zq_spread_rows = []
-
-for i in range(len(zq_df) - 1):
-    zq_spread_rows.append({
+zq_spreads_df = pd.DataFrame([
+    {
         "Spread": f"{zq_df.iloc[i]['Month']} - {zq_df.iloc[i+1]['Month']}",
         "ZQ Price Spread": round(
             zq_df.iloc[i]["ZQ Price"] - zq_df.iloc[i+1]["ZQ Price"], 4
         )
-    })
-
-zq_spreads_df = pd.DataFrame(zq_spread_rows)
+    }
+    for i in range(len(zq_df) - 1)
+])
 
 st.subheader("ZQ Calendar Spreads (Price)")
 st.dataframe(zq_spreads_df, use_container_width=True)
 
 # ======================================================
-# 9. ZQ PRICE FLIES (ZQ1 - 2*ZQ2 + ZQ3)
+# 9. ZQ PRICE FLIES
 # ======================================================
-zq_fly_rows = []
-
-for i in range(len(zq_df) - 2):
-    zq_fly_rows.append({
+zq_flies_df = pd.DataFrame([
+    {
         "Fly": f"{zq_df.iloc[i]['Month']} / {zq_df.iloc[i+1]['Month']} / {zq_df.iloc[i+2]['Month']}",
         "ZQ Fly (Price)": round(
             zq_df.iloc[i]["ZQ Price"]
             - 2 * zq_df.iloc[i+1]["ZQ Price"]
             + zq_df.iloc[i+2]["ZQ Price"], 4
         )
-    })
-
-zq_flies_df = pd.DataFrame(zq_fly_rows)
+    }
+    for i in range(len(zq_df) - 2)
+])
 
 st.subheader("ZQ Flies (Price)")
 st.dataframe(zq_flies_df, use_container_width=True)
 
 # ======================================================
-# 10. SR3 PRICE SPREADS (FRONT - NEXT, ORDER SAFE)
+# 10. SR3 PRICE SPREADS (ORDER SAFE)
 # ======================================================
-sr3_spread_rows = []
-
-for i in range(len(sr3_summary_df) - 1):
-    front = sr3_summary_df.iloc[i]
-    nxt = sr3_summary_df.iloc[i + 1]
-
-    sr3_spread_rows.append({
-        "Spread": f"{front['SR3']} - {nxt['SR3']}",
+sr3_spreads_df = pd.DataFrame([
+    {
+        "Spread": f"{sr3_summary_df.iloc[i]['SR3']} - {sr3_summary_df.iloc[i+1]['SR3']}",
         "SR3 Price Spread": round(
-            front["Implied SR3 Price"] - nxt["Implied SR3 Price"], 4
+            sr3_summary_df.iloc[i]["Implied SR3 Price"]
+            - sr3_summary_df.iloc[i+1]["Implied SR3 Price"], 4
         )
-    })
-
-sr3_spreads_df = pd.DataFrame(sr3_spread_rows)
+    }
+    for i in range(len(sr3_summary_df) - 1)
+])
 
 st.subheader("SR3 Calendar Spreads (Price)")
 st.dataframe(sr3_spreads_df, use_container_width=True)
