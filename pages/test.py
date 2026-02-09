@@ -7,18 +7,7 @@ st.set_page_config(layout="wide")
 st.title("ZQ → FOMC Meeting Premium Dashboard")
 
 # ======================================================
-# 1. AUTO ROLL 13 CALENDAR MONTHS (ANCHOR + 12)
-# ======================================================
-today = pd.Timestamp.today()
-
-months = pd.date_range(
-    today,                # anchor month INCLUDED
-    periods=13,
-    freq="MS"
-)
-
-# ======================================================
-# 2. FOMC MEETING CALENDAR (EDIT ONCE PER YEAR)
+# 1. FOMC MEETING CALENDAR (EDIT ONCE PER YEAR)
 # ======================================================
 fomc_dates = pd.to_datetime([
     "2026-03-18", "2026-05-06", "2026-06-17", "2026-07-29",
@@ -28,7 +17,32 @@ fomc_dates = pd.to_datetime([
 ])
 
 # ======================================================
-# 3. MAIN INPUT TABLE (13 ZQ PRICES)
+# 2. FIND FIRST FUTURE MEETING
+# ======================================================
+today = pd.Timestamp.today()
+
+future_meetings = fomc_dates[fomc_dates >= today]
+
+if len(future_meetings) == 0:
+    st.error("No future FOMC meetings found.")
+    st.stop()
+
+first_meeting = future_meetings.min()
+
+# ======================================================
+# 3. ANCHOR MONTH = MONTH BEFORE FIRST MEETING
+# ======================================================
+anchor_month = (first_meeting - pd.offsets.MonthBegin(1)).replace(day=1)
+
+# Build 13 months: anchor + next 12
+months = pd.date_range(
+    anchor_month,
+    periods=13,
+    freq="MS"
+)
+
+# ======================================================
+# 4. MAIN INPUT TABLE (13 ZQ PRICES)
 # ======================================================
 st.subheader("Enter ZQ Prices (Anchor + Next 12 Months)")
 
@@ -46,7 +60,7 @@ edited_df = st.data_editor(
 edited_df["Month Rate"] = 100 - edited_df["ZQ Price"]
 
 # ======================================================
-# 4. BUILD MONTH / MEETING STRUCTURE
+# 5. BUILD MONTH / MEETING STRUCTURE
 # ======================================================
 rows = []
 
@@ -81,14 +95,15 @@ for i, m in enumerate(months):
 df = pd.DataFrame(rows)
 
 # ======================================================
-# 5. ANCHOR (FIRST ROW, GUARANTEED PRE-MEETING)
+# 6. ANCHOR (FIRST ROW — GUARANTEED PRE-MEETING)
 # ======================================================
 anchor_rate = df.iloc[0]["Month Rate"]
+anchor_label = df.iloc[0]["Month"]
 
 df_work = df.iloc[1:].reset_index(drop=True)
 
 # ======================================================
-# 6. SOLVE MEETING PREMIUMS
+# 7. SOLVE MEETING-BY-MEETING PREMIUMS
 # ======================================================
 prev_rate = anchor_rate
 meeting_moves = []
@@ -109,11 +124,11 @@ df_work["Meeting Premium (bps)"] = meeting_moves
 df_work["Policy Path"] = anchor_rate + np.cumsum(df_work["Meeting Premium (bps)"]) / 100
 
 # ======================================================
-# 7. OUTPUT
+# 8. OUTPUT (NO CHARTS)
 # ======================================================
 st.caption(
     f"As of {date.today()} | "
-    f"Anchor month: {df.iloc[0]['Month']} | "
+    f"Anchor month: {anchor_label} | "
     f"Anchor rate: {anchor_rate:.2f}% | "
     f"Total priced change: {df_work['Meeting Premium (bps)'].sum():.1f} bps"
 )
@@ -129,6 +144,3 @@ st.dataframe(
     ]],
     use_container_width=True
 )
-
-st.subheader("Meeting Premiums (bps)")
-st.bar_chart(df_work.set_index("Month")["Meeting Premium (bps)"])
