@@ -2767,4 +2767,221 @@ plot_snapshot(
 # ============================
 # END SECTION 11
 # ============================
+# ============================================================
+# ---------------- SECTION 11: ROLL-ADJUSTED PCA --------------
+#        Constant-Maturity Curve (PRICE SPACE ONLY)
+# ============================================================
+
+st.header("11. Roll-Adjusted PCA (Constant-Maturity, Price Space)")
+
+st.markdown("""
+This section removes **quarterly roll effects** by constructing a **constant-maturity
+synthetic price curve** (e.g. 3M, 6M, 9M, …) using **linear interpolation in PRICE space**
+between adjacent quarterly futures.
+
+All downstream logic (spreads, PCA, fair curve, mispricing, hedging) is identical to
+Sections 2–8 — only the input curve changes.
+""")
+
+# -----------------------------
+# 11.1 User Inputs
+# -----------------------------
+TARGET_TENORS = st.multiselect(
+    "Select Constant Maturities (Months)",
+    options=[3, 6, 9, 12, 15, 18, 21, 24],
+    default=[3, 6, 9, 12, 15, 18],
+    key="cm_tenors"
+)
+
+if len(TARGET_TENORS) < 2:
+    st.warning("Select at least two constant maturities to form a curve.")
+    st.stop()
+
+TARGET_TENORS = sorted(TARGET_TENORS)
+
+# -----------------------------
+# 11.2 Helper: Time to Expiry
+# -----------------------------
+def _time_to_expiry_months(val_date, expiry_date):
+    return (expiry_date - val_date).days / 30.4375
+
+
+# -----------------------------
+# 11.3 Build Constant-Maturity Curve (PRICE SPACE)
+# -----------------------------
+@st.cache_data
+def build_constant_maturity_curve_price(price_df, expiry_df, target_tenors):
+    cm_rows = []
+
+    for dt in price_df.index:
+        active = expiry_df[expiry_df['ExpiryDate'] > dt].copy()
+        if active.empty:
+            continue
+
+        active = active.sort_values("ExpiryDate")
+        active["TTE"] = active["ExpiryDate"].apply(
+            lambda x: _time_to_expiry_months(dt, x)
+        )
+
+        row = {}
+        for T in target_tenors:
+            before = active[active["TTE"] <= T].tail(1)
+            after  = active[active["TTE"] >  T].head(1)
+
+            if before.empty or after.empty:
+                row[f"CM_{T}M"] = np.nan
+                continue
+
+            c1, c2 = before.index[0], after.index[0]
+            t1, t2 = before["TTE"].iloc[0], after["TTE"].iloc[0]
+
+            p1 = price_df.loc[dt, c1]
+            p2 = price_df.loc[dt, c2]
+
+            if pd.isna(p1) or pd.isna(p2) or abs(t2 - t1) < 1e-6:
+                row[f"CM_{T}M"] = np.nan
+                continue
+
+            w2 = (T - t1) / (t2 - t1)
+            w1 = 1.0 - w2
+
+            # ---- PRICE SPACE interpolation ----
+            row[f"CM_{T}M"] = w1 * p1 + w2 * p2
+
+        cm_rows.append(pd.Series(row, name=dt))
+
+    cm_df = pd.DataFrame(cm_rows)
+    return cm_df.dropna(how="all")
+
+
+cm_curve_df = build_constant_maturity_curve_price(
+    price_df_filtered,
+    expiry_df,
+    TARGET_TENORS
+)
+
+if cm_curve_df.empty:
+    st.warning("Constant-maturity curve construction failed.")
+    st.stop()
+
+# -----------------------------
+# 11.4 Diagnostics
+# -----------------------------
+c1, c2, c3 = st.columns(3)
+c1.metric("CM Nodes", cm_curve_df.shape[1])
+c2.metric("History (Days)", cm_curve_df.shape[0])
+c3.metric("Tenors", ", ".join([f"{t}M" for t in TARGET_TENORS]))
+
+st.markdown("##### Constant-Maturity Price Curve (Last 5 Days)")
+st.dataframe(cm_curve_df.tail(), use_container_width=True)
+
+# -----------------------------
+# 11.5 Derivatives on CM Curve
+# -----------------------------
+spreads_cm_3M = calculate_k_step_spreads(cm_curve_df, 1)
+flies_cm_3M   = calculate_k_step_butterflies(cm_curve_df, 1)
+dbf_cm_3M     = calculate_k_step_double_butterflies(cm_curve_df, 1)
+
+# -----------------------------
+# 11.6 PCA on Roll-Adjusted 3M Spreads
+# -----------------------------
+st.subheader("11.1 PCA on Roll-Adjusted 3M Spreads")
+
+load_cm, var_cm, eig_cm, scores_cm, spreads_cm_clean = perform_pca(spreads_cm_3M)
+
+if load_cm is None:
+    st.warning("PCA failed on roll-adjusted spreads.")
+    st.stop()
+
+variance_cm_df = pd.DataFrame({
+    "PC": [f"PC{i+1}" for i in range(len(var_cm))],
+    "Explained Variance (%)": var_cm * 100
+})
+variance_cm_df["Cumulative (%)"] = variance_cm_df["Explained Variance (%)"].cumsum()
+
+st.dataframe(variance_cm_df, use_container_width=True)
+
+pc_cm = st.slider(
+    "Select PCs for Roll-Adjusted Fair Curve",
+    min_value=1,
+    max_value=len(var_cm),
+    value=min(3, len(var_cm)),
+    key="pc_cm_slider"
+)
+
+st.info(
+    f"{pc_cm} PCs explain "
+    f"{variance_cm_df['Cumulative (%)'].iloc[pc_cm-1]:.2f}% "
+    "of roll-adjusted spread variance."
+)
+
+# -----------------------------
+# 11.7 Reconstruct Fair CM Curve
+# -----------------------------
+mean_cm = spreads_cm_clean.mean()
+std_cm  = spreads_cm_clean.std()
+
+recon_scaled_cm = (
+    scores_cm.iloc[:, :pc_cm].values
+    @ load_cm.iloc[:, :pc_cm].values.T
+)
+
+recon_spreads_cm = pd.DataFrame(
+    recon_scaled_cm * std_cm.values + mean_cm.values,
+    index=spreads_cm_clean.index,
+    columns=spreads_cm_clean.columns
+)
+
+# -----------------------------
+# 11.8 Reconstruct CM Prices (Anchor = Front CM)
+# -----------------------------
+cm_prices_recon = pd.DataFrame(index=cm_curve_df.index)
+
+front_node = cm_curve_df.columns[0]
+cm_prices_recon[front_node + " (PCA)"] = cm_curve_df[front_node]
+
+for i in range(1, len(cm_curve_df.columns)):
+    prev_node = cm_curve_df.columns[i - 1]
+    node      = cm_curve_df.columns[i]
+    spread_lb = f"{prev_node}-{node}"
+
+    if spread_lb in recon_spreads_cm.columns:
+        cm_prices_recon[node + " (PCA)"] = (
+            cm_prices_recon[prev_node + " (PCA)"]
+            - recon_spreads_cm[spread_lb]
+        )
+    else:
+        cm_prices_recon[node + " (PCA)"] = cm_prices_recon[prev_node + " (PCA)"]
+
+# -----------------------------
+# 11.9 Snapshot Plot (Original vs PCA Fair)
+# -----------------------------
+st.subheader("11.2 Roll-Adjusted Curve Snapshot")
+
+try:
+    orig = cm_curve_df.loc[analysis_dt]
+    fair = cm_prices_recon.loc[analysis_dt]
+
+    cmp = pd.DataFrame({
+        "Original": orig.values,
+        "PCA Fair": fair.values
+    }, index=[c.replace(" (PCA)", "") for c in fair.index])
+
+    fig, ax = plt.subplots(figsize=(15, 7))
+    ax.plot(cmp.index, cmp["Original"], marker="o", label="Original CM Price")
+    ax.plot(cmp.index, cmp["PCA Fair"], marker="x", linestyle="--", label="PCA Fair CM Price")
+
+    ax.set_title("Roll-Adjusted Constant-Maturity Curve (Price Space)")
+    ax.set_xlabel("Constant Maturity")
+    ax.set_ylabel("Price (100 - Rate)")
+    ax.grid(True, linestyle=":")
+    ax.legend()
+
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig)
+
+except KeyError:
+    st.warning("Selected analysis date not available in CM curve.")
+
 
