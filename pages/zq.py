@@ -44,7 +44,7 @@ st.subheader("ZQ Prices (Anchor + Next 12 Months)")
 
 zq_df = pd.DataFrame({
     "Month": months.strftime("%b-%Y"),
-    "ZQ Price": [94.50] * 13
+    "ZQ Price": [96.50] * 13
 })
 
 zq_df = st.data_editor(
