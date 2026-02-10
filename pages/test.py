@@ -2768,77 +2768,76 @@ plot_snapshot(
 # END SECTION 11
 # ============================
 # ============================================================
-# ============================================================
-# ============================
 # SECTION 12 — ROLL-ADJUSTED CONSTANT-MATURITY CURVE
-# ============================
+# ============================================================
 
 st.header("12. Roll-Adjusted Constant-Maturity Curve")
 
 st.markdown("""
 This section constructs a **roll-adjusted (constant-maturity)** curve in **price space**
-by linearly interpolating between adjacent quarterly contracts.
+by interpolating between adjacent quarterly contracts.  
 The output feeds directly into the **existing derivative + PCA engine**.
 """)
 
-# --- User Controls ---
-cm_tenors_months = st.multiselect(
+# ------------------------------------------------------------
+# 12.1 Tenor Selection
+# ------------------------------------------------------------
+cm_tenors = st.multiselect(
     "Select Constant Maturities (Months)",
     options=[3, 6, 9, 12, 15, 18],
     default=[3, 6, 9, 12],
     key="cm_tenors"
 )
 
-if len(cm_tenors_months) < 2:
+if len(cm_tenors) < 2:
     st.warning("Select at least two constant maturities.")
     st.stop()
 
-# --- Helper: time-to-expiry in months ---
-def _months_to_expiry(expiry_date, ref_date):
-    return (expiry_date - ref_date).days / 30.4375
+# ------------------------------------------------------------
+# 12.2 Helper: time to expiry (months)
+# ------------------------------------------------------------
+def _months_to_expiry(expiry, ref):
+    return (expiry - ref).days / 30.4375
 
 
-# --- Build CM Curve ---
-cm_curve_records = []
+# ------------------------------------------------------------
+# 12.3 Build Constant-Maturity Curve (PRICE SPACE)
+# ------------------------------------------------------------
+cm_rows = []
 
 for dt in analysis_curve_df.index:
-
-    row = analysis_curve_df.loc[dt]
-    expiries = future_expiries_df.loc[row.index, "ExpiryDate"]
+    prices = analysis_curve_df.loc[dt]
+    expiries = future_expiries_df.loc[prices.index, "ExpiryDate"]
 
     ttms = pd.Series(
         [_months_to_expiry(exp, dt) for exp in expiries],
-        index=row.index
+        index=prices.index
     )
 
-    cm_row = {}
-
-    for T in cm_tenors_months:
+    row = {}
+    for T in cm_tenors:
         below = ttms[ttms <= T]
         above = ttms[ttms >= T]
 
         if below.empty or above.empty:
-            cm_row[f"CM_{T}M"] = np.nan
+            row[f"CM_{T}M"] = np.nan
             continue
 
         c1 = below.idxmax()
         c2 = above.idxmin()
 
         if c1 == c2:
-            cm_row[f"CM_{T}M"] = row[c1]
-            continue
+            row[f"CM_{T}M"] = prices[c1]
+        else:
+            t1, t2 = ttms[c1], ttms[c2]
+            w2 = (T - t1) / (t2 - t1)
+            w1 = 1 - w2
+            row[f"CM_{T}M"] = w1 * prices[c1] + w2 * prices[c2]
 
-        t1, t2 = ttms[c1], ttms[c2]
-        w2 = (T - t1) / (t2 - t1)
-        w1 = 1 - w2
+    cm_rows.append(row)
 
-        cm_row[f"CM_{T}M"] = w1 * row[c1] + w2 * row[c2]
+cm_curve_df = pd.DataFrame(cm_rows, index=analysis_curve_df.index)
 
-    cm_curve_records.append(cm_row)
-
-cm_curve_df = pd.DataFrame(cm_curve_records, index=analysis_curve_df.index)
-
-# --- Store for downstream use ---
 st.session_state["cm_curve_df"] = cm_curve_df
 st.session_state["cm_ready"] = True
 
@@ -2847,106 +2846,117 @@ st.success("Roll-adjusted constant-maturity curve built successfully.")
 st.subheader("Constant-Maturity Outright Curve Snapshot")
 st.dataframe(cm_curve_df.loc[[analysis_dt]].T, use_container_width=True)
 
-# ============================
-# SECTION 13 — RAW vs ROLL-ADJUSTED COMPARISON
-# ============================
+# ============================================================
+# SECTION 13 — PCA ON ROLL-ADJUSTED (CM) CURVE
+# ============================================================
 
-st.header("13. Raw vs Roll-Adjusted Comparison")
+st.header("13. PCA on Roll-Adjusted Curve")
 
-st.markdown("""
-This section compares **Raw Quarterly** vs **Roll-Adjusted (Constant-Maturity)** curves:
-
-• Full derivative snapshots  
-• Mispricing rank changes after roll removal  
-""")
-
-# ------------------------------------------------------------
-# 13.1 Curve Representation Toggle
-# ------------------------------------------------------------
-curve_mode = st.radio(
-    "Select Curve Representation",
-    ["Raw Quarterly", "Roll-Adjusted (CM)"],
-    horizontal=True,
-    key="curve_representation_toggle"
-)
-
-# ------------------------------------------------------------
-# 13.2 Availability Check (CORRECT)
-# ------------------------------------------------------------
-cm_available = (
-    st.session_state.get("cm_ready", False)
-    and isinstance(st.session_state.get("cm_curve_df"), pd.DataFrame)
-    and not st.session_state["cm_curve_df"].empty
-)
-
-if curve_mode == "Roll-Adjusted (CM)" and not cm_available:
-    st.warning("Roll-adjusted curve not available. Please run **Section 12** first.")
+cm_curve_df = st.session_state.get("cm_curve_df")
+if cm_curve_df is None or cm_curve_df.empty:
+    st.warning("Run Section 12 first.")
     st.stop()
 
 # ------------------------------------------------------------
-# 13.3 Select Curve
+# 13.1 CM Derivatives
 # ------------------------------------------------------------
-if curve_mode == "Raw Quarterly":
-    curve_df = analysis_curve_df
-    curve_label = "Raw Quarterly"
-else:
-    curve_df = st.session_state["cm_curve_df"]
-    curve_label = "Roll-Adjusted (CM)"
+spreads_cm_3M = calculate_k_step_spreads(cm_curve_df, 1)
 
 # ------------------------------------------------------------
-# 13.4 Build Derivatives (DYNAMIC & SAFE)
+# 13.2 PCA on CM 3M Spreads
 # ------------------------------------------------------------
-spreads_3M = calculate_k_step_spreads(curve_df, 1)
-spreads_6M = calculate_k_step_spreads(curve_df, 2)
-spreads_12M = calculate_k_step_spreads(curve_df, 4)
+load_cm, var_cm, eig_cm, scores_cm, spreads_cm_clean = perform_pca(spreads_cm_3M)
 
-flies_3M = calculate_k_step_butterflies(curve_df, 1)
-flies_6M = calculate_k_step_butterflies(curve_df, 2)
+var_cm_df = pd.DataFrame({
+    "PC": [f"PC{i+1}" for i in range(len(var_cm))],
+    "Explained Variance (%)": var_cm * 100
+})
+var_cm_df["Cumulative (%)"] = var_cm_df["Explained Variance (%)"].cumsum()
 
-dbf_3M = calculate_k_step_double_butterflies(curve_df, 1)
-dbf_6M = calculate_k_step_double_butterflies(curve_df, 2)
+st.subheader("Roll-Adjusted PCA Variance")
+st.dataframe(var_cm_df, use_container_width=True)
 
-# ------------------------------------------------------------
-# 13.5 Snapshot Helper (ROBUST)
-# ------------------------------------------------------------
-def plot_snapshot_safe(df, title):
-    if df is None or df.empty:
-        st.info(f"{title}: not enough curve points.")
-        return None
-
-    if analysis_dt not in df.index:
-        st.info(f"{title}: analysis date not available.")
-        return None
-
-    snap = df.loc[[analysis_dt]].T
-    snap.columns = ["Value"]
-
-    fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(snap.index, snap["Value"], marker="o")
-    ax.set_title(title)
-    ax.grid(True, linestyle=":")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    st.pyplot(fig)
-
-    st.dataframe(
-        snap.style.format("{:.4f}"),
-        use_container_width=True
-    )
-
-    return snap["Value"]
+pc_cm = st.slider(
+    "PCs used for CM Fair Curve",
+    1, len(var_cm), min(3, len(var_cm)),
+    key="pc_cm"
+)
 
 # ------------------------------------------------------------
-# 13.6 Render ALL Derivative Families
+# 13.3 Reconstruct CM Fair Spreads
 # ------------------------------------------------------------
-st.subheader(f"{curve_label} — Derivative Snapshots")
+mean_cm = spreads_cm_clean.mean()
+std_cm = spreads_cm_clean.std()
 
-plot_snapshot_safe(spreads_3M, f"{curve_label} 3M Spreads")
-plot_snapshot_safe(spreads_6M, f"{curve_label} 6M Spreads")
-plot_snapshot_safe(spreads_12M, f"{curve_label} 12M Spreads")
+recon_cm = (
+    scores_cm.iloc[:, :pc_cm].values
+    @ load_cm.iloc[:, :pc_cm].values.T
+)
 
-plot_snapshot_safe(flies_3M, f"{curve_label} 3M Flies")
-plot_snapshot_safe(flies_6M, f"{curve_label} 6M Flies")
+recon_spreads_cm = pd.DataFrame(
+    recon_cm * std_cm.values + mean_cm.values,
+    index=spreads_cm_clean.index,
+    columns=spreads_cm_clean.columns
+)
 
-plot_snapshot_safe(dbf_3M, f"{curve_label} 3M Double Flies")
-plot_snapshot_safe(dbf_6M, f"{curve_label} 6M Double Flies")
+# ------------------------------------------------------------
+# 13.4 Market vs CM PCA Fair Snapshot (FULL CURVE)
+# ------------------------------------------------------------
+st.subheader("Market vs Roll-Adjusted PCA Fair — 3M CM Spreads")
+
+snap_cm = pd.DataFrame({
+    "Market": spreads_cm_3M.loc[analysis_dt],
+    "PCA Fair": recon_spreads_cm.loc[analysis_dt]
+})
+
+snap_cm["Mispricing (Rate %)"] = (snap_cm["Market"] - snap_cm["PCA Fair"]) * 100
+
+fig, ax = plt.subplots(figsize=(15, 6))
+ax.plot(snap_cm.index, snap_cm["Market"], marker="o", label="Market")
+ax.plot(snap_cm.index, snap_cm["PCA Fair"], marker="x", linestyle="--", label="PCA Fair")
+ax.axhline(0, color="gray", linewidth=0.6)
+ax.set_title("Roll-Adjusted 3M CM Spreads")
+ax.legend()
+ax.grid(True, linestyle=":")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+st.pyplot(fig)
+
+st.dataframe(
+    snap_cm.style.format({
+        "Market": "{:.4f}",
+        "PCA Fair": "{:.4f}",
+        "Mispricing (Rate %)": "{:.4f}"
+    }),
+    use_container_width=True
+)
+
+# ============================================================
+# SECTION 14 — MARKET vs ROLL-ADJUSTED PCA COMPARISON
+# ============================================================
+
+st.header("14. Market vs Roll-Adjusted PCA Comparison")
+
+# Raw PCA variance already exists earlier as variance_df
+raw_var = variance_df.copy()
+raw_var["Type"] = "Raw Quarterly"
+
+cm_var = var_cm_df.copy()
+cm_var["Type"] = "Roll-Adjusted (CM)"
+
+cmp = pd.concat([raw_var, cm_var])
+
+st.subheader("Explained Variance Comparison")
+
+fig, ax = plt.subplots(figsize=(12, 6))
+for t, g in cmp.groupby("Type"):
+    ax.plot(g["PC"], g["Explained Variance (%)"], marker="o", label=t)
+
+ax.set_ylabel("Explained Variance (%)")
+ax.set_title("PCA Variance: Raw vs Roll-Adjusted")
+ax.grid(True, linestyle=":")
+ax.legend()
+plt.tight_layout()
+st.pyplot(fig)
+
+st.dataframe(cmp, use_container_width=True)
