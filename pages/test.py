@@ -2983,5 +2983,185 @@ try:
 
 except KeyError:
     st.warning("Selected analysis date not available in CM curve.")
+    # ============================================================
+# 11.10 Roll-Adjusted Snapshot — ALL DERIVATIVE FAMILIES
+# ============================================================
+
+st.subheader("11.3 Roll-Adjusted Snapshot (All Derivative Families)")
+
+def plot_cm_derivative_snapshot(cm_df, recon_cm_prices, derivative_df, label, analysis_dt):
+    """
+    Snapshot plot for CM derivatives:
+    Original vs PCA Fair vs Prev Day
+    """
+
+    def _prev_date(df, dt):
+        prev = df.index[df.index < dt]
+        return prev.max() if len(prev) else None
+
+    try:
+        # ---- Today ----
+        orig_today = derivative_df.loc[analysis_dt]
+        fair_today = {}
+
+        # Rebuild PCA fair derivatives from reconstructed CM prices
+        for col in derivative_df.columns:
+            parts = col.replace("CM_", "").split("-")
+            if len(parts) == 2:  # Spread
+                fair_today[col] = (
+                    recon_cm_prices.loc[analysis_dt, parts[0] + " (PCA)"]
+                    - recon_cm_prices.loc[analysis_dt, parts[1] + " (PCA)"]
+                )
+            elif "2x" in col:  # Fly
+                c1, rest = col.split("-2x")
+                c2, c3 = rest.split("+")
+                fair_today[col] = (
+                    recon_cm_prices.loc[analysis_dt, c1 + " (PCA)"]
+                    - 2 * recon_cm_prices.loc[analysis_dt, c2 + " (PCA)"]
+                    + recon_cm_prices.loc[analysis_dt, c3 + " (PCA)"]
+                )
+            elif "3x" in col:  # Double Fly
+                c1, rest = col.split("-3x")
+                c2, rest2 = rest.split("+3x")
+                c3, c4 = rest2.split("-")
+                fair_today[col] = (
+                    recon_cm_prices.loc[analysis_dt, c1 + " (PCA)"]
+                    - 3 * recon_cm_prices.loc[analysis_dt, c2 + " (PCA)"]
+                    + 3 * recon_cm_prices.loc[analysis_dt, c3 + " (PCA)"]
+                    - recon_cm_prices.loc[analysis_dt, c4 + " (PCA)"]
+                )
+
+        fair_today = pd.Series(fair_today)
+
+        # ---- Previous Day ----
+        prev_dt = _prev_date(derivative_df, analysis_dt)
+        prev_orig = derivative_df.loc[prev_dt] if prev_dt else None
+
+        # ---- Assemble ----
+        snap = pd.DataFrame({
+            "Original": orig_today,
+            "PCA Fair": fair_today
+        })
+
+        if prev_orig is not None:
+            snap["Prev Day"] = prev_orig
+
+        snap["Mispricing (Rate %)"] = (snap["Original"] - snap["PCA Fair"]) * 100
+
+        # ---- Plot ----
+        fig, ax = plt.subplots(figsize=(15, 7))
+
+        ax.plot(snap.index, snap["Original"], marker="o", label="Original")
+        ax.plot(snap.index, snap["PCA Fair"], marker="x", linestyle="--", label="PCA Fair")
+
+        if "Prev Day" in snap:
+            ax.plot(snap.index, snap["Prev Day"], marker="s", linestyle="-.", label="Prev Day")
+
+        ax.axhline(0, color="gray", linewidth=0.6)
+        ax.set_title(f"Roll-Adjusted {label} Snapshot (Original vs PCA Fair)")
+        ax.set_xlabel(label)
+        ax.set_ylabel("Price Difference")
+        ax.legend(loc="upper left", bbox_to_anchor=(1, 1))
+        ax.grid(True, linestyle=":")
+
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig)
+
+        # ---- Table ----
+        st.dataframe(
+            snap.style.format({
+                "Original": "{:.4f}",
+                "PCA Fair": "{:.4f}",
+                "Mispricing (Rate %)": "{:.4f}"
+            }),
+            use_container_width=True
+        )
+
+    except Exception as e:
+        st.warning(f"{label} snapshot unavailable: {e}")
+
+
+# -----------------------------
+# 11.10.1 Spreads
+# -----------------------------
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    spreads_cm_3M,
+    "3M CM Spreads",
+    analysis_dt
+)
+
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    calculate_k_step_spreads(cm_curve_df, 2),
+    "6M CM Spreads",
+    analysis_dt
+)
+
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    calculate_k_step_spreads(cm_curve_df, 4),
+    "12M CM Spreads",
+    analysis_dt
+)
+
+# -----------------------------
+# 11.10.2 Flies
+# -----------------------------
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    calculate_k_step_butterflies(cm_curve_df, 1),
+    "3M CM Flies",
+    analysis_dt
+)
+
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    calculate_k_step_butterflies(cm_curve_df, 2),
+    "6M CM Flies",
+    analysis_dt
+)
+
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    calculate_k_step_butterflies(cm_curve_df, 4),
+    "12M CM Flies",
+    analysis_dt
+)
+
+# -----------------------------
+# 11.10.3 Double Flies
+# -----------------------------
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    calculate_k_step_double_butterflies(cm_curve_df, 1),
+    "3M CM Double Flies",
+    analysis_dt
+)
+
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    calculate_k_step_double_butterflies(cm_curve_df, 2),
+    "6M CM Double Flies",
+    analysis_dt
+)
+
+plot_cm_derivative_snapshot(
+    cm_curve_df,
+    cm_prices_recon,
+    calculate_k_step_double_butterflies(cm_curve_df, 4),
+    "12M CM Double Flies",
+    analysis_dt
+)
+
 
 
