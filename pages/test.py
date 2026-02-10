@@ -2768,400 +2768,204 @@ plot_snapshot(
 # END SECTION 11
 # ============================
 # ============================================================
-# ---------------- SECTION 11: ROLL-ADJUSTED PCA --------------
-#        Constant-Maturity Curve (PRICE SPACE ONLY)
+# ============================================================
+# -------- SECTION 12: RAW vs ROLL-ADJUSTED COMPARISON --------
 # ============================================================
 
-st.header("11. Roll-Adjusted PCA (Constant-Maturity, Price Space)")
+st.header("12. Raw vs Roll-Adjusted Comparison")
 
 st.markdown("""
-This section removes **quarterly roll effects** by constructing a **constant-maturity
-synthetic price curve** (e.g. 3M, 6M, 9M, …) using **linear interpolation in PRICE space**
-between adjacent quarterly futures.
+This section compares **Quarterly (Raw)** vs **Constant-Maturity (Roll-Adjusted)** curves:
 
-All downstream logic (spreads, PCA, fair curve, mispricing, hedging) is identical to
-Sections 2–8 — only the input curve changes.
+1. Side-by-side **snapshot comparison** for all derivative families  
+2. **Mispricing rank delta** — identifies instruments whose valuation
+   materially changes once roll effects are removed
 """)
 
-# -----------------------------
-# 11.1 User Inputs
-# -----------------------------
-TARGET_TENORS = st.multiselect(
-    "Select Constant Maturities (Months)",
-    options=[3, 6, 9, 12, 15, 18, 21, 24],
-    default=[3, 6, 9, 12, 15, 18],
-    key="cm_tenors"
+# ------------------------------------------------------------
+# 12.1 Toggle: Raw vs Roll-Adjusted
+# ------------------------------------------------------------
+view_mode = st.radio(
+    "Select Curve Representation",
+    options=["Raw Quarterly", "Roll-Adjusted (CM)"],
+    horizontal=True,
+    key="raw_vs_cm_toggle"
 )
 
-if len(TARGET_TENORS) < 2:
-    st.warning("Select at least two constant maturities to form a curve.")
-    st.stop()
+# ------------------------------------------------------------
+# 12.2 Helper: Universal Snapshot Plotter (ROBUST)
+# ------------------------------------------------------------
+def plot_derivative_snapshot_universal(
+    original_derivative_df,
+    reconstructed_prices_df,
+    derivative_type,
+    title,
+    analysis_dt
+):
+    """
+    Snapshot plot identical to Section 5 logic.
+    Works for BOTH raw quarterly and CM curves.
+    """
 
-TARGET_TENORS = sorted(TARGET_TENORS)
+    if analysis_dt not in original_derivative_df.index:
+        st.warning(f"{title}: analysis date not available.")
+        return
 
-# -----------------------------
-# 11.2 Helper: Time to Expiry
-# -----------------------------
-def _time_to_expiry_months(val_date, expiry_date):
-    return (expiry_date - val_date).days / 30.4375
+    # ---- ORIGINAL ----
+    orig_today = original_derivative_df.loc[analysis_dt]
 
+    # ---- PCA FAIR (via shared reconstruction logic) ----
+    recon_df = _reconstruct_derivative(
+        original_derivative_df,
+        reconstructed_prices_df,
+        derivative_type=derivative_type
+    )
 
-# -----------------------------
-# 11.3 Build Constant-Maturity Curve (PRICE SPACE)
-# -----------------------------
-@st.cache_data
-def build_constant_maturity_curve_price(price_df, expiry_df, target_tenors):
-    cm_rows = []
+    if analysis_dt not in recon_df.index:
+        st.warning(f"{title}: PCA reconstruction unavailable.")
+        return
 
-    for dt in price_df.index:
-        active = expiry_df[expiry_df['ExpiryDate'] > dt].copy()
-        if active.empty:
-            continue
+    fair_today = recon_df.loc[analysis_dt].filter(like="(PCA)")
+    fair_today.index = fair_today.index.str.replace(" (PCA)", "", regex=False)
 
-        active = active.sort_values("ExpiryDate")
-        active["TTE"] = active["ExpiryDate"].apply(
-            lambda x: _time_to_expiry_months(dt, x)
-        )
+    orig_today.index = orig_today.index.str.replace(" (Original)", "", regex=False)
 
-        row = {}
-        for T in target_tenors:
-            before = active[active["TTE"] <= T].tail(1)
-            after  = active[active["TTE"] >  T].head(1)
+    snap = pd.DataFrame({
+        "Original": orig_today,
+        "PCA Fair": fair_today
+    })
 
-            if before.empty or after.empty:
-                row[f"CM_{T}M"] = np.nan
-                continue
+    snap["Mispricing (Rate %)"] = (snap["Original"] - snap["PCA Fair"]) * 100
 
-            c1, c2 = before.index[0], after.index[0]
-            t1, t2 = before["TTE"].iloc[0], after["TTE"].iloc[0]
-
-            p1 = price_df.loc[dt, c1]
-            p2 = price_df.loc[dt, c2]
-
-            if pd.isna(p1) or pd.isna(p2) or abs(t2 - t1) < 1e-6:
-                row[f"CM_{T}M"] = np.nan
-                continue
-
-            w2 = (T - t1) / (t2 - t1)
-            w1 = 1.0 - w2
-
-            # ---- PRICE SPACE interpolation ----
-            row[f"CM_{T}M"] = w1 * p1 + w2 * p2
-
-        cm_rows.append(pd.Series(row, name=dt))
-
-    cm_df = pd.DataFrame(cm_rows)
-    return cm_df.dropna(how="all")
-
-
-cm_curve_df = build_constant_maturity_curve_price(
-    price_df_filtered,
-    expiry_df,
-    TARGET_TENORS
-)
-
-if cm_curve_df.empty:
-    st.warning("Constant-maturity curve construction failed.")
-    st.stop()
-
-# -----------------------------
-# 11.4 Diagnostics
-# -----------------------------
-c1, c2, c3 = st.columns(3)
-c1.metric("CM Nodes", cm_curve_df.shape[1])
-c2.metric("History (Days)", cm_curve_df.shape[0])
-c3.metric("Tenors", ", ".join([f"{t}M" for t in TARGET_TENORS]))
-
-st.markdown("##### Constant-Maturity Price Curve (Last 5 Days)")
-st.dataframe(cm_curve_df.tail(), use_container_width=True)
-
-# -----------------------------
-# 11.5 Derivatives on CM Curve
-# -----------------------------
-spreads_cm_3M = calculate_k_step_spreads(cm_curve_df, 1)
-flies_cm_3M   = calculate_k_step_butterflies(cm_curve_df, 1)
-dbf_cm_3M     = calculate_k_step_double_butterflies(cm_curve_df, 1)
-
-# -----------------------------
-# 11.6 PCA on Roll-Adjusted 3M Spreads
-# -----------------------------
-st.subheader("11.1 PCA on Roll-Adjusted 3M Spreads")
-
-load_cm, var_cm, eig_cm, scores_cm, spreads_cm_clean = perform_pca(spreads_cm_3M)
-
-if load_cm is None:
-    st.warning("PCA failed on roll-adjusted spreads.")
-    st.stop()
-
-variance_cm_df = pd.DataFrame({
-    "PC": [f"PC{i+1}" for i in range(len(var_cm))],
-    "Explained Variance (%)": var_cm * 100
-})
-variance_cm_df["Cumulative (%)"] = variance_cm_df["Explained Variance (%)"].cumsum()
-
-st.dataframe(variance_cm_df, use_container_width=True)
-
-pc_cm = st.slider(
-    "Select PCs for Roll-Adjusted Fair Curve",
-    min_value=1,
-    max_value=len(var_cm),
-    value=min(3, len(var_cm)),
-    key="pc_cm_slider"
-)
-
-st.info(
-    f"{pc_cm} PCs explain "
-    f"{variance_cm_df['Cumulative (%)'].iloc[pc_cm-1]:.2f}% "
-    "of roll-adjusted spread variance."
-)
-
-# -----------------------------
-# 11.7 Reconstruct Fair CM Curve
-# -----------------------------
-mean_cm = spreads_cm_clean.mean()
-std_cm  = spreads_cm_clean.std()
-
-recon_scaled_cm = (
-    scores_cm.iloc[:, :pc_cm].values
-    @ load_cm.iloc[:, :pc_cm].values.T
-)
-
-recon_spreads_cm = pd.DataFrame(
-    recon_scaled_cm * std_cm.values + mean_cm.values,
-    index=spreads_cm_clean.index,
-    columns=spreads_cm_clean.columns
-)
-
-# -----------------------------
-# 11.8 Reconstruct CM Prices (Anchor = Front CM)
-# -----------------------------
-cm_prices_recon = pd.DataFrame(index=cm_curve_df.index)
-
-front_node = cm_curve_df.columns[0]
-cm_prices_recon[front_node + " (PCA)"] = cm_curve_df[front_node]
-
-for i in range(1, len(cm_curve_df.columns)):
-    prev_node = cm_curve_df.columns[i - 1]
-    node      = cm_curve_df.columns[i]
-    spread_lb = f"{prev_node}-{node}"
-
-    if spread_lb in recon_spreads_cm.columns:
-        cm_prices_recon[node + " (PCA)"] = (
-            cm_prices_recon[prev_node + " (PCA)"]
-            - recon_spreads_cm[spread_lb]
-        )
-    else:
-        cm_prices_recon[node + " (PCA)"] = cm_prices_recon[prev_node + " (PCA)"]
-
-# -----------------------------
-# 11.9 Snapshot Plot (Original vs PCA Fair)
-# -----------------------------
-st.subheader("11.2 Roll-Adjusted Curve Snapshot")
-
-try:
-    orig = cm_curve_df.loc[analysis_dt]
-    fair = cm_prices_recon.loc[analysis_dt]
-
-    cmp = pd.DataFrame({
-        "Original": orig.values,
-        "PCA Fair": fair.values
-    }, index=[c.replace(" (PCA)", "") for c in fair.index])
-
+    # ---- Plot ----
     fig, ax = plt.subplots(figsize=(15, 7))
-    ax.plot(cmp.index, cmp["Original"], marker="o", label="Original CM Price")
-    ax.plot(cmp.index, cmp["PCA Fair"], marker="x", linestyle="--", label="PCA Fair CM Price")
 
-    ax.set_title("Roll-Adjusted Constant-Maturity Curve (Price Space)")
-    ax.set_xlabel("Constant Maturity")
-    ax.set_ylabel("Price (100 - Rate)")
+    ax.plot(snap.index, snap["Original"], marker="o", label="Original")
+    ax.plot(snap.index, snap["PCA Fair"], marker="x", linestyle="--", label="PCA Fair")
+
+    ax.axhline(0, color="gray", linewidth=0.6)
+    ax.set_title(title)
+    ax.set_xlabel("Instrument")
+    ax.set_ylabel("Price Difference")
+    ax.legend(loc="upper left", bbox_to_anchor=(1, 1))
     ax.grid(True, linestyle=":")
-    ax.legend()
 
-    plt.xticks(rotation=45)
+    plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     st.pyplot(fig)
 
-except KeyError:
-    st.warning("Selected analysis date not available in CM curve.")
-    # ============================================================
-# 11.10 Roll-Adjusted Snapshot — ALL DERIVATIVE FAMILIES
-# ============================================================
+    st.dataframe(
+        snap.style.format({
+            "Original": "{:.4f}",
+            "PCA Fair": "{:.4f}",
+            "Mispricing (Rate %)": "{:.4f}"
+        }),
+        use_container_width=True
+    )
 
-st.subheader("11.3 Roll-Adjusted Snapshot (All Derivative Families)")
+    return snap["Mispricing (Rate %)"]
 
-def plot_cm_derivative_snapshot(cm_df, recon_cm_prices, derivative_df, label, analysis_dt):
-    """
-    Snapshot plot for CM derivatives:
-    Original vs PCA Fair vs Prev Day
-    """
 
-    def _prev_date(df, dt):
-        prev = df.index[df.index < dt]
-        return prev.max() if len(prev) else None
+# ------------------------------------------------------------
+# 12.3 Select Data Based on Toggle
+# ------------------------------------------------------------
+if view_mode == "Raw Quarterly":
+    price_curve_used      = analysis_curve_df
+    recon_prices_used     = historical_outrights_df.filter(like="(PCA)")
+    spreads_3M_used       = spreads_3M_df_raw
+    butterflies_3M_used   = butterflies_3M_df
+    dbf_3M_used           = double_butterflies_3M_df
+    label_prefix          = "Raw Quarterly"
 
-    try:
-        # ---- Today ----
-        orig_today = derivative_df.loc[analysis_dt]
-        fair_today = {}
+else:
+    price_curve_used      = cm_curve_df
+    recon_prices_used     = cm_prices_recon
+    spreads_3M_used       = spreads_cm_3M
+    butterflies_3M_used   = calculate_k_step_butterflies(cm_curve_df, 1)
+    dbf_3M_used           = calculate_k_step_double_butterflies(cm_curve_df, 1)
+    label_prefix          = "Roll-Adjusted (CM)"
 
-        # Rebuild PCA fair derivatives from reconstructed CM prices
-        for col in derivative_df.columns:
-            parts = col.replace("CM_", "").split("-")
-            if len(parts) == 2:  # Spread
-                fair_today[col] = (
-                    recon_cm_prices.loc[analysis_dt, parts[0] + " (PCA)"]
-                    - recon_cm_prices.loc[analysis_dt, parts[1] + " (PCA)"]
-                )
-            elif "2x" in col:  # Fly
-                c1, rest = col.split("-2x")
-                c2, c3 = rest.split("+")
-                fair_today[col] = (
-                    recon_cm_prices.loc[analysis_dt, c1 + " (PCA)"]
-                    - 2 * recon_cm_prices.loc[analysis_dt, c2 + " (PCA)"]
-                    + recon_cm_prices.loc[analysis_dt, c3 + " (PCA)"]
-                )
-            elif "3x" in col:  # Double Fly
-                c1, rest = col.split("-3x")
-                c2, rest2 = rest.split("+3x")
-                c3, c4 = rest2.split("-")
-                fair_today[col] = (
-                    recon_cm_prices.loc[analysis_dt, c1 + " (PCA)"]
-                    - 3 * recon_cm_prices.loc[analysis_dt, c2 + " (PCA)"]
-                    + 3 * recon_cm_prices.loc[analysis_dt, c3 + " (PCA)"]
-                    - recon_cm_prices.loc[analysis_dt, c4 + " (PCA)"]
-                )
 
-        fair_today = pd.Series(fair_today)
+# ------------------------------------------------------------
+# 12.4 Snapshot: ALL Derivative Families
+# ------------------------------------------------------------
+st.subheader(f"12.1 {label_prefix} Snapshot — All Derivatives")
 
-        # ---- Previous Day ----
-        prev_dt = _prev_date(derivative_df, analysis_dt)
-        prev_orig = derivative_df.loc[prev_dt] if prev_dt else None
+mispricing_store = {}
 
-        # ---- Assemble ----
-        snap = pd.DataFrame({
-            "Original": orig_today,
-            "PCA Fair": fair_today
+mispricing_store["3M Spreads"] = plot_derivative_snapshot_universal(
+    spreads_3M_used,
+    recon_prices_used,
+    derivative_type="spread",
+    title=f"{label_prefix} 3M Spreads",
+    analysis_dt=analysis_dt
+)
+
+mispricing_store["3M Flies"] = plot_derivative_snapshot_universal(
+    butterflies_3M_used,
+    recon_prices_used,
+    derivative_type="fly",
+    title=f"{label_prefix} 3M Flies",
+    analysis_dt=analysis_dt
+)
+
+mispricing_store["3M Double Flies"] = plot_derivative_snapshot_universal(
+    dbf_3M_used,
+    recon_prices_used,
+    derivative_type="dbfly",
+    title=f"{label_prefix} 3M Double Flies",
+    analysis_dt=analysis_dt
+)
+
+
+# ------------------------------------------------------------
+# 12.5 Mispricing Rank Delta (RAW vs CM)
+# ------------------------------------------------------------
+st.subheader("12.2 Mispricing Rank Delta (Raw → Roll-Adjusted)")
+
+if (
+    "Raw Quarterly" in view_mode
+    or mispricing_series is None
+):
+    st.info("Switch to **Roll-Adjusted (CM)** to view rank delta.")
+else:
+    # Raw mispricing already computed earlier in app
+    raw_mis = mispricing_series.dropna()
+
+    # Roll-adjusted mispricing from current section
+    cm_mis = pd.concat(mispricing_store.values()).dropna()
+
+    common_instr = raw_mis.index.intersection(cm_mis.index)
+
+    if len(common_instr) < 3:
+        st.warning("Not enough overlapping instruments to compute rank delta.")
+    else:
+        delta_df = pd.DataFrame({
+            "Raw Mispricing (Rate %)": raw_mis.loc[common_instr],
+            "CM Mispricing (Rate %)": cm_mis.loc[common_instr]
         })
 
-        if prev_orig is not None:
-            snap["Prev Day"] = prev_orig
+        delta_df["Raw Rank"] = delta_df["Raw Mispricing (Rate %)"].abs().rank(ascending=False)
+        delta_df["CM Rank"]  = delta_df["CM Mispricing (Rate %)"].abs().rank(ascending=False)
 
-        snap["Mispricing (Rate %)"] = (snap["Original"] - snap["PCA Fair"]) * 100
+        delta_df["Rank Change (CM - Raw)"] = delta_df["CM Rank"] - delta_df["Raw Rank"]
 
-        # ---- Plot ----
-        fig, ax = plt.subplots(figsize=(15, 7))
+        delta_df = delta_df.sort_values("Rank Change (CM - Raw)", ascending=False)
 
-        ax.plot(snap.index, snap["Original"], marker="o", label="Original")
-        ax.plot(snap.index, snap["PCA Fair"], marker="x", linestyle="--", label="PCA Fair")
+        st.markdown("""
+        **Interpretation**
+        - Positive rank change → looks **more mispriced after roll removal**
+        - Negative rank change → mispricing was **roll-driven**
+        """)
 
-        if "Prev Day" in snap:
-            ax.plot(snap.index, snap["Prev Day"], marker="s", linestyle="-.", label="Prev Day")
-
-        ax.axhline(0, color="gray", linewidth=0.6)
-        ax.set_title(f"Roll-Adjusted {label} Snapshot (Original vs PCA Fair)")
-        ax.set_xlabel(label)
-        ax.set_ylabel("Price Difference")
-        ax.legend(loc="upper left", bbox_to_anchor=(1, 1))
-        ax.grid(True, linestyle=":")
-
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        st.pyplot(fig)
-
-        # ---- Table ----
         st.dataframe(
-            snap.style.format({
-                "Original": "{:.4f}",
-                "PCA Fair": "{:.4f}",
-                "Mispricing (Rate %)": "{:.4f}"
+            delta_df.style.format({
+                "Raw Mispricing (Rate %)": "{:.4f}",
+                "CM Mispricing (Rate %)": "{:.4f}",
+                "Rank Change (CM - Raw)": "{:+.0f}"
             }),
             use_container_width=True
         )
-
-    except Exception as e:
-        st.warning(f"{label} snapshot unavailable: {e}")
-
-
-# -----------------------------
-# 11.10.1 Spreads
-# -----------------------------
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    spreads_cm_3M,
-    "3M CM Spreads",
-    analysis_dt
-)
-
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    calculate_k_step_spreads(cm_curve_df, 2),
-    "6M CM Spreads",
-    analysis_dt
-)
-
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    calculate_k_step_spreads(cm_curve_df, 4),
-    "12M CM Spreads",
-    analysis_dt
-)
-
-# -----------------------------
-# 11.10.2 Flies
-# -----------------------------
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    calculate_k_step_butterflies(cm_curve_df, 1),
-    "3M CM Flies",
-    analysis_dt
-)
-
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    calculate_k_step_butterflies(cm_curve_df, 2),
-    "6M CM Flies",
-    analysis_dt
-)
-
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    calculate_k_step_butterflies(cm_curve_df, 4),
-    "12M CM Flies",
-    analysis_dt
-)
-
-# -----------------------------
-# 11.10.3 Double Flies
-# -----------------------------
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    calculate_k_step_double_butterflies(cm_curve_df, 1),
-    "3M CM Double Flies",
-    analysis_dt
-)
-
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    calculate_k_step_double_butterflies(cm_curve_df, 2),
-    "6M CM Double Flies",
-    analysis_dt
-)
-
-plot_cm_derivative_snapshot(
-    cm_curve_df,
-    cm_prices_recon,
-    calculate_k_step_double_butterflies(cm_curve_df, 4),
-    "12M CM Double Flies",
-    analysis_dt
-)
 
 
 
