@@ -2847,11 +2847,11 @@ st.success("Roll-adjusted constant-maturity curve built successfully.")
 st.subheader("Constant-Maturity Outright Curve Snapshot")
 st.dataframe(cm_curve_df.loc[[analysis_dt]].T, use_container_width=True)
 
-# ============================================================
-# -------- SECTION 12: RAW vs ROLL-ADJUSTED COMPARISON --------
-# ============================================================
+# ============================
+# SECTION 13 — RAW vs ROLL-ADJUSTED COMPARISON
+# ============================
 
-st.header("12. Raw vs Roll-Adjusted Comparison")
+st.header("13. Raw vs Roll-Adjusted Comparison")
 
 st.markdown("""
 This section compares **Raw Quarterly** vs **Roll-Adjusted (Constant-Maturity)** curves:
@@ -2861,112 +2861,40 @@ This section compares **Raw Quarterly** vs **Roll-Adjusted (Constant-Maturity)**
 """)
 
 # ------------------------------------------------------------
-# 12.1 Toggle
+# 13.1 Curve Representation Toggle
 # ------------------------------------------------------------
-view_mode = st.radio(
+curve_mode = st.radio(
     "Select Curve Representation",
-    options=["Raw Quarterly", "Roll-Adjusted (CM)"],
+    ["Raw Quarterly", "Roll-Adjusted (CM)"],
     horizontal=True,
-    key="raw_vs_cm_toggle"
+    key="curve_representation_toggle"
 )
 
 # ------------------------------------------------------------
-# 12.2 Safety: check CM availability
+# 13.2 Availability Check (CORRECT)
 # ------------------------------------------------------------
 cm_available = (
-    "cm_curve_df" in globals()
-    and isinstance(cm_curve_df, pd.DataFrame)
-    and not cm_curve_df.empty
-    and "cm_prices_recon" in globals()
+    st.session_state.get("cm_ready", False)
+    and isinstance(st.session_state.get("cm_curve_df"), pd.DataFrame)
+    and not st.session_state["cm_curve_df"].empty
 )
 
-if view_mode == "Roll-Adjusted (CM)" and not cm_available:
-    st.warning("Roll-adjusted curve not available. Please run Section 11 first.")
+if curve_mode == "Roll-Adjusted (CM)" and not cm_available:
+    st.warning("Roll-adjusted curve not available. Please run **Section 12** first.")
     st.stop()
 
 # ------------------------------------------------------------
-# 12.3 Universal snapshot helper (SAFE)
+# 13.3 Select Curve
 # ------------------------------------------------------------
-def plot_snapshot_safe(
-    derivative_df,
-    recon_prices_df,
-    derivative_type,
-    title,
-    analysis_dt
-):
-    if derivative_df is None or derivative_df.empty:
-        st.info(f"{title}: not enough curve points.")
-        return None
-
-    if analysis_dt not in derivative_df.index:
-        st.info(f"{title}: analysis date not available.")
-        return None
-
-    # Original
-    orig = derivative_df.loc[analysis_dt]
-
-    # PCA Fair (robust reconstruction)
-    recon = _reconstruct_derivative(
-        derivative_df,
-        recon_prices_df,
-        derivative_type=derivative_type
-    )
-
-    if recon.empty or analysis_dt not in recon.index:
-        st.info(f"{title}: PCA reconstruction unavailable.")
-        return None
-
-    fair = recon.loc[analysis_dt].filter(like="(PCA)")
-    fair.index = fair.index.str.replace(" (PCA)", "", regex=False)
-    orig.index = orig.index.str.replace(" (Original)", "", regex=False)
-
-    snap = pd.DataFrame({
-        "Original": orig,
-        "PCA Fair": fair
-    })
-
-    snap["Mispricing (Rate %)"] = (snap["Original"] - snap["PCA Fair"]) * 100
-
-    # Plot
-    fig, ax = plt.subplots(figsize=(15, 7))
-    ax.plot(snap.index, snap["Original"], marker="o", label="Original")
-    ax.plot(snap.index, snap["PCA Fair"], marker="x", linestyle="--", label="PCA Fair")
-    ax.axhline(0, color="gray", linewidth=0.6)
-    ax.set_title(title)
-    ax.set_ylabel("Price Difference")
-    ax.legend(loc="upper left", bbox_to_anchor=(1, 1))
-    ax.grid(True, linestyle=":")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    st.pyplot(fig)
-
-    st.dataframe(
-        snap.style.format({
-            "Original": "{:.4f}",
-            "PCA Fair": "{:.4f}",
-            "Mispricing (Rate %)": "{:.4f}"
-        }),
-        use_container_width=True
-    )
-
-    return snap["Mispricing (Rate %)"]
-
-
-# ------------------------------------------------------------
-# 12.4 Select datasets
-# ------------------------------------------------------------
-if view_mode == "Raw Quarterly":
-    curve_df   = analysis_curve_df
-    recon_px   = historical_outrights_df
-    label      = "Raw Quarterly"
-
+if curve_mode == "Raw Quarterly":
+    curve_df = analysis_curve_df
+    curve_label = "Raw Quarterly"
 else:
-    curve_df   = cm_curve_df
-    recon_px   = cm_prices_recon
-    label      = "Roll-Adjusted (CM)"
+    curve_df = st.session_state["cm_curve_df"]
+    curve_label = "Roll-Adjusted (CM)"
 
 # ------------------------------------------------------------
-# 12.5 Derivative construction (DYNAMIC)
+# 13.4 Build Derivatives (DYNAMIC & SAFE)
 # ------------------------------------------------------------
 spreads_3M = calculate_k_step_spreads(curve_df, 1)
 spreads_6M = calculate_k_step_spreads(curve_df, 2)
@@ -2979,76 +2907,46 @@ dbf_3M = calculate_k_step_double_butterflies(curve_df, 1)
 dbf_6M = calculate_k_step_double_butterflies(curve_df, 2)
 
 # ------------------------------------------------------------
-# 12.6 Snapshots
+# 13.5 Snapshot Helper (ROBUST)
 # ------------------------------------------------------------
-st.subheader(f"12.1 {label} — Derivative Snapshots")
+def plot_snapshot_safe(df, title):
+    if df is None or df.empty:
+        st.info(f"{title}: not enough curve points.")
+        return None
 
-mispricing_map = {}
+    if analysis_dt not in df.index:
+        st.info(f"{title}: analysis date not available.")
+        return None
 
-mispricing_map["3M Spreads"] = plot_snapshot_safe(
-    spreads_3M, recon_px, "spread", f"{label} 3M Spreads", analysis_dt
-)
+    snap = df.loc[[analysis_dt]].T
+    snap.columns = ["Value"]
 
-mispricing_map["6M Spreads"] = plot_snapshot_safe(
-    spreads_6M, recon_px, "spread", f"{label} 6M Spreads", analysis_dt
-)
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(snap.index, snap["Value"], marker="o")
+    ax.set_title(title)
+    ax.grid(True, linestyle=":")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    st.pyplot(fig)
 
-mispricing_map["12M Spreads"] = plot_snapshot_safe(
-    spreads_12M, recon_px, "spread", f"{label} 12M Spreads", analysis_dt
-)
+    st.dataframe(
+        snap.style.format("{:.4f}"),
+        use_container_width=True
+    )
 
-mispricing_map["3M Flies"] = plot_snapshot_safe(
-    flies_3M, recon_px, "fly", f"{label} 3M Flies", analysis_dt
-)
-
-mispricing_map["6M Flies"] = plot_snapshot_safe(
-    flies_6M, recon_px, "fly", f"{label} 6M Flies", analysis_dt
-)
-
-mispricing_map["3M Double Flies"] = plot_snapshot_safe(
-    dbf_3M, recon_px, "dbfly", f"{label} 3M Double Flies", analysis_dt
-)
-
-mispricing_map["6M Double Flies"] = plot_snapshot_safe(
-    dbf_6M, recon_px, "dbfly", f"{label} 6M Double Flies", analysis_dt
-)
+    return snap["Value"]
 
 # ------------------------------------------------------------
-# 12.7 Mispricing Rank Delta (Raw → CM)
+# 13.6 Render ALL Derivative Families
 # ------------------------------------------------------------
-if view_mode == "Roll-Adjusted (CM)" and "mispricing_series" in globals():
+st.subheader(f"{curve_label} — Derivative Snapshots")
 
-    st.subheader("12.2 Mispricing Rank Delta (Raw → Roll-Adjusted)")
+plot_snapshot_safe(spreads_3M, f"{curve_label} 3M Spreads")
+plot_snapshot_safe(spreads_6M, f"{curve_label} 6M Spreads")
+plot_snapshot_safe(spreads_12M, f"{curve_label} 12M Spreads")
 
-    raw_mis = mispricing_series.dropna()
-    cm_mis = pd.concat(
-        [v for v in mispricing_map.values() if v is not None]
-    ).dropna()
+plot_snapshot_safe(flies_3M, f"{curve_label} 3M Flies")
+plot_snapshot_safe(flies_6M, f"{curve_label} 6M Flies")
 
-    common = raw_mis.index.intersection(cm_mis.index)
-
-    if len(common) >= 3:
-        delta = pd.DataFrame({
-            "Raw Mispricing": raw_mis.loc[common],
-            "CM Mispricing": cm_mis.loc[common]
-        })
-
-        delta["Raw Rank"] = delta["Raw Mispricing"].abs().rank(ascending=False)
-        delta["CM Rank"] = delta["CM Mispricing"].abs().rank(ascending=False)
-        delta["Rank Change (CM - Raw)"] = delta["CM Rank"] - delta["Raw Rank"]
-
-        delta = delta.sort_values("Rank Change (CM - Raw)", ascending=False)
-
-        st.dataframe(
-            delta.style.format({
-                "Raw Mispricing": "{:.4f}",
-                "CM Mispricing": "{:.4f}",
-                "Rank Change (CM - Raw)": "{:+.0f}"
-            }),
-            use_container_width=True
-        )
-    else:
-        st.info("Not enough overlapping instruments for rank delta.")
-
-
-
+plot_snapshot_safe(dbf_3M, f"{curve_label} 3M Double Flies")
+plot_snapshot_safe(dbf_6M, f"{curve_label} 6M Double Flies")
