@@ -4,7 +4,7 @@ import numpy as np
 from datetime import date
 
 st.set_page_config(layout="wide")
-st.title("ZQ → FOMC Meeting Premia → SR3 Pricing & Spreads")
+st.title("ZQ → FOMC Meetings → Exact Compounded SR3")
 
 # ======================================================
 # 1. FOMC MEETING CALENDAR
@@ -14,12 +14,12 @@ fomc_dates = pd.to_datetime([
     "2026-09-16", "2026-11-05", "2026-12-16",
     "2027-01-27", "2027-03-17", "2027-04-28",
     "2027-06-16", "2027-07-28"
-])
+]).sort_values()
 
 # ======================================================
 # 2. FIND FIRST FUTURE MEETING → ANCHOR MONTH
 # ======================================================
-today = pd.Timestamp.today()
+today = pd.Timestamp.today().normalize()
 future_meetings = fomc_dates[fomc_dates >= today]
 
 if future_meetings.empty:
@@ -28,17 +28,15 @@ if future_meetings.empty:
 
 first_meeting = future_meetings.min()
 
-# Anchor = month BEFORE first meeting month
 anchor_month = (
     first_meeting.to_period("M").to_timestamp()
     - pd.DateOffset(months=1)
 )
 
-# Build 13 months: anchor + next 12
 months = pd.date_range(anchor_month, periods=13, freq="MS")
 
 # ======================================================
-# 3. ZQ INPUT TABLE (ANCHOR + 12)
+# 3. ZQ INPUT TABLE
 # ======================================================
 st.subheader("ZQ Prices (Anchor + Next 12 Months)")
 
@@ -68,7 +66,7 @@ for i, m in enumerate(months):
         (fomc_dates.month == m.month) &
         (fomc_dates.year == m.year)
     ]
-    meeting_date = meeting_idx[0] if len(meeting_idx) > 0 else pd.NaT
+    meeting_date = meeting_idx[0] if len(meeting_idx) else pd.NaT
 
     if pd.notna(meeting_date):
         pre = (meeting_date - m).days
@@ -82,7 +80,7 @@ for i, m in enumerate(months):
         "Days": days,
         "Pre": pre,
         "Post": post,
-        "Month Rate": zq_df.iloc[i]["Month Rate"]
+        "Month Rate": zq_df.iloc[i]["Month Rate"],
     })
 
 month_df = pd.DataFrame(rows)
@@ -95,7 +93,7 @@ anchor_label = month_df.iloc[0]["Month"]
 
 work_df = month_df.iloc[1:].reset_index(drop=True)
 
-prev = anchor_rate
+prev_rate = anchor_rate
 premia = []
 
 for _, r in work_df.iterrows():
@@ -106,21 +104,59 @@ for _, r in work_df.iterrows():
     w_pre = r["Pre"] / r["Days"]
     w_post = r["Post"] / r["Days"]
 
-    new_rate = (r["Month Rate"] - w_pre * prev) / w_post
-    premia.append((new_rate - prev) * 100)
-    prev = new_rate
+    new_rate = (r["Month Rate"] - w_pre * prev_rate) / w_post
+    premia.append((new_rate - prev_rate) * 100)
+    prev_rate = new_rate
 
 work_df["Meeting Premium (bps)"] = premia
-work_df["Policy Path"] = anchor_rate + np.cumsum(work_df["Meeting Premium (bps)"]) / 100
+work_df["Policy Rate After Meeting"] = (
+    anchor_rate + np.cumsum(work_df["Meeting Premium (bps)"]) / 100
+)
 
 st.subheader("Implied FOMC Meeting Premia (from ZQ)")
 st.dataframe(
-    work_df[["Month", "Meeting Date", "Meeting Premium (bps)", "Policy Path"]],
+    work_df[["Month", "Meeting Date", "Meeting Premium (bps)", "Policy Rate After Meeting"]],
     use_container_width=True
 )
 
 # ======================================================
-# 6. SR3 QUARTERS
+# 6. BUILD EXACT POLICY STEP FUNCTION
+# ======================================================
+policy_steps = []
+current_rate = anchor_rate
+
+for _, r in work_df.iterrows():
+    meet = r["Meeting Date"]
+    if pd.isna(meet):
+        continue
+
+    policy_steps.append((meet.normalize(), current_rate))
+    current_rate += r["Meeting Premium (bps)"] / 100
+
+policy_steps.append((pd.Timestamp.max, current_rate))
+
+# ======================================================
+# 7. EXACT DAILY COMPOUNDING FUNCTION
+# ======================================================
+def compounded_sr3_rate(start, end, steps):
+    acc = 1.0
+    D = (end - start).days
+
+    for i in range(len(steps) - 1):
+        seg_start = max(start, steps[i][0])
+        seg_end = min(end, steps[i + 1][0])
+
+        if seg_start >= seg_end:
+            continue
+
+        rate = steps[i][1]
+        days = (seg_end - seg_start).days
+        acc *= (1 + rate / 360) ** days
+
+    return 360 * (acc - 1) / D
+
+# ======================================================
+# 8. SR3 CONTRACTS
 # ======================================================
 sr3_quarters = pd.DataFrame([
     ("SR3H6", "2026-03-18", "2026-06-17"),
@@ -131,100 +167,52 @@ sr3_quarters = pd.DataFrame([
 
 sr3_quarters["Start"] = pd.to_datetime(sr3_quarters["Start"])
 sr3_quarters["End"] = pd.to_datetime(sr3_quarters["End"])
+sr3_quarters = sr3_quarters.sort_values("Start")
 
 # ======================================================
-# 7. MAP MEETING PREMIA → SR3 (DETAIL + SUMMARY)
+# 9. EXACT SR3 PRICING
 # ======================================================
-sr3_detail_rows = []
-sr3_summary_rows = []
+sr3_rows = []
 
 for _, q in sr3_quarters.iterrows():
-    total_days = (q["End"] - q["Start"]).days
-    total_contribution_bps = 0.0
+    sr3_rate = compounded_sr3_rate(q["Start"], q["End"], policy_steps)
 
-    for _, m in work_df.iterrows():
-        meet = m["Meeting Date"]
-        if pd.isna(meet) or meet < q["Start"] or meet >= q["End"]:
-            continue
-
-        days_after = (q["End"] - meet).days
-        weight = days_after / total_days
-        contrib_bps = weight * m["Meeting Premium (bps)"]
-
-        total_contribution_bps += contrib_bps
-
-        sr3_detail_rows.append({
-            "SR3": q["SR3"],
-            "Meeting Date": meet.date(),
-            "Meeting Premium (bps)": round(m["Meeting Premium (bps)"], 2),
-            "Weight": round(weight, 4),
-            "Contribution (bps)": round(contrib_bps, 2),
-        })
-
-    implied_rate = anchor_rate + total_contribution_bps / 100
-    implied_price = 100 - implied_rate
-
-    sr3_summary_rows.append({
+    sr3_rows.append({
         "SR3": q["SR3"],
-        "Anchor Rate (%)": round(anchor_rate, 3),
-        "Total Meeting Impact (bps)": round(total_contribution_bps, 2),
-        "Implied SR3 Rate (%)": round(implied_rate, 3),
-        "Implied SR3 Price": round(implied_price, 3),
+        "Start": q["Start"].date(),
+        "End": q["End"].date(),
+        "Implied SR3 Rate (%)": round(sr3_rate, 5),
+        "Implied SR3 Price": round(100 - sr3_rate, 5),
     })
 
-sr3_detail_df = pd.DataFrame(sr3_detail_rows)
-sr3_summary_df = pd.DataFrame(sr3_summary_rows)
+sr3_df = pd.DataFrame(sr3_rows)
 
-st.subheader("SR3 – Meeting Premium Decomposition")
-st.dataframe(sr3_detail_df, use_container_width=True)
-
-st.subheader("SR3 – Implied Rates & Prices")
-st.dataframe(sr3_summary_df, use_container_width=True)
+st.subheader("SR3 – Exact Compounded Pricing")
+st.dataframe(sr3_df, use_container_width=True)
 
 # ======================================================
-# 8. ZQ PRICE SPREADS (ZQ1 - ZQ2)
+# 10. SR3 PRICE SPREADS (FRONT - NEXT)
 # ======================================================
-zq_spread_rows = []
-
-for i in range(len(zq_df) - 1):
-    zq_spread_rows.append({
-        "Spread": f"{zq_df.iloc[i]['Month']} - {zq_df.iloc[i+1]['Month']}",
-        "ZQ Price Spread": round(
-            zq_df.iloc[i]["ZQ Price"] - zq_df.iloc[i+1]["ZQ Price"],
-            4
-        )
-    })
-
-zq_spreads_df = pd.DataFrame(zq_spread_rows)
-
-st.subheader("ZQ Calendar Spreads (Price)")
-st.dataframe(zq_spreads_df, use_container_width=True)
-
-# ======================================================
-# 9. SR3 PRICE SPREADS (SR3H - SR3M)
-# ======================================================
-sr3_spread_rows = []
-
-for i in range(len(sr3_summary_df) - 1):
-    sr3_spread_rows.append({
-        "Spread": f"{sr3_summary_df.iloc[i]['SR3']} - {sr3_summary_df.iloc[i+1]['SR3']}",
+sr3_spreads_df = pd.DataFrame([
+    {
+        "Spread": f"{sr3_df.iloc[i]['SR3']} - {sr3_df.iloc[i+1]['SR3']}",
         "SR3 Price Spread": round(
-            sr3_summary_df.iloc[i]["Implied SR3 Price"]
-            - sr3_summary_df.iloc[i+1]["Implied SR3 Price"],
-            4
+            sr3_df.iloc[i]["Implied SR3 Price"]
+            - sr3_df.iloc[i+1]["Implied SR3 Price"],
+            5
         )
-    })
-
-sr3_spreads_df = pd.DataFrame(sr3_spread_rows)
+    }
+    for i in range(len(sr3_df) - 1)
+])
 
 st.subheader("SR3 Calendar Spreads (Price)")
 st.dataframe(sr3_spreads_df, use_container_width=True)
 
 # ======================================================
-# 10. FOOTER
+# 11. FOOTER
 # ======================================================
 st.caption(
     f"As of {date.today()} | "
     f"Anchor month: {anchor_label} | "
-    f"Anchor rate: {anchor_rate:.2f}%"
+    f"Anchor policy rate: {anchor_rate:.3f}%"
 )
