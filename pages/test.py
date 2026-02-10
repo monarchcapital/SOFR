@@ -2769,6 +2769,84 @@ plot_snapshot(
 # ============================
 # ============================================================
 # ============================================================
+# ============================
+# SECTION 12 — ROLL-ADJUSTED CONSTANT-MATURITY CURVE
+# ============================
+
+st.header("12. Roll-Adjusted Constant-Maturity Curve")
+
+st.markdown("""
+This section constructs a **roll-adjusted (constant-maturity)** curve in **price space**
+by linearly interpolating between adjacent quarterly contracts.
+The output feeds directly into the **existing derivative + PCA engine**.
+""")
+
+# --- User Controls ---
+cm_tenors_months = st.multiselect(
+    "Select Constant Maturities (Months)",
+    options=[3, 6, 9, 12, 15, 18],
+    default=[3, 6, 9, 12],
+    key="cm_tenors"
+)
+
+if len(cm_tenors_months) < 2:
+    st.warning("Select at least two constant maturities.")
+    st.stop()
+
+# --- Helper: time-to-expiry in months ---
+def _months_to_expiry(expiry_date, ref_date):
+    return (expiry_date - ref_date).days / 30.4375
+
+
+# --- Build CM Curve ---
+cm_curve_records = []
+
+for dt in analysis_curve_df.index:
+
+    row = analysis_curve_df.loc[dt]
+    expiries = future_expiries_df.loc[row.index, "ExpiryDate"]
+
+    ttms = pd.Series(
+        [_months_to_expiry(exp, dt) for exp in expiries],
+        index=row.index
+    )
+
+    cm_row = {}
+
+    for T in cm_tenors_months:
+        below = ttms[ttms <= T]
+        above = ttms[ttms >= T]
+
+        if below.empty or above.empty:
+            cm_row[f"CM_{T}M"] = np.nan
+            continue
+
+        c1 = below.idxmax()
+        c2 = above.idxmin()
+
+        if c1 == c2:
+            cm_row[f"CM_{T}M"] = row[c1]
+            continue
+
+        t1, t2 = ttms[c1], ttms[c2]
+        w2 = (T - t1) / (t2 - t1)
+        w1 = 1 - w2
+
+        cm_row[f"CM_{T}M"] = w1 * row[c1] + w2 * row[c2]
+
+    cm_curve_records.append(cm_row)
+
+cm_curve_df = pd.DataFrame(cm_curve_records, index=analysis_curve_df.index)
+
+# --- Store for downstream use ---
+st.session_state["cm_curve_df"] = cm_curve_df
+st.session_state["cm_ready"] = True
+
+st.success("Roll-adjusted constant-maturity curve built successfully.")
+
+st.subheader("Constant-Maturity Outright Curve Snapshot")
+st.dataframe(cm_curve_df.loc[[analysis_dt]].T, use_container_width=True)
+
 # ============================================================
 # -------- SECTION 12: RAW vs ROLL-ADJUSTED COMPARISON --------
 # ============================================================
