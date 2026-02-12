@@ -3125,12 +3125,11 @@ else:
 
 # ======================
 # END SECTION 12
-# ======================
 # ==========================================================
-# 5.d — FILTERED MISPRICING TABLE WITH HEDGE SUGGESTIONS
+# 5.d — FILTERED MISPRICING TABLE + FAMILY FILTER + HEDGES
 # ==========================================================
 
-st.subheader("5.d Mispricing Filter + Hedge Suggestions (All Derivative Families)")
+st.subheader("5.d Mispricing Filter + Family Selection + Hedge Suggestions")
 
 # Requires:
 # mispricing_series  -> from calculate_derivative_mispricings()
@@ -3139,27 +3138,14 @@ st.subheader("5.d Mispricing Filter + Hedge Suggestions (All Derivative Families
 if mispricing_series is not None and len(mispricing_series) > 0:
 
     # ------------------------------------------------------
-    # Threshold Slider
-    # ------------------------------------------------------
-    max_range = float(np.nanmax(np.abs(mispricing_series.values))) if len(mispricing_series) > 0 else 5.0
-
-    threshold_rate = st.slider(
-        "Minimum Absolute Mispricing Threshold (Rate %)",
-        min_value=0.0,
-        max_value=max_range if max_range > 0 else 5.0,
-        value=min(0.10, max_range) if max_range > 0 else 0.10,
-        step=0.01,
-        help="Shows instruments where |Original − PCA Fair| exceeds threshold"
-    )
-
-    # ------------------------------------------------------
-    # Build Mispricing DataFrame
+    # BUILD MISPRICING DATAFRAME
     # ------------------------------------------------------
     mispricing_df = mispricing_series.reset_index()
     mispricing_df.columns = ["Instrument", "Mispricing (Rate %)"]
 
     # --- classify derivative family ---
     def classify_family(name):
+
         if "3M" in name:
             tenor = "3M"
         elif "6M" in name:
@@ -3167,7 +3153,7 @@ if mispricing_series is not None and len(mispricing_series) > 0:
         elif "12M" in name:
             tenor = "12M"
         else:
-            tenor = ""
+            tenor = "Other"
 
         if "Double Fly" in name:
             typ = "Double Fly"
@@ -3184,14 +3170,43 @@ if mispricing_series is not None and len(mispricing_series) > 0:
     mispricing_df["Abs Mispricing"] = mispricing_df["Mispricing (Rate %)"].abs()
 
     # ------------------------------------------------------
-    # Filter by threshold
+    # FILTER CONTROLS
+    # ------------------------------------------------------
+    col1, col2 = st.columns(2)
+
+    # --- Threshold slider ---
+    with col1:
+        max_range = float(np.nanmax(np.abs(mispricing_series.values))) if len(mispricing_series) > 0 else 5.0
+
+        threshold_rate = st.slider(
+            "Minimum Absolute Mispricing Threshold (Rate %)",
+            min_value=0.0,
+            max_value=max_range if max_range > 0 else 5.0,
+            value=min(0.10, max_range) if max_range > 0 else 0.10,
+            step=0.01
+        )
+
+    # --- Family filter selector ---
+    with col2:
+        available_families = sorted(mispricing_df["Family"].unique().tolist())
+
+        selected_families = st.multiselect(
+            "Select Derivative Families",
+            options=available_families,
+            default=available_families,
+            help="Filter by tenor and derivative type"
+        )
+
+    # ------------------------------------------------------
+    # APPLY FILTERS
     # ------------------------------------------------------
     filtered_df = mispricing_df[
-        mispricing_df["Abs Mispricing"] >= threshold_rate
+        (mispricing_df["Abs Mispricing"] >= threshold_rate) &
+        (mispricing_df["Family"].isin(selected_families))
     ].sort_values("Abs Mispricing", ascending=False)
 
     # ------------------------------------------------------
-    # Minimum Variance Hedge Engine (PCA Covariance Based)
+    # MINIMUM VARIANCE HEDGE ENGINE (PCA COVARIANCE BASED)
     # ------------------------------------------------------
     def find_best_hedge(trade_label, Sigma):
         """
@@ -3232,13 +3247,13 @@ if mispricing_series is not None and len(mispricing_series) > 0:
         if best_hedge is None:
             return None, None, None, None
 
-        residual_vol = np.sqrt(best_residual) * 100  # convert to Rate %
+        residual_vol = np.sqrt(best_residual) * 100
         action = "Short Hedge" if best_k > 0 else "Long Hedge"
 
         return best_hedge, abs(best_k), residual_vol, action
 
     # ------------------------------------------------------
-    # Compute Hedge Suggestions
+    # COMPUTE HEDGE SUGGESTIONS
     # ------------------------------------------------------
     hedge_list = []
     hedge_ratio_list = []
@@ -3263,12 +3278,12 @@ if mispricing_series is not None and len(mispricing_series) > 0:
     filtered_df["Residual Risk After Hedge (Rate %)"] = residual_list
 
     # ------------------------------------------------------
-    # Display Output
+    # DISPLAY OUTPUT
     # ------------------------------------------------------
     if filtered_df.empty:
-        st.info("No derivatives exceed the selected threshold.")
+        st.info("No instruments match selected filters.")
     else:
-        st.metric("Instruments Above Threshold", len(filtered_df))
+        st.metric("Filtered Instruments", len(filtered_df))
 
         st.caption("""
 Hedge Basis: **Minimum Variance Hedge using PCA Risk Model**
@@ -3290,5 +3305,6 @@ Hedge Basis: **Minimum Variance Hedge using PCA Risk Model**
 
 else:
     st.info("Mispricing data not available.")
+
 
 
