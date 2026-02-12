@@ -1642,189 +1642,6 @@ if not price_df_filtered.empty:
                 file_name="SOFR.pdf",
                 mime="application/pdf",
             )
-            # 5.d — FILTERED MISPRICING TABLE + FAMILY FILTER + HEDGES
-# ==========================================================
-
-st.subheader("5.d Mispricing Filter + Family Selection + Hedge Suggestions")
-
-# Requires:
-# mispricing_series  -> from calculate_derivative_mispricings()
-# Sigma_Raw_df       -> PCA reconstructed covariance from Section 7
-
-if mispricing_series is not None and len(mispricing_series) > 0:
-
-    # ------------------------------------------------------
-    # BUILD MISPRICING DATAFRAME
-    # ------------------------------------------------------
-    mispricing_df = mispricing_series.reset_index()
-    mispricing_df.columns = ["Instrument", "Mispricing (Rate %)"]
-
-    # --- classify derivative family ---
-    def classify_family(name):
-
-        if "3M" in name:
-            tenor = "3M"
-        elif "6M" in name:
-            tenor = "6M"
-        elif "12M" in name:
-            tenor = "12M"
-        else:
-            tenor = "Other"
-
-        if "Double Fly" in name:
-            typ = "Double Fly"
-        elif "Fly" in name:
-            typ = "Fly"
-        elif "Spread" in name:
-            typ = "Spread"
-        else:
-            typ = "Other"
-
-        return f"{tenor} {typ}".strip()
-
-    mispricing_df["Family"] = mispricing_df["Instrument"].apply(classify_family)
-    mispricing_df["Abs Mispricing"] = mispricing_df["Mispricing (Rate %)"].abs()
-
-    # ------------------------------------------------------
-    # FILTER CONTROLS
-    # ------------------------------------------------------
-    col1, col2 = st.columns(2)
-
-    # --- Threshold slider ---
-    with col1:
-        max_range = float(np.nanmax(np.abs(mispricing_series.values))) if len(mispricing_series) > 0 else 5.0
-
-        threshold_rate = st.slider(
-            "Minimum Absolute Mispricing Threshold (Rate %)",
-            min_value=0.0,
-            max_value=max_range if max_range > 0 else 5.0,
-            value=min(0.10, max_range) if max_range > 0 else 0.10,
-            step=0.01
-        )
-
-    # --- Family filter selector ---
-    with col2:
-        available_families = sorted(mispricing_df["Family"].unique().tolist())
-
-        selected_families = st.multiselect(
-            "Select Derivative Families",
-            options=available_families,
-            default=available_families,
-            help="Filter by tenor and derivative type"
-        )
-
-    # ------------------------------------------------------
-    # APPLY FILTERS
-    # ------------------------------------------------------
-    filtered_df = mispricing_df[
-        (mispricing_df["Abs Mispricing"] >= threshold_rate) &
-        (mispricing_df["Family"].isin(selected_families))
-    ].sort_values("Abs Mispricing", ascending=False)
-
-    # ------------------------------------------------------
-    # MINIMUM VARIANCE HEDGE ENGINE (PCA COVARIANCE BASED)
-    # ------------------------------------------------------
-    def find_best_hedge(trade_label, Sigma):
-        """
-        Minimum Variance Hedge:
-            k* = Cov(T,H) / Var(H)
-            Residual Var = Var(T) - k*Cov(T,H)
-        """
-        if Sigma is None or Sigma.empty:
-            return None, None, None, None
-
-        if trade_label not in Sigma.index:
-            return None, None, None, None
-
-        Var_T = Sigma.loc[trade_label, trade_label]
-        best_residual = np.inf
-        best_hedge = None
-        best_k = None
-
-        for hedge in Sigma.columns:
-            if hedge == trade_label:
-                continue
-
-            Var_H = Sigma.loc[hedge, hedge]
-            Cov_TH = Sigma.loc[trade_label, hedge]
-
-            if Var_H <= 1e-9:
-                continue
-
-            k = Cov_TH / Var_H
-            residual_var = Var_T - k * Cov_TH
-            residual_var = max(residual_var, 0)
-
-            if residual_var < best_residual:
-                best_residual = residual_var
-                best_hedge = hedge
-                best_k = k
-
-        if best_hedge is None:
-            return None, None, None, None
-
-        residual_vol = np.sqrt(best_residual) * 100
-        action = "Short Hedge" if best_k > 0 else "Long Hedge"
-
-        return best_hedge, abs(best_k), residual_vol, action
-
-    # ------------------------------------------------------
-    # COMPUTE HEDGE SUGGESTIONS
-    # ------------------------------------------------------
-    hedge_list = []
-    hedge_ratio_list = []
-    residual_list = []
-    action_list = []
-
-    for instr in filtered_df["Instrument"]:
-
-        if 'Sigma_Raw_df' in globals() and not Sigma_Raw_df.empty:
-            hedge, k, resid, action = find_best_hedge(instr, Sigma_Raw_df)
-        else:
-            hedge, k, resid, action = None, None, None, None
-
-        hedge_list.append(hedge if hedge else "N/A")
-        hedge_ratio_list.append(k if k else np.nan)
-        residual_list.append(resid if resid else np.nan)
-        action_list.append(action if action else "N/A")
-
-    filtered_df["Suggested Hedge"] = hedge_list
-    filtered_df["Hedge Ratio |k*|"] = hedge_ratio_list
-    filtered_df["Hedge Action"] = action_list
-    filtered_df["Residual Risk After Hedge (Rate %)"] = residual_list
-
-    # ------------------------------------------------------
-    # DISPLAY OUTPUT
-    # ------------------------------------------------------
-    if filtered_df.empty:
-        st.info("No instruments match selected filters.")
-    else:
-        st.metric("Filtered Instruments", len(filtered_df))
-
-        st.caption("""
-Hedge Basis: **Minimum Variance Hedge using PCA Risk Model**
-
-• PCA reconstructed covariance matrix  
-• Hedge ratio: k* = Cov(trade, hedge) / Var(hedge)  
-• Hedge selected to minimize residual volatility  
-• Residual risk shows remaining exposure after hedge
-""")
-
-        st.dataframe(
-            filtered_df.drop(columns=["Abs Mispricing"]).style.format({
-                "Mispricing (Rate %)": "{:.4f}",
-                "Hedge Ratio |k*|": "{:.4f}",
-                "Residual Risk After Hedge (Rate %)": "{:.4f}"
-            }),
-            use_container_width=True
-        )
-
-else:
-    st.info("Mispricing data not available.")
-
-
-
-
 
         # --------------------------- 6. PCA-Based Hedging Strategy (3M Spreads ONLY - Original Section) ---------------------------
         st.header("6. PCA-Based Hedging Strategy (3M Spreads ONLY - Original Section)")
@@ -3309,3 +3126,185 @@ else:
 # ======================
 # END SECTION 12
 # ==========================================================
+# 5.d — FILTERED MISPRICING TABLE + FAMILY FILTER + HEDGES
+# ==========================================================
+
+st.subheader("5.d Mispricing Filter + Family Selection + Hedge Suggestions")
+
+# Requires:
+# mispricing_series  -> from calculate_derivative_mispricings()
+# Sigma_Raw_df       -> PCA reconstructed covariance from Section 7
+
+if mispricing_series is not None and len(mispricing_series) > 0:
+
+    # ------------------------------------------------------
+    # BUILD MISPRICING DATAFRAME
+    # ------------------------------------------------------
+    mispricing_df = mispricing_series.reset_index()
+    mispricing_df.columns = ["Instrument", "Mispricing (Rate %)"]
+
+    # --- classify derivative family ---
+    def classify_family(name):
+
+        if "3M" in name:
+            tenor = "3M"
+        elif "6M" in name:
+            tenor = "6M"
+        elif "12M" in name:
+            tenor = "12M"
+        else:
+            tenor = "Other"
+
+        if "Double Fly" in name:
+            typ = "Double Fly"
+        elif "Fly" in name:
+            typ = "Fly"
+        elif "Spread" in name:
+            typ = "Spread"
+        else:
+            typ = "Other"
+
+        return f"{tenor} {typ}".strip()
+
+    mispricing_df["Family"] = mispricing_df["Instrument"].apply(classify_family)
+    mispricing_df["Abs Mispricing"] = mispricing_df["Mispricing (Rate %)"].abs()
+
+    # ------------------------------------------------------
+    # FILTER CONTROLS
+    # ------------------------------------------------------
+    col1, col2 = st.columns(2)
+
+    # --- Threshold slider ---
+    with col1:
+        max_range = float(np.nanmax(np.abs(mispricing_series.values))) if len(mispricing_series) > 0 else 5.0
+
+        threshold_rate = st.slider(
+            "Minimum Absolute Mispricing Threshold (Rate %)",
+            min_value=0.0,
+            max_value=max_range if max_range > 0 else 5.0,
+            value=min(0.10, max_range) if max_range > 0 else 0.10,
+            step=0.01
+        )
+
+    # --- Family filter selector ---
+    with col2:
+        available_families = sorted(mispricing_df["Family"].unique().tolist())
+
+        selected_families = st.multiselect(
+            "Select Derivative Families",
+            options=available_families,
+            default=available_families,
+            help="Filter by tenor and derivative type"
+        )
+
+    # ------------------------------------------------------
+    # APPLY FILTERS
+    # ------------------------------------------------------
+    filtered_df = mispricing_df[
+        (mispricing_df["Abs Mispricing"] >= threshold_rate) &
+        (mispricing_df["Family"].isin(selected_families))
+    ].sort_values("Abs Mispricing", ascending=False)
+
+    # ------------------------------------------------------
+    # MINIMUM VARIANCE HEDGE ENGINE (PCA COVARIANCE BASED)
+    # ------------------------------------------------------
+    def find_best_hedge(trade_label, Sigma):
+        """
+        Minimum Variance Hedge:
+            k* = Cov(T,H) / Var(H)
+            Residual Var = Var(T) - k*Cov(T,H)
+        """
+        if Sigma is None or Sigma.empty:
+            return None, None, None, None
+
+        if trade_label not in Sigma.index:
+            return None, None, None, None
+
+        Var_T = Sigma.loc[trade_label, trade_label]
+        best_residual = np.inf
+        best_hedge = None
+        best_k = None
+
+        for hedge in Sigma.columns:
+            if hedge == trade_label:
+                continue
+
+            Var_H = Sigma.loc[hedge, hedge]
+            Cov_TH = Sigma.loc[trade_label, hedge]
+
+            if Var_H <= 1e-9:
+                continue
+
+            k = Cov_TH / Var_H
+            residual_var = Var_T - k * Cov_TH
+            residual_var = max(residual_var, 0)
+
+            if residual_var < best_residual:
+                best_residual = residual_var
+                best_hedge = hedge
+                best_k = k
+
+        if best_hedge is None:
+            return None, None, None, None
+
+        residual_vol = np.sqrt(best_residual) * 100
+        action = "Short Hedge" if best_k > 0 else "Long Hedge"
+
+        return best_hedge, abs(best_k), residual_vol, action
+
+    # ------------------------------------------------------
+    # COMPUTE HEDGE SUGGESTIONS
+    # ------------------------------------------------------
+    hedge_list = []
+    hedge_ratio_list = []
+    residual_list = []
+    action_list = []
+
+    for instr in filtered_df["Instrument"]:
+
+        if 'Sigma_Raw_df' in globals() and not Sigma_Raw_df.empty:
+            hedge, k, resid, action = find_best_hedge(instr, Sigma_Raw_df)
+        else:
+            hedge, k, resid, action = None, None, None, None
+
+        hedge_list.append(hedge if hedge else "N/A")
+        hedge_ratio_list.append(k if k else np.nan)
+        residual_list.append(resid if resid else np.nan)
+        action_list.append(action if action else "N/A")
+
+    filtered_df["Suggested Hedge"] = hedge_list
+    filtered_df["Hedge Ratio |k*|"] = hedge_ratio_list
+    filtered_df["Hedge Action"] = action_list
+    filtered_df["Residual Risk After Hedge (Rate %)"] = residual_list
+
+    # ------------------------------------------------------
+    # DISPLAY OUTPUT
+    # ------------------------------------------------------
+    if filtered_df.empty:
+        st.info("No instruments match selected filters.")
+    else:
+        st.metric("Filtered Instruments", len(filtered_df))
+
+        st.caption("""
+Hedge Basis: **Minimum Variance Hedge using PCA Risk Model**
+
+• PCA reconstructed covariance matrix  
+• Hedge ratio: k* = Cov(trade, hedge) / Var(hedge)  
+• Hedge selected to minimize residual volatility  
+• Residual risk shows remaining exposure after hedge
+""")
+
+        st.dataframe(
+            filtered_df.drop(columns=["Abs Mispricing"]).style.format({
+                "Mispricing (Rate %)": "{:.4f}",
+                "Hedge Ratio |k*|": "{:.4f}",
+                "Residual Risk After Hedge (Rate %)": "{:.4f}"
+            }),
+            use_container_width=True
+        )
+
+else:
+    st.info("Mispricing data not available.")
+
+
+
