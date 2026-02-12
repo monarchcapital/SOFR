@@ -3411,6 +3411,25 @@ try:
     def granger_test(trade_series, other_series, max_lag=5):
 
         df = pd.concat([trade_series, other_series], axis=1).dropna()
+        # ------------------------------------------------------
+# ROLLING LOOKBACK WINDOW (Fixed Rolling Back)
+# ------------------------------------------------------
+total_days_available = len(derivatives_ts)
+
+if total_days_available < 30:
+    st.warning("Not enough data for rolling analysis (minimum 30 days required).")
+    st.stop()
+
+lookback_days = st.slider(
+    "Rolling Lookback Window (Days Used for Analysis)",
+    min_value=30,
+    max_value=total_days_available,
+    value=min(250, total_days_available)
+)
+
+# Use only most recent N days
+derivatives_ts = derivatives_ts.tail(lookback_days)
+
         if len(df) < 100:
             return None
 
