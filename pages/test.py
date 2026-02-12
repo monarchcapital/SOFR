@@ -1264,118 +1264,361 @@ if not price_df_filtered.empty:
         # --------------------------------------------------------------------------------------------------
 
 
-       # ==========================================================
-# SECTION 5 — HELPER FUNCTIONS (KEEP OUTSIDE EXPANDER)
-# ==========================================================
+        # --- Curve Snapshot (Section 5) ---
+        st.header("5. Curve Snapshot (Original vs. PCA Fair Value)")
+        
 
-def get_previous_date(df, current_date):
-    try:
-        prev_dates = df.index[df.index < current_date]
-        if len(prev_dates) == 0:
-            return None
-        return prev_dates.max()
-    except Exception:
-        return None
-
-
-def plot_snapshot(historical_df, derivative_type, current_date, pc_count):
-    # ⭐ KEEP YOUR FULL EXISTING FUNCTION CODE HERE
-    # DO NOT CHANGE IT
-    # DO NOT USE pass
-    pass
+        def get_previous_date(df, current_date):
+            """Return the last available previous date in df before current_date."""
+            try:
+                prev_dates = df.index[df.index < current_date]
+                if len(prev_dates) == 0:
+                    return None
+                return prev_dates.max()
+            except Exception:
+                return None
 
 
-def plot_shock_derivative_snapshot(historical_df, derivative_type, shocked_series, current_date, pc_count, title_suffix=""):
-    # ⭐ KEEP YOUR FULL EXISTING FUNCTION CODE HERE
-    pass
+        def plot_snapshot(historical_df, derivative_type, current_date, pc_count):
+            """Plots the market vs PCA fair value snapshot (today vs previous day)."""
+
+            try:
+                # 1. Today's snapshot
+                market_values = historical_df.loc[current_date].filter(like='(Original)')
+                pca_fair_values = historical_df.loc[current_date].filter(like='(PCA)')
+
+                # 2. Align and merge for plotting (today)
+                comparison = pd.DataFrame({
+                    'Original': market_values.values,
+                    'PCA Fair': pca_fair_values.values
+                }, index=[col.replace(f' (Original)', '').replace(f'{derivative_type}: ', '') for col in market_values.index])
+
+                if comparison.empty:
+                    st.info(f"No {derivative_type} data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
+                    return
+
+                # 3. Previous-day snapshot
+                prev_date = get_previous_date(historical_df, current_date)
+                prev_series = None
+                if prev_date is not None:
+                    try:
+                        prev_market = historical_df.loc[prev_date].filter(like='(Original)')
+                        prev_series = pd.Series(
+                            prev_market.values,
+                            index=[col.replace(f' (Original)', '').replace(f'{derivative_type}: ', '') for col in prev_market.index],
+                            name='Prev Day'
+                        )
+                    except KeyError:
+                        prev_series = None
+
+                # --- Plot the Derivative ---
+                fig, ax = plt.subplots(figsize=(15, 7))
+
+                ax.plot(
+                    comparison.index,
+                    comparison['Original'],
+                    label=f'vwap',
+                    marker='o',
+                    linestyle='-',
+                    linewidth=2.5,
+                    color='blue'
+                )
+                ax.plot(
+                    comparison.index,
+                    comparison['PCA Fair'],
+                    label=f'PCA',
+                    marker='x',
+                    linestyle='--',
+                    linewidth=2.5,
+                    color='red'
+                )
+
+                # Previous-day original curve, if available
+                if prev_series is not None:
+                    ax.plot(
+                        prev_series.index,
+                        prev_series.values,
+                        label=f'settle',
+                        marker='s',
+                        linestyle='-.',
+                        linewidth=2.0,
+                        color='green'
+                    )
+
+                mispricing = comparison['Original'] - comparison['PCA Fair']
+                ax.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7)
+
+                # Annotate the derivative with the largest absolute mispricing (today)
+                max_abs_mispricing = mispricing.abs().max()
+                if max_abs_mispricing > 0:
+                    mispricing_contract = mispricing.abs().idxmax()
+                    mispricing_value = mispricing.loc[mispricing_contract] * 100  # Rate %
+
+                    ax.annotate(
+                        f"Mispricing: {mispricing_value:.4f} Rate %",
+                        (mispricing_contract, comparison.loc[mispricing_contract]['Original']), 
+                        textcoords="offset points", 
+                        xytext=(0, 10), 
+                        ha='center', 
+                        fontsize=10, 
+                        bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
+                    )
+
+                ax.set_title(f'Market {derivative_type} vs. PCA Fair {derivative_type} (Today vs Prev Day)', fontsize=16)
+                ax.set_xlabel(f'{derivative_type} Contract')
+                ax.set_ylabel(f'{derivative_type} Value (Price Difference)')
+                ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+                ax.grid(True, linestyle=':', alpha=0.6)
+
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                st.pyplot(fig)
+
+                # Collect Section 5 figure for PDF download
+                SECTION5_FIGURES.append((fig, f"Section 5 – {derivative_type}"))
+
+                # --- Detailed Table ---
+                st.markdown(f"###### {derivative_type} Mispricing (Today vs PCA, with Prev Day if available)")
+                detailed_comparison = comparison.copy()
+                detailed_comparison.index.name = f'{derivative_type} Contract'
+                detailed_comparison['Mispricing (Rate %)'] = mispricing * 100 
+                detailed_comparison = detailed_comparison.rename(
+                    columns={'Original': f'Original {derivative_type}', 'PCA Fair': f'PCA Fair {derivative_type}'}
+                )
+
+                # Add previous-day original column if exists
+                if prev_series is not None:
+                    prev_align = prev_series.reindex(detailed_comparison.index)
+                    detailed_comparison[f'Prev Day Original {derivative_type} ({prev_date.strftime("%Y-%m-%d")})'] = prev_align.values
+
+                st.dataframe(
+                    detailed_comparison.style.format({
+                        f'Original {derivative_type}': "{:.4f}",
+                        f'PCA Fair {derivative_type}': "{:.4f}",
+                        'Mispricing (Rate %)': "{:.4f}"
+                    }), 
+                    use_container_width=True
+                )
+
+            except KeyError:
+                 st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for {derivative_type}. Please choose a different date within the historical range.")
+        def plot_shock_derivative_snapshot(historical_df, derivative_type, shocked_series, current_date, pc_count, title_suffix=""):
+            """
+            Plots Original vs PCA Fair vs Shock Scenario for a given derivative family
+            on the selected analysis date, using the same x-axis ordering as Section 5.
+            """
+            try:
+                row = historical_df.loc[current_date]
+            except KeyError:
+                st.info(f"No {derivative_type} data available for the selected analysis date in shock snapshot.")
+                return
+
+            market_values = row.filter(like='(Original)')
+            pca_fair_values = row.filter(like='(PCA)')
+
+            if market_values.empty or pca_fair_values.empty:
+                st.info(f"{derivative_type}: Missing Original or PCA Fair values for shock snapshot.")
+                return
+
+            # Build a clean instrument index WITHOUT tenor prefixes (e.g. '3M Spread: ')
+            base_index = []
+            for col in market_values.index:
+                core = col.replace(' (Original)', '')
+                if ': ' in core:
+                    core = core.split(': ', 1)[1]
+                base_index.append(core)
+
+            comparison = pd.DataFrame(
+                {
+                    'Original': market_values.values,
+                    'PCA Fair': pca_fair_values.values,
+                },
+                index=base_index,
+            )
+
+            if shocked_series is None or len(shocked_series) == 0:
+                st.info(f"No shocked series supplied for {derivative_type} in shock snapshot.")
+                return
+
+            shocked_aligned = shocked_series.reindex(comparison.index)
+            if shocked_aligned.isna().all():
+                st.info(f"Shocked series for {derivative_type} could not be aligned to instruments.")
+                return
+
+            comparison['Shock Scenario'] = shocked_aligned.values
+
+            fig, ax = plt.subplots(figsize=(15, 7))
+            ax.plot(comparison.index, comparison['Original'], label=f'{derivative_type} Original', marker='o')
+            ax.plot(comparison.index, comparison['PCA Fair'], label=f'{derivative_type} PCA Fair ({pc_count} PCs)', marker='x', linestyle='--')
+            ax.plot(comparison.index, comparison['Shock Scenario'], label=f'{derivative_type} Shock {title_suffix}', marker='s', linestyle='-.')
+
+            ax.set_title(f'{derivative_type} Snapshot under Shock {title_suffix}')
+            ax.set_xlabel('Instrument')
+            ax.set_ylabel('Value (Price Points)')
+            ax.grid(True, linestyle=':', alpha=0.6)
+            ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            # Collect Section 9 shock figure for PDF download
+            SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
 
 
-# ==========================================================
-# SECTION 5 — UI (WRAPPED IN EXPANDER)
-# ==========================================================
+        # --- 5.1 Outright Price/Rate Curve Snapshot ---
 
-with st.expander("5. Curve Snapshot (Original vs PCA Fair Value)", expanded=True):
+        st.subheader("5.1 Outright Price/Rate Curve Snapshot")
+        try:
+            # 1. Get the snapshot for the selected date
+            market_prices = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
+            pca_fair_prices = historical_outrights_df.loc[analysis_dt].filter(like='(PCA)')
 
-    # ------------------------------------------------------
-    # 5.1 OUTRIGHT CURVE SNAPSHOT
-    # ------------------------------------------------------
-    st.subheader("5.1 Outright Price/Rate Curve Snapshot")
+            # 2. Align and merge for plotting
+            curve_comparison = pd.DataFrame({
+                'Original': market_prices.values,
+                'PCA Fair': pca_fair_prices.values
+            }, index=[col.replace(' (Original)', '') for col in market_prices.index])
 
-    try:
-        market_prices = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
-        pca_fair_prices = historical_outrights_df.loc[analysis_dt].filter(like='(PCA)')
+            # --- Plot the Curve (Today vs Previous Day) ---
+            fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
 
-        curve_comparison = pd.DataFrame({
-            'Original': market_prices.values,
-            'PCA Fair': pca_fair_prices.values
-        }, index=[col.replace(' (Original)', '') for col in market_prices.index])
+            # Today
+            ax_curve.plot(
+                curve_comparison.index,
+                curve_comparison['Original'],
+                label=f'Today Original Price ({analysis_dt.strftime("%Y-%m-%d")})',
+                marker='o',
+                linestyle='-',
+                linewidth=2.5,
+                color='blue'
+            )
+            ax_curve.plot(
+                curve_comparison.index,
+                curve_comparison['PCA Fair'],
+                label=f'Today PCA Fair Price ({pc_count} PCs)',
+                marker='x',
+                linestyle='--',
+                linewidth=2.5,
+                color='red'
+            )
 
-        fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
+            # Previous day
+            prev_dt = get_previous_date(historical_outrights_df, analysis_dt)
+            if prev_dt is not None:
+                try:
+                    prev_prices = historical_outrights_df.loc[prev_dt].filter(like='(Original)')
+                    prev_cmp = pd.Series(
+                        prev_prices.values,
+                        index=[col.replace(' (Original)', '') for col in prev_prices.index]
+                    )
+                    ax_curve.plot(
+                        prev_cmp.index,
+                        prev_cmp.values,
+                        label=f'Prev Day Original Price ({prev_dt.strftime("%Y-%m-%d")})',
+                        marker='s',
+                        linestyle='-.',
+                        linewidth=2.0,
+                        color='green'
+                    )
+                except KeyError:
+                    pass
 
-        ax_curve.plot(
-            curve_comparison.index,
-            curve_comparison['Original'],
-            label="Today Original Price",
-            marker='o'
-        )
+            ax_curve.set_title('Market Price Curve vs. PCA Fair Value Curve (Price = 100 - Rate, Today vs Prev Day)', fontsize=16)
+            ax_curve.set_xlabel('Contract Maturity')
+            ax_curve.set_ylabel('Price (100 - Rate)')
+            ax_curve.legend(loc='upper right')
+            ax_curve.grid(True, linestyle=':', alpha=0.6)
 
-        ax_curve.plot(
-            curve_comparison.index,
-            curve_comparison['PCA Fair'],
-            label="PCA Fair Price",
-            marker='x',
-            linestyle='--'
-        )
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            st.pyplot(fig_curve)
 
-        st.pyplot(fig_curve)
+            # Collect Outright curve figure for Section 5 PDF
+            SECTION5_FIGURES.append((fig_curve, "Section 5 – Outright Curve"))
 
-    except KeyError:
-        st.error("Selected analysis date not present.")
+            # --- Detailed Contract Price/Rate Table (Outright) ---
+            st.markdown("###### Outright Price and Rate Mispricing")
+            detailed_comparison = curve_comparison.copy()
+            detailed_comparison.index.name = 'Contract'
+            detailed_comparison['Original Rate (%)'] = 100.0 - detailed_comparison['Original']
+            detailed_comparison['PCA Fair Rate (%)'] = 100.0 - detailed_comparison['PCA Fair']
+            detailed_comparison['Mispricing (Rate %)'] = (detailed_comparison['Original'] - detailed_comparison['PCA Fair']) * 100
 
+            detailed_comparison = detailed_comparison.rename(
+                columns={'Original': 'Original Price', 'PCA Fair': 'PCA Fair Price'}
+            )
+            detailed_comparison = detailed_comparison[[
+                'Original Price', 'Original Rate (%)', 'PCA Fair Price', 'PCA Fair Rate (%)', 'Mispricing (Rate %)'
+            ]]
 
-    # ------------------------------------------------------
-    # 3M DERIVATIVES
-    # ------------------------------------------------------
-    st.subheader("5.2 3M Spread Snapshot")
-    plot_snapshot(historical_spreads_3M_df, "3M Spread", analysis_dt, pc_count)
+            st.dataframe(
+                detailed_comparison.style.format({
+                    'Original Price': "{:.4f}",
+                    'PCA Fair Price': "{:.4f}",
+                    'Original Rate (%)': "{:.4f}",
+                    'PCA Fair Rate (%)': "{:.4f}",
+                    'Mispricing (Rate %)': "{:.4f}"
+                }), 
+                use_container_width=True
+            )
+        except KeyError:
+            st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Outright Prices. Please choose a different date within the historical range.")
+        # --------------------------- 3-Month (k=1) Derivatives ---------------------------
+        # --- 5.2 Spread Snapshot (3M) ---
+        st.subheader("5.2 3M Spread Snapshot (k=1, e.g., Z25-H26)")
+        plot_snapshot(historical_spreads_3M_df, "3M Spread", analysis_dt, pc_count)
 
-    if not historical_butterflies_3M_df.empty:
-        st.subheader("5.3 3M Butterfly Snapshot")
-        plot_snapshot(historical_butterflies_3M_df, "3M Butterfly", analysis_dt, pc_count)
+        # --- 5.3 Butterfly (Fly) Snapshot (3M) ---
+        if not historical_butterflies_3M_df.empty:
+            st.subheader("5.3 3M Butterfly (Fly) Snapshot (k=1, e.g., Z25-2xH26+M26)")
+            plot_snapshot(historical_butterflies_3M_df, "3M Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 3 or more) to calculate and plot 3M butterfly snapshot.")
+            
+        # --- 5.4 Double Butterfly (DBF) Snapshot (3M) --- 
+        if not historical_double_butterflies_3M_df.empty:
+            st.subheader(r"5.4 3M Double Butterfly (DBF) Snapshot ($k=1$, e.g., $Z25-3 \cdot H26+3 \cdot M26-U26$)")
+            plot_snapshot(historical_double_butterflies_3M_df, "3M Double Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 4 or more) to calculate and plot 3M double butterfly snapshot.")
+            
+        # --------------------------- 6-Month (k=2) Derivatives ---------------------------
+        # --- 5.5 Spread Snapshot (6M) ---
+        st.subheader("5.5 6M Spread Snapshot (k=2, e.g., Z25-M26)")
+        plot_snapshot(historical_spreads_6M_df, "6M Spread", analysis_dt, pc_count)
+        
+        # --- 5.6 Butterfly (Fly) Snapshot (6M) ---
+        if not historical_butterflies_6M_df.empty:
+            st.subheader("5.6 6M Butterfly (Fly) Snapshot (k=2, e.g., Z25-2xM26+Z26)")
+            plot_snapshot(historical_butterflies_6M_df, "6M Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 5 or more) to calculate and plot 6M butterfly snapshot.")
+            
+        # --- 5.7 Double Butterfly (DBF) Snapshot (6M) --- 
+        if not historical_double_butterflies_6M_df.empty:
+            st.subheader(r"5.7 6M Double Butterfly (DBF) Snapshot ($k=2$, e.g., $Z25-3 \cdot M26+3 \cdot Z26-M27$)")
+            plot_snapshot(historical_double_butterflies_6M_df, "6M Double Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 7 or more) to calculate and plot 6M double butterfly snapshot.")
 
-    if not historical_double_butterflies_3M_df.empty:
-        st.subheader("5.4 3M Double Butterfly Snapshot")
-        plot_snapshot(historical_double_butterflies_3M_df, "3M Double Butterfly", analysis_dt, pc_count)
+        # --------------------------- 12-Month (k=4) Derivatives ---------------------------
+        # --- 5.8 Spread Snapshot (12M) ---
+        st.subheader("5.8 12M Spread Snapshot (k=4, e.g., Z25-Z26)")
+        plot_snapshot(historical_spreads_12M_df, "12M Spread", analysis_dt, pc_count)
 
+        # --- 5.9 Butterfly (Fly) Snapshot (12M) ---
+        if not historical_butterflies_12M_df.empty:
+            st.subheader("5.9 12M Butterfly (Fly) Snapshot (k=4, e.g., Z25-2xZ26+Z27)")
+            plot_snapshot(historical_butterflies_12M_df, "12M Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 9 or more) to calculate and plot 12M butterfly snapshot.")
 
-    # ------------------------------------------------------
-    # 6M DERIVATIVES
-    # ------------------------------------------------------
-    st.subheader("5.5 6M Spread Snapshot")
-    plot_snapshot(historical_spreads_6M_df, "6M Spread", analysis_dt, pc_count)
-
-    if not historical_butterflies_6M_df.empty:
-        st.subheader("5.6 6M Butterfly Snapshot")
-        plot_snapshot(historical_butterflies_6M_df, "6M Butterfly", analysis_dt, pc_count)
-
-    if not historical_double_butterflies_6M_df.empty:
-        st.subheader("5.7 6M Double Butterfly Snapshot")
-        plot_snapshot(historical_double_butterflies_6M_df, "6M Double Butterfly", analysis_dt, pc_count)
-
-
-    # ------------------------------------------------------
-    # 12M DERIVATIVES
-    # ------------------------------------------------------
-    st.subheader("5.8 12M Spread Snapshot")
-    plot_snapshot(historical_spreads_12M_df, "12M Spread", analysis_dt, pc_count)
-
-    if not historical_butterflies_12M_df.empty:
-        st.subheader("5.9 12M Butterfly Snapshot")
-        plot_snapshot(historical_butterflies_12M_df, "12M Butterfly", analysis_dt, pc_count)
-
-    if not historical_double_butterflies_12M_df.empty:
-        st.subheader("5.10 12M Double Butterfly Snapshot")
-        plot_snapshot(historical_double_butterflies_12M_df, "12M Double Butterfly", analysis_dt, pc_count)
+        # --- 5.10 Double Butterfly (DBF) Snapshot (12M) --- 
+        if not historical_double_butterflies_12M_df.empty:
+            st.subheader(r"5.10 12M Double Butterfly (DBF) Snapshot ($k=4$, e.g., $Z25-3 \cdot Z26+3 \cdot Z27-Z28$)")
+            plot_snapshot(historical_double_butterflies_12M_df, "12M Double Butterfly", analysis_dt, pc_count)
+        else:
+            st.info("Not enough contracts (need 13 or more) to calculate and plot 12M double butterfly snapshot.")
 
         
         # --------------------------- Download all Section 5 snapshots as PDF ---------------------------
