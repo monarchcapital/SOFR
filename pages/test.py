@@ -1265,7 +1265,13 @@ if not price_df_filtered.empty:
 
 
         # --- Curve Snapshot (Section 5) ---
-        st.header("5. Curve Snapshot (Original vs. PCA Fair Value)")
+        with st.expander("5. Curve Snapshot (Original vs PCA Fair Value)", expanded=True):
+    
+    st.subheader("5.1 Outright Price/Rate Curve Snapshot")
+
+    # ---- ALL YOUR EXISTING SECTION 5 CODE ----
+    # paste everything here unchanged
+
         
 
         def get_previous_date(df, current_date):
