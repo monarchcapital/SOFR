@@ -3308,13 +3308,15 @@ else:
     # ==========================================================
 # ==========================================================
 # ==========================================================
-# 5.e — TRADE RELATIONSHIP EXPLORER (Correlation + Lag + Granger)
+# ==========================================================
+# 5.e — TRADE RELATIONSHIP EXPLORER
+# (Rolling Lookback + Correlation + Lead/Lag + Granger)
 # ==========================================================
 
 st.subheader("5.e Trade Relationship Explorer (Correlation + Lead/Lag + Granger Causality)")
 
-from statsmodels.tsa.stattools import grangercausalitytests
 import numpy as np
+from statsmodels.tsa.stattools import grangercausalitytests
 
 try:
 
@@ -3352,6 +3354,25 @@ try:
         st.stop()
 
     # ------------------------------------------------------
+    # ROLLING LOOKBACK WINDOW (FIXED ROLLING BACK)
+    # ------------------------------------------------------
+    total_days_available = len(derivatives_ts)
+
+    if total_days_available < 30:
+        st.warning("Not enough data for rolling analysis (minimum 30 days required).")
+        st.stop()
+
+    lookback_days = st.slider(
+        "Rolling Lookback Window (Days Used for Analysis)",
+        min_value=30,
+        max_value=total_days_available,
+        value=min(250, total_days_available)
+    )
+
+    # use most recent N days
+    derivatives_ts = derivatives_ts.tail(lookback_days)
+
+    # ------------------------------------------------------
     # TRADE SELECTION
     # ------------------------------------------------------
     trade_selected = st.selectbox(
@@ -3378,9 +3399,8 @@ try:
 
     with col3:
         granger_p_threshold = st.slider(
-            "Max Granger p-value (predictive filter)",
-            0.01, 1.0, 0.05, 0.01,
-            help="Lower p-value = stronger predictive relationship"
+            "Max Granger p-value",
+            0.01, 1.0, 0.05, 0.01
         )
 
     # ------------------------------------------------------
@@ -3403,7 +3423,7 @@ try:
         lags = lags[mask]
 
         idx = np.argmax(np.abs(corr))
-        return corr[idx]/len(x), lags[idx]
+        return corr[idx] / len(x), lags[idx]
 
     # ------------------------------------------------------
     # GRANGER CAUSALITY TEST
@@ -3411,25 +3431,6 @@ try:
     def granger_test(trade_series, other_series, max_lag=5):
 
         df = pd.concat([trade_series, other_series], axis=1).dropna()
-        # ------------------------------------------------------
-# ROLLING LOOKBACK WINDOW (Fixed Rolling Back)
-# ------------------------------------------------------
-total_days_available = len(derivatives_ts)
-
-if total_days_available < 30:
-    st.warning("Not enough data for rolling analysis (minimum 30 days required).")
-    st.stop()
-
-lookback_days = st.slider(
-    "Rolling Lookback Window (Days Used for Analysis)",
-    min_value=30,
-    max_value=total_days_available,
-    value=min(250, total_days_available)
-)
-
-# Use only most recent N days
-derivatives_ts = derivatives_ts.tail(lookback_days)
-
         if len(df) < 100:
             return None
 
@@ -3470,7 +3471,7 @@ derivatives_ts = derivatives_ts.tail(lookback_days)
             trade_series, other_series, max_lag_days
         )
 
-        # granger predictive test
+        # granger test
         p_val = granger_test(trade_series, other_series, max_lag_days)
 
         if best_lag > 0:
@@ -3525,12 +3526,10 @@ derivatives_ts = derivatives_ts.tail(lookback_days)
         st.metric("Filtered Relationships", len(filtered))
 
         st.caption("""
-Relationship Interpretation:
-
+• Uses rolling lookback window from selected date range  
 • Correlation → co-movement strength  
 • Lag → who moves first  
-• Granger p-value → predictive power (lower = stronger)  
-• Predictive Strength shows statistical confidence
+• Granger p-value → predictive power (lower = stronger)
 """)
 
         st.dataframe(
@@ -3543,6 +3542,7 @@ Relationship Interpretation:
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
+
 
 
 
