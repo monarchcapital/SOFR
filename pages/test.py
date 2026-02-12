@@ -3126,104 +3126,57 @@ else:
 # ======================
 # END SECTION 12
 # ==========================================================
-# 5.d — FILTERED MISPRICING TABLE + FAMILY FILTER + HEDGES
+# ==========================================================
+# 5.d — MISPRICING FILTER + FAMILY SELECTION + HEDGE
 # ==========================================================
 
-st.subheader("5.d Mispricing Filter + Family Selection + Hedge Suggestions")
-
-# Requires:
-# mispricing_series  -> from calculate_derivative_mispricings()
-# Sigma_Raw_df       -> PCA reconstructed covariance from Section 7
+st.subheader("5.d Mispricing Filter + Hedge Suggestions")
 
 if mispricing_series is not None and len(mispricing_series) > 0:
 
-    # ------------------------------------------------------
-    # BUILD MISPRICING DATAFRAME
-    # ------------------------------------------------------
     mispricing_df = mispricing_series.reset_index()
     mispricing_df.columns = ["Instrument", "Mispricing (Rate %)"]
 
-    # --- classify derivative family ---
+    # classify derivative family
     def classify_family(name):
+        if "3M" in name: tenor = "3M"
+        elif "6M" in name: tenor = "6M"
+        elif "12M" in name: tenor = "12M"
+        else: tenor = "Other"
 
-        if "3M" in name:
-            tenor = "3M"
-        elif "6M" in name:
-            tenor = "6M"
-        elif "12M" in name:
-            tenor = "12M"
-        else:
-            tenor = "Other"
+        if "Double Fly" in name: typ = "Double Fly"
+        elif "Fly" in name: typ = "Fly"
+        elif "Spread" in name: typ = "Spread"
+        else: typ = "Other"
 
-        if "Double Fly" in name:
-            typ = "Double Fly"
-        elif "Fly" in name:
-            typ = "Fly"
-        elif "Spread" in name:
-            typ = "Spread"
-        else:
-            typ = "Other"
-
-        return f"{tenor} {typ}".strip()
+        return f"{tenor} {typ}"
 
     mispricing_df["Family"] = mispricing_df["Instrument"].apply(classify_family)
     mispricing_df["Abs Mispricing"] = mispricing_df["Mispricing (Rate %)"].abs()
 
-    # ------------------------------------------------------
-    # FILTER CONTROLS
-    # ------------------------------------------------------
     col1, col2 = st.columns(2)
 
-    # --- Threshold slider ---
     with col1:
-        max_range = float(np.nanmax(np.abs(mispricing_series.values))) if len(mispricing_series) > 0 else 5.0
+        max_range = float(np.nanmax(np.abs(mispricing_series.values)))
+        threshold_rate = st.slider("Min Absolute Mispricing (Rate %)", 0.0, max_range, 0.10, 0.01)
 
-        threshold_rate = st.slider(
-            "Minimum Absolute Mispricing Threshold (Rate %)",
-            min_value=0.0,
-            max_value=max_range if max_range > 0 else 5.0,
-            value=min(0.10, max_range) if max_range > 0 else 0.10,
-            step=0.01
-        )
-
-    # --- Family filter selector ---
     with col2:
-        available_families = sorted(mispricing_df["Family"].unique().tolist())
+        families = sorted(mispricing_df["Family"].unique())
+        selected_families = st.multiselect("Derivative Families", families, default=families)
 
-        selected_families = st.multiselect(
-            "Select Derivative Families",
-            options=available_families,
-            default=available_families,
-            help="Filter by tenor and derivative type"
-        )
-
-    # ------------------------------------------------------
-    # APPLY FILTERS
-    # ------------------------------------------------------
     filtered_df = mispricing_df[
         (mispricing_df["Abs Mispricing"] >= threshold_rate) &
         (mispricing_df["Family"].isin(selected_families))
     ].sort_values("Abs Mispricing", ascending=False)
 
-    # ------------------------------------------------------
-    # MINIMUM VARIANCE HEDGE ENGINE (PCA COVARIANCE BASED)
-    # ------------------------------------------------------
+    # minimum variance hedge
     def find_best_hedge(trade_label, Sigma):
-        """
-        Minimum Variance Hedge:
-            k* = Cov(T,H) / Var(H)
-            Residual Var = Var(T) - k*Cov(T,H)
-        """
-        if Sigma is None or Sigma.empty:
-            return None, None, None, None
-
-        if trade_label not in Sigma.index:
+        if Sigma is None or Sigma.empty or trade_label not in Sigma.index:
             return None, None, None, None
 
         Var_T = Sigma.loc[trade_label, trade_label]
         best_residual = np.inf
-        best_hedge = None
-        best_k = None
+        best_hedge, best_k = None, None
 
         for hedge in Sigma.columns:
             if hedge == trade_label:
@@ -3236,8 +3189,7 @@ if mispricing_series is not None and len(mispricing_series) > 0:
                 continue
 
             k = Cov_TH / Var_H
-            residual_var = Var_T - k * Cov_TH
-            residual_var = max(residual_var, 0)
+            residual_var = max(Var_T - k * Cov_TH, 0)
 
             if residual_var < best_residual:
                 best_residual = residual_var
@@ -3252,90 +3204,48 @@ if mispricing_series is not None and len(mispricing_series) > 0:
 
         return best_hedge, abs(best_k), residual_vol, action
 
-    # ------------------------------------------------------
-    # COMPUTE HEDGE SUGGESTIONS
-    # ------------------------------------------------------
-    hedge_list = []
-    hedge_ratio_list = []
-    residual_list = []
-    action_list = []
+    hedge_list, ratio_list, residual_list, action_list = [], [], [], []
 
     for instr in filtered_df["Instrument"]:
-
-        if 'Sigma_Raw_df' in globals() and not Sigma_Raw_df.empty:
+        if 'Sigma_Raw_df' in globals():
             hedge, k, resid, action = find_best_hedge(instr, Sigma_Raw_df)
         else:
             hedge, k, resid, action = None, None, None, None
 
-        hedge_list.append(hedge if hedge else "N/A")
-        hedge_ratio_list.append(k if k else np.nan)
-        residual_list.append(resid if resid else np.nan)
-        action_list.append(action if action else "N/A")
+        hedge_list.append(hedge or "N/A")
+        ratio_list.append(k or np.nan)
+        residual_list.append(resid or np.nan)
+        action_list.append(action or "N/A")
 
     filtered_df["Suggested Hedge"] = hedge_list
-    filtered_df["Hedge Ratio |k*|"] = hedge_ratio_list
+    filtered_df["Hedge Ratio"] = ratio_list
     filtered_df["Hedge Action"] = action_list
-    filtered_df["Residual Risk After Hedge (Rate %)"] = residual_list
+    filtered_df["Residual Risk (%)"] = residual_list
 
-    # ------------------------------------------------------
-    # DISPLAY OUTPUT
-    # ------------------------------------------------------
     if filtered_df.empty:
-        st.info("No instruments match selected filters.")
+        st.info("No instruments match filters.")
     else:
-        st.metric("Filtered Instruments", len(filtered_df))
-
-        st.caption("""
-Hedge Basis: **Minimum Variance Hedge using PCA Risk Model**
-
-• PCA reconstructed covariance matrix  
-• Hedge ratio: k* = Cov(trade, hedge) / Var(hedge)  
-• Hedge selected to minimize residual volatility  
-• Residual risk shows remaining exposure after hedge
-""")
-
-        st.dataframe(
-            filtered_df.drop(columns=["Abs Mispricing"]).style.format({
-                "Mispricing (Rate %)": "{:.4f}",
-                "Hedge Ratio |k*|": "{:.4f}",
-                "Residual Risk After Hedge (Rate %)": "{:.4f}"
-            }),
-            use_container_width=True
-        )
-
-else:
-    st.info("Mispricing data not available.")
-    # ==========================================================
-# ==========================================================
-# ==========================================================
-# ==========================================================
+        st.dataframe(filtered_df.drop(columns=["Abs Mispricing"]), use_container_width=True)
+        # ==========================================================
 # 5.e — TRADE RELATIONSHIP EXPLORER
-# (Rolling Lookback + Correlation + Lead/Lag + Granger)
 # ==========================================================
 
-st.subheader("5.e Trade Relationship Explorer (Correlation + Lead/Lag + Granger Causality)")
+st.subheader("5.e Trade Relationship Explorer (Correlation + Lag + Granger)")
 
-import numpy as np
 from statsmodels.tsa.stattools import grangercausalitytests
 
 try:
 
-    # ------------------------------------------------------
-    # BUILD MASTER DERIVATIVE TIMESERIES MATRIX
-    # ------------------------------------------------------
+    # build derivative time series
     def extract_original_columns(df):
         if df is None or df.empty:
             return pd.DataFrame()
-
         cols = [c for c in df.columns if "(Original)" in c]
-        if not cols:
-            return pd.DataFrame()
-
         clean = df[cols].copy()
         clean.columns = [c.replace(" (Original)", "") for c in cols]
         return clean
 
-    all_derivatives_list = [
+    derivatives_ts = pd.concat([
         extract_original_columns(historical_spreads_3M_df),
         extract_original_columns(historical_butterflies_3M_df),
         extract_original_columns(historical_double_butterflies_3M_df),
@@ -3345,203 +3255,91 @@ try:
         extract_original_columns(historical_spreads_12M_df),
         extract_original_columns(historical_butterflies_12M_df),
         extract_original_columns(historical_double_butterflies_12M_df),
-    ]
-
-    derivatives_ts = pd.concat(all_derivatives_list, axis=1).dropna(axis=1, how="all")
+    ], axis=1).dropna(axis=1, how="all")
 
     if derivatives_ts.empty:
-        st.info("No derivative time series available.")
         st.stop()
 
-    # ------------------------------------------------------
-    # ROLLING LOOKBACK WINDOW (FIXED ROLLING BACK)
-    # ------------------------------------------------------
-    total_days_available = len(derivatives_ts)
-
-    if total_days_available < 30:
-        st.warning("Not enough data for rolling analysis (minimum 30 days required).")
-        st.stop()
-
-    lookback_days = st.slider(
-        "Rolling Lookback Window (Days Used for Analysis)",
-        min_value=30,
-        max_value=total_days_available,
-        value=min(250, total_days_available)
-    )
-
-    # use most recent N days
+    # rolling lookback
+    total_days = len(derivatives_ts)
+    lookback_days = st.slider("Rolling Lookback Days", 30, total_days, min(250,total_days))
     derivatives_ts = derivatives_ts.tail(lookback_days)
 
-    # ------------------------------------------------------
-    # TRADE SELECTION
-    # ------------------------------------------------------
-    trade_selected = st.selectbox(
-        "Select Trade",
-        sorted(derivatives_ts.columns.tolist())
-    )
+    trade_selected = st.selectbox("Select Trade", sorted(derivatives_ts.columns))
 
-    # ------------------------------------------------------
-    # FILTER CONTROLS
-    # ------------------------------------------------------
     col1, col2, col3 = st.columns(3)
-
     with col1:
-        corr_threshold = st.slider(
-            "Min |Correlation|",
-            0.0, 1.0, 0.50, 0.05
-        )
-
+        corr_threshold = st.slider("Min |Correlation|",0.0,1.0,0.5,0.05)
     with col2:
-        max_lag_days = st.slider(
-            "Max Lead/Lag Days",
-            1, 20, 5
-        )
-
+        max_lag_days = st.slider("Max Lag Days",1,20,5)
     with col3:
-        granger_p_threshold = st.slider(
-            "Max Granger p-value",
-            0.01, 1.0, 0.05, 0.01
-        )
+        granger_threshold = st.slider("Max Granger p-value",0.01,1.0,0.05,0.01)
 
-    # ------------------------------------------------------
-    # FFT LEAD/LAG DETECTION
-    # ------------------------------------------------------
-    def compute_lead_lag_fft(trade_series, other_series, max_lag):
+    # FFT lag
+    def compute_lead_lag_fft(x,y,max_lag):
+        df = pd.concat([x,y],axis=1).dropna()
+        if len(df)<50: return None,0
+        x=(df.iloc[:,0]-df.iloc[:,0].mean())/df.iloc[:,0].std()
+        y=(df.iloc[:,1]-df.iloc[:,1].mean())/df.iloc[:,1].std()
+        corr=np.correlate(x,y,mode="full")
+        lags=np.arange(-len(x)+1,len(x))
+        mask=(lags>=-max_lag)&(lags<=max_lag)
+        corr,lags=corr[mask],lags[mask]
+        i=np.argmax(np.abs(corr))
+        return corr[i]/len(x),lags[i]
 
-        df = pd.concat([trade_series, other_series], axis=1).dropna()
-        if len(df) < 50:
-            return None, 0
-
-        x = (df.iloc[:,0] - df.iloc[:,0].mean()) / df.iloc[:,0].std()
-        y = (df.iloc[:,1] - df.iloc[:,1].mean()) / df.iloc[:,1].std()
-
-        corr = np.correlate(x, y, mode="full")
-        lags = np.arange(-len(x)+1, len(x))
-
-        mask = (lags >= -max_lag) & (lags <= max_lag)
-        corr = corr[mask]
-        lags = lags[mask]
-
-        idx = np.argmax(np.abs(corr))
-        return corr[idx] / len(x), lags[idx]
-
-    # ------------------------------------------------------
-    # GRANGER CAUSALITY TEST
-    # ------------------------------------------------------
-    def granger_test(trade_series, other_series, max_lag=5):
-
-        df = pd.concat([trade_series, other_series], axis=1).dropna()
-        if len(df) < 100:
-            return None
-
+    # granger
+    def granger_test(x,y,max_lag):
+        df=pd.concat([x,y],axis=1).dropna()
+        if len(df)<100: return None
         try:
-            result = grangercausalitytests(df, maxlag=max_lag, verbose=False)
-            pvals = [result[i+1][0]["ssr_ftest"][1] for i in range(max_lag)]
-            return min(pvals)
+            res=grangercausalitytests(df,maxlag=max_lag,verbose=False)
+            return min([res[i+1][0]["ssr_ftest"][1] for i in range(max_lag)])
         except:
             return None
 
-    # ------------------------------------------------------
-    # COMPUTE RELATIONSHIPS
-    # ------------------------------------------------------
-    trade_series_full = derivatives_ts[trade_selected].dropna()
-    aligned_df = derivatives_ts.loc[trade_series_full.index]
+    trade_series=derivatives_ts[trade_selected].dropna()
+    results=[]
 
-    results = []
+    for col in derivatives_ts.columns:
+        if col==trade_selected: continue
 
-    for col in aligned_df.columns:
+        other=derivatives_ts[col]
+        idx=trade_series.index.intersection(other.index)
+        if len(idx)<100: continue
 
-        if col == trade_selected:
-            continue
+        t=trade_series.loc[idx]
+        o=other.loc[idx]
 
-        other_series = aligned_df[col].dropna()
-        common_idx = trade_series_full.index.intersection(other_series.index)
+        corr=t.corr(o)
+        lag_corr,lag=compute_lead_lag_fft(t,o,max_lag_days)
+        pval=granger_test(t,o,max_lag_days)
 
-        if len(common_idx) < 100:
-            continue
-
-        trade_series = trade_series_full.loc[common_idx]
-        other_series = other_series.loc[common_idx]
-
-        # correlation
-        corr = trade_series.corr(other_series)
-
-        # lag detection
-        best_corr, best_lag = compute_lead_lag_fft(
-            trade_series, other_series, max_lag_days
-        )
-
-        # granger test
-        p_val = granger_test(trade_series, other_series, max_lag_days)
-
-        if best_lag > 0:
-            relation = "Trade Leads"
-        elif best_lag < 0:
-            relation = "Trade Follows"
-        else:
-            relation = "Simultaneous"
-
-        if p_val is not None:
-            if p_val < 0.01:
-                predict_strength = "Very Strong"
-            elif p_val < 0.05:
-                predict_strength = "Predictive"
-            else:
-                predict_strength = "Weak"
-        else:
-            predict_strength = "N/A"
+        relation="Trade Leads" if lag>0 else "Trade Follows" if lag<0 else "Simultaneous"
 
         results.append({
-            "Trade": trade_selected,
-            "Instrument": col,
-            "Correlation": corr,
-            "Lag (Days)": best_lag,
-            "Relationship": relation,
-            "Granger p-value": p_val,
-            "Predictive Strength": predict_strength,
-            "Abs Correlation": abs(corr) if corr is not None else 0
+            "Trade":trade_selected,
+            "Instrument":col,
+            "Correlation":corr,
+            "Lag":lag,
+            "Relationship":relation,
+            "Granger p":pval,
+            "AbsCorr":abs(corr)
         })
 
-    if not results:
-        st.info("No relationships found.")
-        st.stop()
+    df=pd.DataFrame(results)
 
-    df_results = pd.DataFrame(results)
+    filtered=df[
+        (df["AbsCorr"]>=corr_threshold)&
+        ((df["Granger p"].isna())|(df["Granger p"]<=granger_threshold))
+    ].sort_values("AbsCorr",ascending=False)
 
-    # ------------------------------------------------------
-    # APPLY FILTERS
-    # ------------------------------------------------------
-    filtered = df_results[
-        (df_results["Abs Correlation"] >= corr_threshold) &
-        ((df_results["Granger p-value"].isna()) |
-         (df_results["Granger p-value"] <= granger_p_threshold))
-    ].sort_values("Abs Correlation", ascending=False)
-
-    # ------------------------------------------------------
-    # DISPLAY
-    # ------------------------------------------------------
-    if filtered.empty:
-        st.info("No instruments match filters.")
-    else:
-        st.metric("Filtered Relationships", len(filtered))
-
-        st.caption("""
-• Uses rolling lookback window from selected date range  
-• Correlation → co-movement strength  
-• Lag → who moves first  
-• Granger p-value → predictive power (lower = stronger)
-""")
-
-        st.dataframe(
-            filtered.drop(columns=["Abs Correlation"]).style.format({
-                "Correlation": "{:.3f}",
-                "Granger p-value": "{:.4f}"
-            }),
-            use_container_width=True
-        )
+    st.dataframe(filtered.drop(columns="AbsCorr"),use_container_width=True)
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
+
+
 
 
 
