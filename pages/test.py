@@ -3307,10 +3307,14 @@ else:
     st.info("Mispricing data not available.")
     # ==========================================================
 # ==========================================================
-# 5.e — TRADE CORRELATION + LEAD/LAG DETECTION
+# ==========================================================
+# 5.e — TRADE RELATIONSHIP EXPLORER (Correlation + Lag + Granger)
 # ==========================================================
 
-st.subheader("5.e Trade Correlation Explorer with Lead/Lag Detection")
+st.subheader("5.e Trade Relationship Explorer (Correlation + Lead/Lag + Granger Causality)")
+
+from statsmodels.tsa.stattools import grangercausalitytests
+import numpy as np
 
 try:
 
@@ -3341,82 +3345,84 @@ try:
         extract_original_columns(historical_double_butterflies_12M_df),
     ]
 
-    derivatives_ts = pd.concat(all_derivatives_list, axis=1)
-    derivatives_ts = derivatives_ts.dropna(axis=1, how="all")
+    derivatives_ts = pd.concat(all_derivatives_list, axis=1).dropna(axis=1, how="all")
 
     if derivatives_ts.empty:
-        st.info("No derivative time series available for correlation analysis.")
+        st.info("No derivative time series available.")
         st.stop()
 
     # ------------------------------------------------------
     # TRADE SELECTION
     # ------------------------------------------------------
     trade_selected = st.selectbox(
-        "Select Trade (Derivative Instrument)",
+        "Select Trade",
         sorted(derivatives_ts.columns.tolist())
     )
 
     # ------------------------------------------------------
     # FILTER CONTROLS
     # ------------------------------------------------------
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         corr_threshold = st.slider(
-            "Minimum Absolute Correlation",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.50,
-            step=0.05
+            "Min |Correlation|",
+            0.0, 1.0, 0.50, 0.05
         )
 
     with col2:
         max_lag_days = st.slider(
-            "Max Lead/Lag Days to Test",
-            min_value=1,
-            max_value=20,
-            value=5,
-            help="Tests correlation with time shifts ±lag"
+            "Max Lead/Lag Days",
+            1, 20, 5
+        )
+
+    with col3:
+        granger_p_threshold = st.slider(
+            "Max Granger p-value (predictive filter)",
+            0.01, 1.0, 0.05, 0.01,
+            help="Lower p-value = stronger predictive relationship"
         )
 
     # ------------------------------------------------------
-    # LEAD/LAG CORRELATION FUNCTION
+    # FFT LEAD/LAG DETECTION
     # ------------------------------------------------------
-    def compute_lead_lag(trade_series, other_series, max_lag):
-        """
-        Returns:
-        - best correlation
-        - lag at which correlation highest
-        """
-        best_corr = None
-        best_lag = 0
+    def compute_lead_lag_fft(trade_series, other_series, max_lag):
 
-        for lag in range(-max_lag, max_lag + 1):
+        df = pd.concat([trade_series, other_series], axis=1).dropna()
+        if len(df) < 50:
+            return None, 0
 
-            if lag > 0:
-                aligned_trade = trade_series.iloc[:-lag]
-                aligned_other = other_series.iloc[lag:]
-            elif lag < 0:
-                aligned_trade = trade_series.iloc[-lag:]
-                aligned_other = other_series.iloc[:lag]
-            else:
-                aligned_trade = trade_series
-                aligned_other = other_series
+        x = (df.iloc[:,0] - df.iloc[:,0].mean()) / df.iloc[:,0].std()
+        y = (df.iloc[:,1] - df.iloc[:,1].mean()) / df.iloc[:,1].std()
 
-            if len(aligned_trade) < 10:
-                continue
+        corr = np.correlate(x, y, mode="full")
+        lags = np.arange(-len(x)+1, len(x))
 
-            corr = aligned_trade.corr(aligned_other)
+        mask = (lags >= -max_lag) & (lags <= max_lag)
+        corr = corr[mask]
+        lags = lags[mask]
 
-            if pd.notna(corr):
-                if best_corr is None or abs(corr) > abs(best_corr):
-                    best_corr = corr
-                    best_lag = lag
-
-        return best_corr, best_lag
+        idx = np.argmax(np.abs(corr))
+        return corr[idx]/len(x), lags[idx]
 
     # ------------------------------------------------------
-    # COMPUTE LEAD/LAG CORRELATIONS
+    # GRANGER CAUSALITY TEST
+    # ------------------------------------------------------
+    def granger_test(trade_series, other_series, max_lag=5):
+
+        df = pd.concat([trade_series, other_series], axis=1).dropna()
+        if len(df) < 100:
+            return None
+
+        try:
+            result = grangercausalitytests(df, maxlag=max_lag, verbose=False)
+            pvals = [result[i+1][0]["ssr_ftest"][1] for i in range(max_lag)]
+            return min(pvals)
+        except:
+            return None
+
+    # ------------------------------------------------------
+    # COMPUTE RELATIONSHIPS
     # ------------------------------------------------------
     trade_series_full = derivatives_ts[trade_selected].dropna()
     aligned_df = derivatives_ts.loc[trade_series_full.index]
@@ -3431,22 +3437,23 @@ try:
         other_series = aligned_df[col].dropna()
         common_idx = trade_series_full.index.intersection(other_series.index)
 
-        if len(common_idx) < 20:
+        if len(common_idx) < 100:
             continue
 
         trade_series = trade_series_full.loc[common_idx]
         other_series = other_series.loc[common_idx]
 
-        best_corr, best_lag = compute_lead_lag(
-            trade_series,
-            other_series,
-            max_lag_days
+        # correlation
+        corr = trade_series.corr(other_series)
+
+        # lag detection
+        best_corr, best_lag = compute_lead_lag_fft(
+            trade_series, other_series, max_lag_days
         )
 
-        if best_corr is None:
-            continue
+        # granger predictive test
+        p_val = granger_test(trade_series, other_series, max_lag_days)
 
-        # interpret lag
         if best_lag > 0:
             relation = "Trade Leads"
         elif best_lag < 0:
@@ -3454,54 +3461,70 @@ try:
         else:
             relation = "Simultaneous"
 
+        if p_val is not None:
+            if p_val < 0.01:
+                predict_strength = "Very Strong"
+            elif p_val < 0.05:
+                predict_strength = "Predictive"
+            else:
+                predict_strength = "Weak"
+        else:
+            predict_strength = "N/A"
+
         results.append({
             "Trade": trade_selected,
             "Instrument": col,
-            "Correlation": best_corr,
+            "Correlation": corr,
             "Lag (Days)": best_lag,
             "Relationship": relation,
-            "Abs Correlation": abs(best_corr)
+            "Granger p-value": p_val,
+            "Predictive Strength": predict_strength,
+            "Abs Correlation": abs(corr) if corr is not None else 0
         })
 
     if not results:
-        st.info("No correlation results available.")
+        st.info("No relationships found.")
         st.stop()
 
-    corr_df = pd.DataFrame(results)
+    df_results = pd.DataFrame(results)
 
     # ------------------------------------------------------
-    # APPLY CORRELATION FILTER
+    # APPLY FILTERS
     # ------------------------------------------------------
-    corr_filtered = corr_df[
-        corr_df["Abs Correlation"] >= corr_threshold
+    filtered = df_results[
+        (df_results["Abs Correlation"] >= corr_threshold) &
+        ((df_results["Granger p-value"].isna()) |
+         (df_results["Granger p-value"] <= granger_p_threshold))
     ].sort_values("Abs Correlation", ascending=False)
 
     # ------------------------------------------------------
     # DISPLAY
     # ------------------------------------------------------
-    if corr_filtered.empty:
-        st.info("No instruments exceed selected correlation threshold.")
+    if filtered.empty:
+        st.info("No instruments match filters.")
     else:
-        st.metric("Highly Related Instruments", len(corr_filtered))
+        st.metric("Filtered Relationships", len(filtered))
 
         st.caption("""
-Lead/Lag Interpretation:
+Relationship Interpretation:
 
-• Lag > 0 → trade moves first (trade leads)  
-• Lag < 0 → instrument moves first (trade follows)  
-• Correlation computed across shifted time series  
-• Pearson correlation on historical data
+• Correlation → co-movement strength  
+• Lag → who moves first  
+• Granger p-value → predictive power (lower = stronger)  
+• Predictive Strength shows statistical confidence
 """)
 
         st.dataframe(
-            corr_filtered.drop(columns=["Abs Correlation"]).style.format({
-                "Correlation": "{:.3f}"
+            filtered.drop(columns=["Abs Correlation"]).style.format({
+                "Correlation": "{:.3f}",
+                "Granger p-value": "{:.4f}"
             }),
             use_container_width=True
         )
 
 except Exception as e:
-    st.warning(f"Lead/Lag correlation analysis unavailable: {e}")
+    st.warning(f"Relationship analysis unavailable: {e}")
+
 
 
 
