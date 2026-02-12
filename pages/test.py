@@ -3305,6 +3305,119 @@ Hedge Basis: **Minimum Variance Hedge using PCA Risk Model**
 
 else:
     st.info("Mispricing data not available.")
+    # ==========================================================
+# 5.e — TRADE CORRELATION EXPLORER (DERIVATIVE CORRELATIONS)
+# ==========================================================
+
+st.subheader("5.e Trade Correlation Explorer (Across All Derivatives)")
+
+# Requires historical derivative dataframes already created earlier
+
+try:
+
+    # ------------------------------------------------------
+    # BUILD MASTER DERIVATIVE TIMESERIES MATRIX
+    # ------------------------------------------------------
+    def extract_original_columns(df):
+        """Extract only original market values and clean labels."""
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        cols = [c for c in df.columns if "(Original)" in c]
+        if not cols:
+            return pd.DataFrame()
+
+        clean = df[cols].copy()
+        clean.columns = [c.replace(" (Original)", "") for c in cols]
+        return clean
+
+    all_derivatives_list = [
+        extract_original_columns(historical_spreads_3M_df),
+        extract_original_columns(historical_butterflies_3M_df),
+        extract_original_columns(historical_double_butterflies_3M_df),
+        extract_original_columns(historical_spreads_6M_df),
+        extract_original_columns(historical_butterflies_6M_df),
+        extract_original_columns(historical_double_butterflies_6M_df),
+        extract_original_columns(historical_spreads_12M_df),
+        extract_original_columns(historical_butterflies_12M_df),
+        extract_original_columns(historical_double_butterflies_12M_df),
+    ]
+
+    derivatives_ts = pd.concat(all_derivatives_list, axis=1)
+    derivatives_ts = derivatives_ts.dropna(axis=1, how="all")
+
+    if derivatives_ts.empty:
+        st.info("No derivative time series available for correlation analysis.")
+        st.stop()
+
+    # ------------------------------------------------------
+    # TRADE SELECTION
+    # ------------------------------------------------------
+    trade_selected = st.selectbox(
+        "Select Trade (Derivative Instrument)",
+        sorted(derivatives_ts.columns.tolist())
+    )
+
+    # ------------------------------------------------------
+    # CORRELATION THRESHOLD FILTER
+    # ------------------------------------------------------
+    corr_threshold = st.slider(
+        "Minimum Absolute Correlation",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.50,
+        step=0.05,
+        help="Show only instruments with |correlation| above threshold"
+    )
+
+    # ------------------------------------------------------
+    # COMPUTE CORRELATIONS
+    # ------------------------------------------------------
+    trade_series = derivatives_ts[trade_selected].dropna()
+
+    aligned_df = derivatives_ts.loc[trade_series.index]
+    correlation_series = aligned_df.corrwith(trade_series)
+
+    corr_df = correlation_series.reset_index()
+    corr_df.columns = ["Instrument", "Correlation"]
+
+    corr_df = corr_df[corr_df["Instrument"] != trade_selected]
+    corr_df["Abs Correlation"] = corr_df["Correlation"].abs()
+
+    # ------------------------------------------------------
+    # APPLY FILTER + SORT
+    # ------------------------------------------------------
+    corr_filtered = corr_df[
+        corr_df["Abs Correlation"] >= corr_threshold
+    ].sort_values("Abs Correlation", ascending=False)
+
+    # ------------------------------------------------------
+    # DISPLAY
+    # ------------------------------------------------------
+    if corr_filtered.empty:
+        st.info("No instruments exceed the selected correlation threshold.")
+    else:
+        st.metric("Highly Correlated Instruments", len(corr_filtered))
+
+        st.caption("""
+Correlation Basis:
+
+• Uses historical time series over selected date range  
+• Pearson correlation of market values  
+• Positive → move together  
+• Negative → move opposite (good hedge candidate)
+""")
+
+        st.dataframe(
+            corr_filtered.drop(columns=["Abs Correlation"]).style.format({
+                "Correlation": "{:.3f}"
+            }),
+            use_container_width=True
+        )
+
+except Exception as e:
+    st.warning(f"Correlation analysis unavailable: {e}")
+
 
 
 
