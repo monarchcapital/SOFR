@@ -3542,6 +3542,156 @@ try:
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
+    #================dynamic pca=================
+    historical_outrights_df
+analysis_dt
+pc_count
+# ==========================================================
+# REGIME & FACTOR BASED CURVE SNAPSHOT
+# ==========================================================
+
+with st.expander("Regime-Based Curve Snapshot (Volatility Regime)", expanded=False):
+
+    st.subheader("Regime Conditional Curve Analysis")
+
+    try:
+
+        # ------------------------------------------------------
+        # 1. PREPARE OUTRIGHT PRICE MATRIX
+        # ------------------------------------------------------
+        original_cols = [c for c in historical_outrights_df.columns if "(Original)" in c]
+        price_matrix = historical_outrights_df[original_cols].copy()
+        price_matrix.columns = [c.replace(" (Original)", "") for c in original_cols]
+
+        if price_matrix.empty:
+            st.info("No outright price data available.")
+            st.stop()
+
+        # ------------------------------------------------------
+        # 2. COMPUTE DAILY RETURNS
+        # ------------------------------------------------------
+        returns = price_matrix.diff().dropna()
+
+        # ------------------------------------------------------
+        # 3. COMPUTE ROLLING VOLATILITY (REGIME DETECTION)
+        # ------------------------------------------------------
+        vol_window = st.slider(
+            "Volatility Lookback Window (days)",
+            20, 250, 60
+        )
+
+        rolling_vol = returns.std(axis=1).rolling(vol_window).mean()
+
+        # classify regimes using quantiles
+        low_thresh = rolling_vol.quantile(0.33)
+        high_thresh = rolling_vol.quantile(0.66)
+
+        regime_labels = pd.Series(index=rolling_vol.index, dtype="object")
+        regime_labels[rolling_vol <= low_thresh] = "Low Vol"
+        regime_labels[(rolling_vol > low_thresh) & (rolling_vol <= high_thresh)] = "Normal Vol"
+        regime_labels[rolling_vol > high_thresh] = "High Vol"
+
+        # ------------------------------------------------------
+        # 4. CURRENT REGIME
+        # ------------------------------------------------------
+        if analysis_dt not in regime_labels.index:
+            st.warning("Selected analysis date not available for regime detection.")
+            st.stop()
+
+        current_regime = regime_labels.loc[analysis_dt]
+        st.metric("Current Volatility Regime", current_regime)
+
+        # ------------------------------------------------------
+        # 5. REGIME-CONDITIONAL AVERAGE CURVE
+        # ------------------------------------------------------
+        regime_dates = regime_labels[regime_labels == current_regime].index
+
+        regime_curves = price_matrix.loc[regime_dates]
+        regime_avg_curve = regime_curves.mean()
+
+        # ------------------------------------------------------
+        # 6. CURRENT MARKET CURVE
+        # ------------------------------------------------------
+        market_prices = historical_outrights_df.loc[analysis_dt].filter(like="(Original)")
+        pca_prices = historical_outrights_df.loc[analysis_dt].filter(like="(PCA)")
+
+        market_curve = pd.Series(
+            market_prices.values,
+            index=[c.replace(" (Original)", "") for c in market_prices.index],
+            name="Market"
+        )
+
+        pca_curve = pd.Series(
+            pca_prices.values,
+            index=[c.replace(" (PCA)", "") for c in pca_prices.index],
+            name="PCA Fair"
+        )
+
+        regime_avg_curve = regime_avg_curve.reindex(market_curve.index)
+
+        # ------------------------------------------------------
+        # 7. PLOT COMPARISON
+        # ------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(15,7))
+
+        ax.plot(
+            market_curve.index,
+            market_curve.values,
+            marker="o",
+            linewidth=2.5,
+            label="Market Curve",
+            color="blue"
+        )
+
+        ax.plot(
+            pca_curve.index,
+            pca_curve.values,
+            marker="x",
+            linestyle="--",
+            linewidth=2.5,
+            label="PCA Fair Curve",
+            color="red"
+        )
+
+        ax.plot(
+            regime_avg_curve.index,
+            regime_avg_curve.values,
+            marker="s",
+            linestyle="-.",
+            linewidth=2.5,
+            label=f"Avg Curve ({current_regime})",
+            color="green"
+        )
+
+        ax.set_title("Market vs PCA vs Regime Average Curve")
+        ax.set_xlabel("Contract")
+        ax.set_ylabel("Price (100 - Rate)")
+        ax.grid(True, linestyle=":", alpha=0.6)
+        ax.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+
+        st.pyplot(fig)
+
+        # ------------------------------------------------------
+        # 8. MISPRICING VS REGIME
+        # ------------------------------------------------------
+        regime_mispricing = market_curve - regime_avg_curve
+
+        regime_table = pd.DataFrame({
+            "Market Price": market_curve,
+            "PCA Fair": pca_curve,
+            f"Avg ({current_regime})": regime_avg_curve,
+            "Deviation vs Regime": regime_mispricing
+        })
+
+        st.markdown("### Regime Conditional Mispricing")
+        st.dataframe(regime_table.style.format("{:.4f}"), use_container_width=True)
+
+    except Exception as e:
+        st.warning(f"Regime snapshot unavailable: {e}")
+
+
 
 
 
