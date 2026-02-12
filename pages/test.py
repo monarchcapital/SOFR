@@ -1619,6 +1619,7 @@ if not price_df_filtered.empty:
             plot_snapshot(historical_double_butterflies_12M_df, "12M Double Butterfly", analysis_dt, pc_count)
         else:
             st.info("Not enough contracts (need 13 or more) to calculate and plot 12M double butterfly snapshot.")
+
         # ==========================================================
 # 5.d — FILTERED MISPRICING TABLE WITH HEDGE SUGGESTIONS
 # ==========================================================
@@ -1784,7 +1785,8 @@ Hedge Basis: **Minimum Variance Hedge using PCA Risk Model**
 else:
     st.info("Mispricing data not available.")
 
-            
+        # ==========================================================
+
             
         # --------------------------- Download all Section 5 snapshots as PDF ---------------------------
         st.subheader("Download All Section 5 Snapshots as PDF")
