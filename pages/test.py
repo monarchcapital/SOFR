@@ -1264,34 +1264,41 @@ if not price_df_filtered.empty:
         # --------------------------------------------------------------------------------------------------
 
 
-        # --- Curve Snapshot (Section 5) ---
+       # ==========================================================
+# SECTION 5 — HELPER FUNCTIONS (KEEP OUTSIDE EXPANDER)
+# ==========================================================
+
+def get_previous_date(df, current_date):
+    try:
+        prev_dates = df.index[df.index < current_date]
+        if len(prev_dates) == 0:
+            return None
+        return prev_dates.max()
+    except Exception:
+        return None
+
+
+def plot_snapshot(historical_df, derivative_type, current_date, pc_count):
+    # ⭐ KEEP YOUR FULL EXISTING FUNCTION CODE HERE
+    # DO NOT CHANGE IT
+    # DO NOT USE pass
+    pass
+
+
+def plot_shock_derivative_snapshot(historical_df, derivative_type, shocked_series, current_date, pc_count, title_suffix=""):
+    # ⭐ KEEP YOUR FULL EXISTING FUNCTION CODE HERE
+    pass
+
+
+# ==========================================================
+# SECTION 5 — UI (WRAPPED IN EXPANDER)
+# ==========================================================
+
 with st.expander("5. Curve Snapshot (Original vs PCA Fair Value)", expanded=True):
 
-    # --- helper functions ---
-    def get_previous_date(df, current_date):
-        try:
-            prev_dates = df.index[df.index < current_date]
-            if len(prev_dates) == 0:
-                return None
-            return prev_dates.max()
-        except Exception:
-            return None
-
-
-    def plot_snapshot(historical_df, derivative_type, current_date, pc_count):
-        # your full plot_snapshot code unchanged
-        # keep everything indented inside this function
-        pass
-
-
-    def plot_shock_derivative_snapshot(historical_df, derivative_type, shocked_series, current_date, pc_count, title_suffix=""):
-        # your full shock function unchanged
-        pass
-
-
-    # =====================================================
+    # ------------------------------------------------------
     # 5.1 OUTRIGHT CURVE SNAPSHOT
-    # =====================================================
+    # ------------------------------------------------------
     st.subheader("5.1 Outright Price/Rate Curve Snapshot")
 
     try:
@@ -1308,14 +1315,14 @@ with st.expander("5. Curve Snapshot (Original vs PCA Fair Value)", expanded=True
         ax_curve.plot(
             curve_comparison.index,
             curve_comparison['Original'],
-            label=f'Today Original Price',
+            label="Today Original Price",
             marker='o'
         )
 
         ax_curve.plot(
             curve_comparison.index,
             curve_comparison['PCA Fair'],
-            label=f'Today PCA Fair Price',
+            label="PCA Fair Price",
             marker='x',
             linestyle='--'
         )
@@ -1326,9 +1333,9 @@ with st.expander("5. Curve Snapshot (Original vs PCA Fair Value)", expanded=True
         st.error("Selected analysis date not present.")
 
 
-    # =====================================================
+    # ------------------------------------------------------
     # 3M DERIVATIVES
-    # =====================================================
+    # ------------------------------------------------------
     st.subheader("5.2 3M Spread Snapshot")
     plot_snapshot(historical_spreads_3M_df, "3M Spread", analysis_dt, pc_count)
 
@@ -1341,9 +1348,9 @@ with st.expander("5. Curve Snapshot (Original vs PCA Fair Value)", expanded=True
         plot_snapshot(historical_double_butterflies_3M_df, "3M Double Butterfly", analysis_dt, pc_count)
 
 
-    # =====================================================
+    # ------------------------------------------------------
     # 6M DERIVATIVES
-    # =====================================================
+    # ------------------------------------------------------
     st.subheader("5.5 6M Spread Snapshot")
     plot_snapshot(historical_spreads_6M_df, "6M Spread", analysis_dt, pc_count)
 
@@ -1356,9 +1363,9 @@ with st.expander("5. Curve Snapshot (Original vs PCA Fair Value)", expanded=True
         plot_snapshot(historical_double_butterflies_6M_df, "6M Double Butterfly", analysis_dt, pc_count)
 
 
-    # =====================================================
+    # ------------------------------------------------------
     # 12M DERIVATIVES
-    # =====================================================
+    # ------------------------------------------------------
     st.subheader("5.8 12M Spread Snapshot")
     plot_snapshot(historical_spreads_12M_df, "12M Spread", analysis_dt, pc_count)
 
