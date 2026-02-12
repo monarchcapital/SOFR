@@ -3306,12 +3306,11 @@ Hedge Basis: **Minimum Variance Hedge using PCA Risk Model**
 else:
     st.info("Mispricing data not available.")
     # ==========================================================
-# 5.e — TRADE CORRELATION EXPLORER (DERIVATIVE CORRELATIONS)
+# ==========================================================
+# 5.e — TRADE CORRELATION + LEAD/LAG DETECTION
 # ==========================================================
 
-st.subheader("5.e Trade Correlation Explorer (Across All Derivatives)")
-
-# Requires historical derivative dataframes already created earlier
+st.subheader("5.e Trade Correlation Explorer with Lead/Lag Detection")
 
 try:
 
@@ -3319,7 +3318,6 @@ try:
     # BUILD MASTER DERIVATIVE TIMESERIES MATRIX
     # ------------------------------------------------------
     def extract_original_columns(df):
-        """Extract only original market values and clean labels."""
         if df is None or df.empty:
             return pd.DataFrame()
 
@@ -3359,33 +3357,120 @@ try:
     )
 
     # ------------------------------------------------------
-    # CORRELATION THRESHOLD FILTER
+    # FILTER CONTROLS
     # ------------------------------------------------------
-    corr_threshold = st.slider(
-        "Minimum Absolute Correlation",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.50,
-        step=0.05,
-        help="Show only instruments with |correlation| above threshold"
-    )
+    col1, col2 = st.columns(2)
 
-    # ------------------------------------------------------
-    # COMPUTE CORRELATIONS
-    # ------------------------------------------------------
-    trade_series = derivatives_ts[trade_selected].dropna()
+    with col1:
+        corr_threshold = st.slider(
+            "Minimum Absolute Correlation",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.50,
+            step=0.05
+        )
 
-    aligned_df = derivatives_ts.loc[trade_series.index]
-    correlation_series = aligned_df.corrwith(trade_series)
-
-    corr_df = correlation_series.reset_index()
-    corr_df.columns = ["Instrument", "Correlation"]
-
-    corr_df = corr_df[corr_df["Instrument"] != trade_selected]
-    corr_df["Abs Correlation"] = corr_df["Correlation"].abs()
+    with col2:
+        max_lag_days = st.slider(
+            "Max Lead/Lag Days to Test",
+            min_value=1,
+            max_value=20,
+            value=5,
+            help="Tests correlation with time shifts ±lag"
+        )
 
     # ------------------------------------------------------
-    # APPLY FILTER + SORT
+    # LEAD/LAG CORRELATION FUNCTION
+    # ------------------------------------------------------
+    def compute_lead_lag(trade_series, other_series, max_lag):
+        """
+        Returns:
+        - best correlation
+        - lag at which correlation highest
+        """
+        best_corr = None
+        best_lag = 0
+
+        for lag in range(-max_lag, max_lag + 1):
+
+            if lag > 0:
+                aligned_trade = trade_series.iloc[:-lag]
+                aligned_other = other_series.iloc[lag:]
+            elif lag < 0:
+                aligned_trade = trade_series.iloc[-lag:]
+                aligned_other = other_series.iloc[:lag]
+            else:
+                aligned_trade = trade_series
+                aligned_other = other_series
+
+            if len(aligned_trade) < 10:
+                continue
+
+            corr = aligned_trade.corr(aligned_other)
+
+            if pd.notna(corr):
+                if best_corr is None or abs(corr) > abs(best_corr):
+                    best_corr = corr
+                    best_lag = lag
+
+        return best_corr, best_lag
+
+    # ------------------------------------------------------
+    # COMPUTE LEAD/LAG CORRELATIONS
+    # ------------------------------------------------------
+    trade_series_full = derivatives_ts[trade_selected].dropna()
+    aligned_df = derivatives_ts.loc[trade_series_full.index]
+
+    results = []
+
+    for col in aligned_df.columns:
+
+        if col == trade_selected:
+            continue
+
+        other_series = aligned_df[col].dropna()
+        common_idx = trade_series_full.index.intersection(other_series.index)
+
+        if len(common_idx) < 20:
+            continue
+
+        trade_series = trade_series_full.loc[common_idx]
+        other_series = other_series.loc[common_idx]
+
+        best_corr, best_lag = compute_lead_lag(
+            trade_series,
+            other_series,
+            max_lag_days
+        )
+
+        if best_corr is None:
+            continue
+
+        # interpret lag
+        if best_lag > 0:
+            relation = "Trade Leads"
+        elif best_lag < 0:
+            relation = "Trade Follows"
+        else:
+            relation = "Simultaneous"
+
+        results.append({
+            "Trade": trade_selected,
+            "Instrument": col,
+            "Correlation": best_corr,
+            "Lag (Days)": best_lag,
+            "Relationship": relation,
+            "Abs Correlation": abs(best_corr)
+        })
+
+    if not results:
+        st.info("No correlation results available.")
+        st.stop()
+
+    corr_df = pd.DataFrame(results)
+
+    # ------------------------------------------------------
+    # APPLY CORRELATION FILTER
     # ------------------------------------------------------
     corr_filtered = corr_df[
         corr_df["Abs Correlation"] >= corr_threshold
@@ -3395,17 +3480,17 @@ try:
     # DISPLAY
     # ------------------------------------------------------
     if corr_filtered.empty:
-        st.info("No instruments exceed the selected correlation threshold.")
+        st.info("No instruments exceed selected correlation threshold.")
     else:
-        st.metric("Highly Correlated Instruments", len(corr_filtered))
+        st.metric("Highly Related Instruments", len(corr_filtered))
 
         st.caption("""
-Correlation Basis:
+Lead/Lag Interpretation:
 
-• Uses historical time series over selected date range  
-• Pearson correlation of market values  
-• Positive → move together  
-• Negative → move opposite (good hedge candidate)
+• Lag > 0 → trade moves first (trade leads)  
+• Lag < 0 → instrument moves first (trade follows)  
+• Correlation computed across shifted time series  
+• Pearson correlation on historical data
 """)
 
         st.dataframe(
@@ -3416,7 +3501,8 @@ Correlation Basis:
         )
 
 except Exception as e:
-    st.warning(f"Correlation analysis unavailable: {e}")
+    st.warning(f"Lead/Lag correlation analysis unavailable: {e}")
+
 
 
 
