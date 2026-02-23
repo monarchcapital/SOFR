@@ -3660,5 +3660,4 @@ ranked['Family'] = [ _family(idx) for idx in ranked.index ]
 ranked['Expected Move'] = np.where(ranked['Mispricing (Rate %)'] > 0, 'Down toward fair', 'Up toward fair')
 
 st.dataframe(ranked)
-else:
-    st.info("Mispricing data unavailable for ranking.")
+st.info("Mispricing data unavailable for ranking.")
