@@ -1789,7 +1789,16 @@ if not price_df_filtered.empty:
                 )
             else:
                 st.warning("Generalized Minimum Variance Hedging calculation failed for the selected trade. Check if enough historical data is available after filtering.")
+#------------------------------------------------------carry and roll-------------#
+from carry_roll_section import render_carry_roll_section
 
+render_carry_roll_section(
+    analysis_dt,
+    historical_outrights_df,
+    expiry_df,
+    mispricing_series
+)
+#------------------------------------------------------------carry and roll end---------------------#  
 
         # --------------------------- 8. PCA-Based Factor Hedging Strategy (Sensitivity Hedging - MODIFIED) ---------------------------
         st.header("8. PCA-Based Factor Hedging Strategy (Sensitivity Hedging)")
@@ -3542,155 +3551,133 @@ try:
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
-    #================dynamic pca=================
-    historical_outrights_df
-analysis_dt
-pc_count
-# ==========================================================
-# REGIME & FACTOR BASED CURVE SNAPSHOT
-# ==========================================================
+# ===============================
+# CARRY & ROLL ANALYSIS SECTION
+# Drop-in module for SOFR PCA Analyzer
+# ===============================
 
-with st.expander("Regime-Based Curve Snapshot (Volatility Regime)", expanded=False):
+import pandas as pd
+import numpy as np
+import streamlit as st
 
-    st.subheader("Regime Conditional Curve Analysis")
+# -------------------------------------------------
+# 1) Convert futures prices -> implied rates
+# -------------------------------------------------
+
+def prices_to_rates(outright_df: pd.DataFrame) -> pd.DataFrame:
+    # Price = 100 - rate
+    return 100.0 - outright_df
+
+# -------------------------------------------------
+# 2) Compute maturity in years from expiry table
+# expiry_df indexed by Contract with ExpiryDate
+# -------------------------------------------------
+
+def compute_time_to_maturity(expiry_df: pd.DataFrame, valuation_date) -> pd.Series:
+    ttm = (expiry_df['ExpiryDate'] - valuation_date).dt.days / 365.0
+    return ttm.clip(lower=1/365)  # avoid zero
+
+# -------------------------------------------------
+# 3) Curve slope dF/dT (forward slope approximation)
+# -------------------------------------------------
+
+def compute_forward_slope(rates_row: pd.Series, ttm: pd.Series) -> pd.Series:
+    contracts = rates_row.index.intersection(ttm.index)
+    rates = rates_row[contracts]
+    times = ttm[contracts]
+
+    slopes = {}
+    for i in range(len(contracts)-1):
+        c1, c2 = contracts[i], contracts[i+1]
+        dt = times[c2] - times[c1]
+        if dt <= 0:
+            slopes[c1] = 0.0
+        else:
+            slopes[c1] = (rates[c2] - rates[c1]) / dt
+    slopes[contracts[-1]] = slopes[list(slopes.keys())[-1]]
+    return pd.Series(slopes)
+
+# -------------------------------------------------
+# 4) Roll (daily expected drift from maturity decay)
+# -------------------------------------------------
+
+def compute_roll(slopes: pd.Series) -> pd.Series:
+    # dPrice/dt = -dF/dT * 1/365
+    return -slopes / 365.0
+
+# -------------------------------------------------
+# 5) Spread carry + roll
+# -------------------------------------------------
+
+def compute_spread_carry_roll(rates_row, roll_series, k=1):
+    contracts = list(rates_row.index)
+    data = {}
+    for i in range(len(contracts)-k):
+        c1, c2 = contracts[i], contracts[i+k]
+        carry = rates_row[c1] - rates_row[c2]
+        roll = roll_series[c2] - roll_series[c1]
+        data[f"{c1}-{c2}"] = carry + roll
+    return pd.Series(data, name="Carry+Roll")
+
+# -------------------------------------------------
+# 6) Fly carry + roll
+# -------------------------------------------------
+
+def compute_fly_carry_roll(rates_row, roll_series, k=1):
+    contracts = list(rates_row.index)
+    data = {}
+    for i in range(len(contracts)-2*k):
+        c1, c2, c3 = contracts[i], contracts[i+k], contracts[i+2*k]
+        carry = rates_row[c1] - 2*rates_row[c2] + rates_row[c3]
+        roll = roll_series[c1] - 2*roll_series[c2] + roll_series[c3]
+        data[f"{c1}-2x{c2}+{c3}"] = carry + roll
+    return pd.Series(data, name="Carry+Roll")
+
+# -------------------------------------------------
+# 7) Rank trades with carry filter
+# -------------------------------------------------
+
+def rank_trades(mispricing: pd.Series, carry_roll: pd.Series):
+    aligned = mispricing.index.intersection(carry_roll.index)
+    df = pd.DataFrame({
+        'Mispricing': mispricing[aligned],
+        'Carry+Roll': carry_roll[aligned]
+    })
+    df['Tradable Score'] = df['Mispricing'] * np.sign(df['Carry+Roll'])
+    return df.sort_values('Tradable Score', ascending=False)
+
+# -------------------------------------------------
+# 8) Streamlit display section
+# -------------------------------------------------
+
+def render_carry_roll_section(analysis_dt, historical_outrights_df, expiry_df, mispricing_series):
+    st.header("9. Carry & Roll Trade Filter")
 
     try:
+        outrights_today = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
+        outrights_today.index = outrights_today.index.str.replace(' (Original)', '')
+    except KeyError:
+        st.warning("Selected date not available for carry/roll computation")
+        return
 
-        # ------------------------------------------------------
-        # 1. PREPARE OUTRIGHT PRICE MATRIX
-        # ------------------------------------------------------
-        original_cols = [c for c in historical_outrights_df.columns if "(Original)" in c]
-        price_matrix = historical_outrights_df[original_cols].copy()
-        price_matrix.columns = [c.replace(" (Original)", "") for c in original_cols]
+    rates = prices_to_rates(outrights_today.to_frame().T).iloc[0]
+    ttm = compute_time_to_maturity(expiry_df, analysis_dt)
+    slopes = compute_forward_slope(rates, ttm)
+    roll = compute_roll(slopes)
 
-        if price_matrix.empty:
-            st.info("No outright price data available.")
-            st.stop()
+    spreads_cr = compute_spread_carry_roll(rates, roll, k=1)
+    flies_cr = compute_fly_carry_roll(rates, roll, k=1)
 
-        # ------------------------------------------------------
-        # 2. COMPUTE DAILY RETURNS
-        # ------------------------------------------------------
-        returns = price_matrix.diff().dropna()
+    st.subheader("Spread Carry + Roll")
+    st.dataframe(spreads_cr.to_frame())
 
-        # ------------------------------------------------------
-        # 3. COMPUTE ROLLING VOLATILITY (REGIME DETECTION)
-        # ------------------------------------------------------
-        vol_window = st.slider(
-            "Volatility Lookback Window (days)",
-            20, 250, 60
-        )
+    st.subheader("Fly Carry + Roll")
+    st.dataframe(flies_cr.to_frame())
 
-        rolling_vol = returns.std(axis=1).rolling(vol_window).mean()
-
-        # classify regimes using quantiles
-        low_thresh = rolling_vol.quantile(0.33)
-        high_thresh = rolling_vol.quantile(0.66)
-
-        regime_labels = pd.Series(index=rolling_vol.index, dtype="object")
-        regime_labels[rolling_vol <= low_thresh] = "Low Vol"
-        regime_labels[(rolling_vol > low_thresh) & (rolling_vol <= high_thresh)] = "Normal Vol"
-        regime_labels[rolling_vol > high_thresh] = "High Vol"
-
-        # ------------------------------------------------------
-        # 4. CURRENT REGIME
-        # ------------------------------------------------------
-        if analysis_dt not in regime_labels.index:
-            st.warning("Selected analysis date not available for regime detection.")
-            st.stop()
-
-        current_regime = regime_labels.loc[analysis_dt]
-        st.metric("Current Volatility Regime", current_regime)
-
-        # ------------------------------------------------------
-        # 5. REGIME-CONDITIONAL AVERAGE CURVE
-        # ------------------------------------------------------
-        regime_dates = regime_labels[regime_labels == current_regime].index
-
-        regime_curves = price_matrix.loc[regime_dates]
-        regime_avg_curve = regime_curves.mean()
-
-        # ------------------------------------------------------
-        # 6. CURRENT MARKET CURVE
-        # ------------------------------------------------------
-        market_prices = historical_outrights_df.loc[analysis_dt].filter(like="(Original)")
-        pca_prices = historical_outrights_df.loc[analysis_dt].filter(like="(PCA)")
-
-        market_curve = pd.Series(
-            market_prices.values,
-            index=[c.replace(" (Original)", "") for c in market_prices.index],
-            name="Market"
-        )
-
-        pca_curve = pd.Series(
-            pca_prices.values,
-            index=[c.replace(" (PCA)", "") for c in pca_prices.index],
-            name="PCA Fair"
-        )
-
-        regime_avg_curve = regime_avg_curve.reindex(market_curve.index)
-
-        # ------------------------------------------------------
-        # 7. PLOT COMPARISON
-        # ------------------------------------------------------
-        fig, ax = plt.subplots(figsize=(15,7))
-
-        ax.plot(
-            market_curve.index,
-            market_curve.values,
-            marker="o",
-            linewidth=2.5,
-            label="Market Curve",
-            color="blue"
-        )
-
-        ax.plot(
-            pca_curve.index,
-            pca_curve.values,
-            marker="x",
-            linestyle="--",
-            linewidth=2.5,
-            label="PCA Fair Curve",
-            color="red"
-        )
-
-        ax.plot(
-            regime_avg_curve.index,
-            regime_avg_curve.values,
-            marker="s",
-            linestyle="-.",
-            linewidth=2.5,
-            label=f"Avg Curve ({current_regime})",
-            color="green"
-        )
-
-        ax.set_title("Market vs PCA vs Regime Average Curve")
-        ax.set_xlabel("Contract")
-        ax.set_ylabel("Price (100 - Rate)")
-        ax.grid(True, linestyle=":", alpha=0.6)
-        ax.legend()
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-
-        st.pyplot(fig)
-
-        # ------------------------------------------------------
-        # 8. MISPRICING VS REGIME
-        # ------------------------------------------------------
-        regime_mispricing = market_curve - regime_avg_curve
-
-        regime_table = pd.DataFrame({
-            "Market Price": market_curve,
-            "PCA Fair": pca_curve,
-            f"Avg ({current_regime})": regime_avg_curve,
-            "Deviation vs Regime": regime_mispricing
-        })
-
-        st.markdown("### Regime Conditional Mispricing")
-        st.dataframe(regime_table.style.format("{:.4f}"), use_container_width=True)
-
-    except Exception as e:
-        st.warning(f"Regime snapshot unavailable: {e}")
-
+    if mispricing_series is not None and not mispricing_series.empty:
+        st.subheader("Tradable Opportunities (Carry Filtered)")
+        ranked = rank_trades(mispricing_series, pd.concat([spreads_cr, flies_cr]))
+        st.dataframe(ranked)
 
 
 
