@@ -3544,7 +3544,7 @@ except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
 #---------------------------------------section 12 end here---------------#
 # ============================================================
-# SECTION 14 — CARRY & ROLL TRADE FILTER (FULL EDUCATIONAL)
+# SECTION 14 — CARRY & ROLL TRADE FILTER (ROBUST VERSION)
 # ============================================================
 
 st.header("14. Carry & Roll Trade Filter")
@@ -3552,72 +3552,9 @@ st.header("14. Carry & Roll Trade Filter")
 import numpy as np
 import pandas as pd
 
-# ============================================================
-# EXPLANATION PANEL
-# ============================================================
-
-with st.expander("📘 What is Carry & Roll and how to interpret trades?"):
-
-    st.markdown("""
-### Futures do NOT pay coupons
-Instead they **converge to realised overnight rates**.
-
-So if the yield curve does not change tomorrow:
-
-> Prices STILL move.
-
-That predictable movement = **Carry + Roll**
-
----
-
-### Mathematical intuition
-
-Let price = `100 - expected rate`
-
-As time passes:
-- Near contracts become realised sooner
-- Far contracts still contain expectations
-
-Therefore spreads naturally change.
-
----
-
-### Instruments
-
-**Spread**
-F₁ − F₂  
-Measures slope of curve
-
-**Fly**
-F₁ − 2F₂ + F₃  
-Measures curvature
-
-**Double Fly**
-F₁ − 3F₂ + 3F₃ − F₄  
-Measures curvature acceleration
-
----
-
-### Why traders care
-
-We only trade anomalies that also decay toward fair value.
-
-| Situation | Meaning | Trade |
-|--------|------|------|
-Cheap + positive carry | rises naturally | BUY |
-Rich + positive carry | falls naturally | SELL |
-Cheap + negative carry | trap | AVOID |
-Rich + negative carry | trap | AVOID |
-
-So the model answers:
-
-> Not "what is weird?"  
-> But "what gets fixed automatically?"
-""")
-
-# ============================================================
-# Helper functions
-# ============================================================
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 
 def _prices_to_rates(series):
     return 100.0 - series
@@ -3638,36 +3575,33 @@ def _forward_slope(rates, ttm):
 def _roll(slopes):
     return -slopes / 365.0
 
-def _clean_label(label):
-    if ': ' in label:
-        return label.split(': ', 1)[1]
-    return label
-
-def _trade_action(mispricing, carry):
-    if mispricing > 0 and carry > 0:
-        return "SELL (rich & decays down)"
-    if mispricing < 0 and carry < 0:
-        return "BUY (cheap & rises)"
-    if mispricing > 0 and carry < 0:
-        return "AVOID (rich but bleeds)"
-    if mispricing < 0 and carry > 0:
-        return "AVOID (cheap but bleeds)"
-    return "NEUTRAL"
+# Canonical trade key (critical fix)
+def _canonical(label):
+    label = label.replace("3M ","").replace("6M ","").replace("12M ","")
+    label = label.replace("Spread: ","").replace("Fly: ","").replace("Double Fly: ","")
+    return label.strip()
 
 def _family(label):
-    if 'Double Fly' in label: return 'Double Fly'
-    if 'Fly' in label: return 'Fly'
-    return 'Spread'
+    if "Double Fly" in label: return "Double Fly"
+    if "Fly" in label: return "Fly"
+    return "Spread"
 
-# ============================================================
+def _action(m, c):
+    if m>0 and c>0: return "SELL (rich & decays)"
+    if m<0 and c<0: return "BUY (cheap & rises)"
+    if m>0 and c<0: return "AVOID (rich but widens)"
+    if m<0 and c>0: return "AVOID (cheap but bleeds)"
+    return "NEUTRAL"
+
+# ------------------------------------------------------------
 # Build today's curve
-# ============================================================
+# ------------------------------------------------------------
 
 try:
     outrights_today = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
     outrights_today.index = outrights_today.index.str.replace(' (Original)', '')
 except KeyError:
-    st.warning("Selected date not available")
+    st.warning("Date not in dataset")
     st.stop()
 
 rates = _prices_to_rates(outrights_today)
@@ -3675,78 +3609,110 @@ ttm = _time_to_maturity(expiry_df, analysis_dt)
 slopes = _forward_slope(rates, ttm)
 roll = _roll(slopes)
 
-# ============================================================
-# Generate all derivative families
-# ============================================================
+# ------------------------------------------------------------
+# Carry & Roll for ALL derivative families
+# ------------------------------------------------------------
 
-all_cr = []
+carry_records = []
 
-for k, label in [(1,"3M"), (2,"6M"), (4,"12M")]:
+contracts = list(rates.index)
 
-    contracts = list(rates.index)
+for k,label in [(1,"3M"),(2,"6M"),(4,"12M")]:
 
     # spreads
-    s = {}
     for i in range(len(contracts)-k):
-        c1, c2 = contracts[i], contracts[i+k]
-        carry = rates[c1] - rates[c2]
-        r = roll[c2] - roll[c1]
-        s[f"{label} Spread: {c1}-{c2}"] = carry + r
-    all_cr.append(pd.Series(s))
+        c1,c2 = contracts[i],contracts[i+k]
+        carry = rates[c1]-rates[c2]
+        r = roll[c2]-roll[c1]
+        name=f"{label} Spread: {c1}-{c2}"
+        carry_records.append((name,_canonical(name),carry+r))
 
     # flies
-    f = {}
     for i in range(len(contracts)-2*k):
-        c1, c2, c3 = contracts[i], contracts[i+k], contracts[i+2*k]
-        carry = rates[c1] - 2*rates[c2] + rates[c3]
-        r = roll[c1] - 2*roll[c2] + roll[c3]
-        f[f"{label} Fly: {c1}-2x{c2}+{c3}"] = carry + r
-    all_cr.append(pd.Series(f))
+        c1,c2,c3 = contracts[i],contracts[i+k],contracts[i+2*k]
+        carry = rates[c1]-2*rates[c2]+rates[c3]
+        r = roll[c1]-2*roll[c2]+roll[c3]
+        name=f"{label} Fly: {c1}-2x{c2}+{c3}"
+        carry_records.append((name,_canonical(name),carry+r))
 
     # double flies
-    dfly = {}
     for i in range(len(contracts)-3*k):
-        c1, c2, c3, c4 = contracts[i], contracts[i+k], contracts[i+2*k], contracts[i+3*k]
-        carry = rates[c1] - 3*rates[c2] + 3*rates[c3] - rates[c4]
-        r = roll[c1] - 3*roll[c2] + 3*roll[c3] - roll[c4]
-        dfly[f"{label} Double Fly: {c1}-3x{c2}+3x{c3}-{c4}"] = carry + r
-    if dfly:
-        all_cr.append(pd.Series(dfly))
+        c1,c2,c3,c4 = contracts[i],contracts[i+k],contracts[i+2*k],contracts[i+3*k]
+        carry = rates[c1]-3*rates[c2]+3*rates[c3]-rates[c4]
+        r = roll[c1]-3*roll[c2]+3*roll[c3]-roll[c4]
+        name=f"{label} Double Fly: {c1}-3x{c2}+3x{c3}-{c4}"
+        carry_records.append((name,_canonical(name),carry+r))
 
-carry_roll_all = pd.concat(all_cr).dropna()
+carry_df=pd.DataFrame(carry_records,columns=["Label","Key","Carry+Roll"]).set_index("Label")
 
 st.subheader("Carry + Roll (Daily Expected Drift)")
-st.dataframe(carry_roll_all.to_frame("Carry+Roll"))
+st.dataframe(carry_df[["Carry+Roll"]])
 
-# ============================================================
-# Match with PCA mispricing
-# ============================================================
+# ------------------------------------------------------------
+# Align with PCA mispricing (FIXED)
+# ------------------------------------------------------------
 
-if mispricing_series is not None and not mispricing_series.empty:
+if mispricing_series is None or mispricing_series.empty:
+    st.info("Mispricing data unavailable for ranking.")
+    st.stop()
 
-    mispricing_clean = mispricing_series.copy()
-    mispricing_clean.index = mispricing_clean.index.map(_clean_label)
+mis_df = mispricing_series.to_frame("Mispricing")
+mis_df["Key"]=mis_df.index.map(_canonical)
 
-    aligned = mispricing_clean.index.intersection(carry_roll_all.index)
+merged = carry_df.reset_index().merge(mis_df,on="Key",how="inner").set_index("Label")
 
-    ranked = pd.DataFrame({
-        'Mispricing (Rate %)': mispricing_clean.loc[aligned],
-        'Carry+Roll': carry_roll_all.loc[aligned]
+if merged.empty:
+    st.warning("No overlap between PCA derivatives and carry model")
+    st.stop()
+
+merged["Tradable Score"]=merged["Mispricing"]*np.sign(merged["Carry+Roll"])
+merged=merged[merged["Tradable Score"]>0]
+
+merged["Action"]=[_action(m,c) for m,c in zip(merged["Mispricing"],merged["Carry+Roll"])]
+merged["Family"]=[_family(i) for i in merged.index]
+merged["Expected Move"]=np.where(merged["Mispricing"]>0,"Down toward fair","Up toward fair")
+
+merged=merged.sort_values("Tradable Score",ascending=False)
+
+st.subheader("Tradable Opportunities (Carry Filtered)")
+st.dataframe(merged)
+
+# ------------------------------------------------------------
+# REGIME SENSITIVITY (NOW WORKS)
+# ------------------------------------------------------------
+
+st.subheader("Regime Sensitivity")
+
+def weights_from_key(key):
+    key=key.replace("2x","").replace("3x","")
+    parts=key.replace("+","-").split("-")
+    parts=[p for p in parts if p!=""]
+    w={}
+    if len(parts)==2:
+        w[parts[0]]=1; w[parts[1]]=-1
+    elif len(parts)==3:
+        w[parts[0]]=1; w[parts[1]]=-2; w[parts[2]]=1
+    elif len(parts)==4:
+        w[parts[0]]=1; w[parts[1]]=-3; w[parts[2]]=3; w[parts[3]]=-1
+    return pd.Series(w)
+
+sens=[]
+
+for trade,key in zip(merged.index,merged["Key"]):
+
+    w=weights_from_key(key).reindex(rates.index).fillna(0).values
+    n=len(w)
+
+    level=np.ones(n)
+    slope=np.linspace(1,-1,n)
+    curve=np.zeros(n); curve[n//2]=2; curve-=1
+
+    sens.append({
+        "Trade":trade,
+        "Level":np.sign(np.dot(w,level)),
+        "Steepener":np.sign(np.dot(w,slope)),
+        "Curvature":np.sign(np.dot(w,curve))
     })
 
-    ranked['Tradable Score'] = ranked['Mispricing (Rate %)'] * np.sign(ranked['Carry+Roll'])
-    ranked = ranked[ranked['Tradable Score'] > 0]
-
-    ranked['Action'] = [_trade_action(m, c) for m, c in zip(ranked['Mispricing (Rate %)'], ranked['Carry+Roll'])]
-    ranked['Family'] = [_family(idx) for idx in ranked.index]
-    ranked['Expected Move'] = np.where(ranked['Mispricing (Rate %)'] > 0,
-                                       'Down toward fair',
-                                       'Up toward fair')
-
-    ranked = ranked.sort_values('Tradable Score', ascending=False)
-
-    st.subheader("Tradable Opportunities (Carry Filtered)")
-    st.dataframe(ranked)
-
-else:
-    st.info("Mispricing data unavailable for ranking.")
+sens=pd.DataFrame(sens).set_index("Trade")
+st.dataframe(sens)
