@@ -3617,33 +3617,48 @@ carry_roll_all = pd.concat([spreads_cr, flies_cr])
 st.subheader("Carry + Roll (Daily Expected Drift)")
 st.dataframe(carry_roll_all.to_frame())
 
-# --- Normalize labels ---
-def _clean_label(label: str):
-    if ': ' in label:
-        return label.split(': ', 1)[1]
-    return label
+# --- Tradable Ranking ---
+if mispricing_series is not None and not mispricing_series.empty:
+    aligned = mispricing_series.index.intersection(carry_roll_all.index)
+    ranked = pd.DataFrame({
+        'Mispricing (Rate %)': mispricing_series[aligned],
+        'Carry+Roll': carry_roll_all[aligned]
+    })
+    ranked['Tradable Score'] = ranked['Mispricing (Rate %)'] * np.sign(ranked['Carry+Roll'])
+    ranked = ranked.sort_values('Tradable Score', ascending=False)
 
-mispricing_clean = mispricing_series.copy()
-mispricing_clean.index = mispricing_clean.index.map(_clean_label)
+    st.subheader("Tradable Opportunities (Carry Filtered)")
 
-# --- Align instruments ---
-aligned = mispricing_clean.index.intersection(carry_roll_all.index)
+# --- Trade interpretation ---
+def _trade_action(mispricing, carry):
+    # Mispricing defined as Market - Fair
+    # If positive -> market rich -> sell
+    # If negative -> market cheap -> buy
+    if mispricing > 0 and carry > 0:
+        return "SELL (rich, pays carry)"
+    if mispricing < 0 and carry < 0:
+        return "BUY (cheap, pays carry)"
+    if mispricing > 0 and carry < 0:
+        return "AVOID (rich but negative carry)"
+    if mispricing < 0 and carry > 0:
+        return "AVOID (cheap but negative carry)"
+    return "NEUTRAL"
 
-ranked = pd.DataFrame({
-    'Mispricing (Rate %)': mispricing_clean.loc[aligned],
-    'Carry+Roll': carry_roll_all.loc[aligned]
-})
+ranked['Action'] = [ _trade_action(m, c) for m, c in zip(ranked['Mispricing (Rate %)'], ranked['Carry+Roll']) ]
 
-# Trade only if carry works in your favor
-ranked['Tradable Score'] = ranked['Mispricing (Rate %)'] * np.sign(ranked['Carry+Roll'])
+# classify instrument family
+def _family(label):
+    if '-3x' in label:
+        return 'Double Fly'
+    if '-2x' in label:
+        return 'Fly'
+    return 'Spread'
 
-# Remove negative expectancy trades
-ranked = ranked[ranked['Tradable Score'] > 0]
+ranked['Family'] = [ _family(idx) for idx in ranked.index ]
 
-ranked = ranked.sort_values('Tradable Score', ascending=False)
+# fair value direction explanation
+ranked['Expected Move'] = np.where(ranked['Mispricing (Rate %)'] > 0, 'Down toward fair', 'Up toward fair')
 
-st.subheader("Tradable Opportunities (Carry Filtered)")
 st.dataframe(ranked)
-
-
-
+else:
+    st.info("Mispricing data unavailable for ranking.")
