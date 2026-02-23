@@ -3543,8 +3543,11 @@ try:
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
 #---------------------------------------section 12 end here---------------#
+
 # ============================================================
-# SECTION 14 — SR3 POLICY PATH ENGINE (FINAL CORRECT VERSION)
+
+# SECTION 14 — SR3 POLICY PATH ENGINE (ECONOMICALLY CORRECT)
+
 # ============================================================
 
 st.header("14. Policy Path Interpretation")
@@ -3557,9 +3560,10 @@ import re
 
 BP_VALUE = 25  # $ per bp per contract
 
-
 # ------------------------------------------------------------
-# 1) FOMC CALENDAR (TO 2029)
+
+# 1) FOMC CALENDAR
+
 # ------------------------------------------------------------
 
 FOMC = pd.to_datetime([
@@ -3569,117 +3573,128 @@ FOMC = pd.to_datetime([
 "2029-01-31","2029-03-20","2029-05-01","2029-06-19","2029-07-31","2029-09-18","2029-11-07","2029-12-18"
 ])
 
-
 # ------------------------------------------------------------
-# 2) CONTRACT ACCRUAL WINDOW → MEETING WEIGHTS
+
+# 2) CONTRACT ACCRUAL WINDOW → POLICY STEP IMPACT
+
 # ------------------------------------------------------------
 
 def contract_meeting_weights(start,end):
 
-    total=(end-start).days
-    weights={}
+```
+total_days = (end-start).days
+weights = {}
 
-    meetings=list(FOMC[(FOMC>start)&(FOMC<end)])
-    timeline=[start]+meetings+[end]
+meetings = list(FOMC[(FOMC>start)&(FOMC<end)])
+timeline = [start] + meetings + [end]
 
-    for i in range(len(timeline)-1):
+for i in range(len(timeline)-1):
 
-        s=timeline[i]
-        e=timeline[i+1]
-        days=(e-s).days
+    segment_start = timeline[i]
+    segment_end   = timeline[i+1]
 
-        if i==0:
-            label="Before First Meeting"
-        else:
-            label=meetings[i-1].strftime("%Y-%m")
+    # policy level between meetings
+    if i == 0:
+        label = "Before First Meeting"
+    else:
+        label = meetings[i-1].strftime("%Y-%m")
 
-        weights[label]=weights.get(label,0)+days/total
+    days = (segment_end-segment_start).days
+    weights[label] = weights.get(label,0) + days/total_days
 
-    return weights
+return weights
+```
 
-
-contract_weights={}
+contract_weights = {}
 
 for c,row in expiry_df.iterrows():
-
-    end=row["ExpiryDate"]
-    start=end-DateOffset(months=3)
-
-    contract_weights[c]=contract_meeting_weights(start,end)
-
+end   = row["ExpiryDate"]
+start = end - DateOffset(months=3)
+contract_weights[c] = contract_meeting_weights(start,end)
 
 # ------------------------------------------------------------
-# 3) UNIVERSAL TRADE PARSER (NO HARDCODING)
+
+# 3) UNIVERSAL TRADE PARSER (WORKS FOR SPREAD/FLY/DFLY)
+
 # ------------------------------------------------------------
 
 def trade_contract_weights(label):
 
-    key=(label.replace("3M ","")
-                .replace("6M ","")
-                .replace("12M ","")
-                .replace("Spread: ","")
-                .replace("Fly: ","")
-                .replace("Double Fly: ",""))
+```
+key=(label.replace("3M ","")
+            .replace("6M ","")
+            .replace("12M ","")
+            .replace("Spread: ","")
+            .replace("Fly: ","")
+            .replace("Double Fly: ",""))
 
-    tokens=re.findall(r'([+-]?[^+-]+)',key)
+tokens=re.findall(r'([+-]?[^+-]+)',key)
 
-    weights={}
+weights={}
 
-    for t in tokens:
+for t in tokens:
 
-        sign=-1 if t.startswith('-') else 1
-        t=t.replace('+','').replace('-','')
+    sign=-1 if t.startswith('-') else 1
+    t=t.replace('+','').replace('-','')
 
-        if 'x' in t:
-            mult,contract=t.split('x')
-            mult=int(mult)
-        else:
-            mult=1
-            contract=t
+    if 'x' in t:
+        mult,contract=t.split('x')
+        mult=int(mult)
+    else:
+        mult=1
+        contract=t
 
-        weights[contract]=weights.get(contract,0)+sign*mult
+    weights[contract]=weights.get(contract,0)+sign*mult
 
-    return weights
-
+return weights
+```
 
 # ------------------------------------------------------------
-# 4) MEETING → PRICE SENSITIVITY PER TRADE
+
+# 4) BUILD RATE SENSITIVITY MATRIX
+
 # ------------------------------------------------------------
 
 records=[]
 
+all_meetings=sorted({m for cw in contract_weights.values() for m in cw})
+
 for trade in mispricing_series.index:
 
-    structure=trade_contract_weights(trade)
+```
+structure=trade_contract_weights(trade)
 
-    meeting_sens={}
+row={}
 
-    for meeting in sorted({m for cw in contract_weights.values() for m in cw}):
+for meeting in all_meetings:
 
-        sens=0
+    sens=0
 
-        for contract,coef in structure.items():
+    for contract,coef in structure.items():
 
-            if contract not in contract_weights: continue
+        if contract not in contract_weights: 
+            continue
 
-            w=contract_weights[contract].get(meeting,0)
+        frac=contract_weights[contract].get(meeting,0)
 
-            # rate ↑ => price ↓
-            sens += coef * (-w)
+        # policy hike -> higher rate -> lower futures price
+        sens += coef * (-frac)
 
-        meeting_sens[meeting]=sens
+    row[meeting]=sens
 
-    meeting_sens["Trade"]=trade
-    records.append(meeting_sens)
+row["Trade"]=trade
+records.append(row)
+```
 
 sens_matrix=pd.DataFrame(records).set_index("Trade").fillna(0)
 
-st.subheader("Rate Exposure Matrix (price bp per 1bp policy move)")
+st.subheader("Rate Exposure (price bp per 1bp policy move)")
 st.dataframe(sens_matrix.round(4))
 
-
 # ------------------------------------------------------------
+
 # 5) POSITION BUILDER
+
 # ------------------------------------------------------------
 
 st.subheader("Position Policy Impact")
@@ -3689,26 +3704,27 @@ trades=sens_matrix.index.tolist()
 c1,c2=st.columns(2)
 
 with c1:
-    tA=st.selectbox("Trade A",trades)
-    sideA=st.radio("Side A",["BUY","SELL"],horizontal=True)
-    lA=st.number_input("Lots A",value=100,step=25)
+tA=st.selectbox("Trade A",trades)
+sideA=st.radio("Side A",["BUY","SELL"],horizontal=True)
+lA=st.number_input("Lots A",value=100,step=25)
 
 with c2:
-    tB=st.selectbox("Trade B",trades,index=min(1,len(trades)-1))
-    sideB=st.radio("Side B",["BUY","SELL"],horizontal=True)
-    lB=st.number_input("Lots B",value=0,step=25)
+tB=st.selectbox("Trade B",trades,index=min(1,len(trades)-1))
+sideB=st.radio("Side B",["BUY","SELL"],horizontal=True)
+lB=st.number_input("Lots B",value=0,step=25)
 
 signA=1 if sideA=="BUY" else -1
 signB=1 if sideB=="BUY" else -1
 
 net_rate = sens_matrix.loc[tA]*lA*signA + sens_matrix.loc[tB]*lB*signB
-net_rate = net_rate[net_rate.abs()>1e-6]
+net_rate = net_rate[net_rate.abs()>1e-8]
 
 net_pnl = net_rate * BP_VALUE
 
-
 # ------------------------------------------------------------
-# 6) MEETING PNL
+
+# 6) MEETING PNL OUTPUT
+
 # ------------------------------------------------------------
 
 st.subheader("Meeting PnL ($ per 1bp surprise)")
@@ -3720,60 +3736,46 @@ ax.set_ylabel("$ PnL per 1bp policy shock")
 ax.set_title("Which FOMC meetings drive your position")
 st.pyplot(fig)
 
-
-# ------------------------------------------------------------
-# 7) CURRENT MARKET PREMIUM PER MEETING
 # ------------------------------------------------------------
 
-st.subheader("Market Premium Embedded In Your Trade")
-
-misA=mispricing_series.get(tA,0)*lA*signA
-misB=mispricing_series.get(tB,0)*lB*signB
-total_mis=misA+misB
-
-weights=net_rate.abs()/net_rate.abs().sum()
-premium_per_meeting=weights*total_mis
-
-st.dataframe(pd.DataFrame({
-"Meeting":premium_per_meeting.index,
-"Premium(bp)":premium_per_meeting.values
-}).set_index("Meeting").round(3))
-
+# 7) HUMAN INTERPRETATION (REAL TRADER LANGUAGE)
 
 # ------------------------------------------------------------
-# 8) HUMAN INTERPRETATION
-# ------------------------------------------------------------
 
-st.subheader("Human Interpretation")
+st.subheader("What Your Trade Is Saying About The Fed")
 
 if len(net_pnl)==0:
-    st.info("No policy exposure")
+st.info("No policy exposure")
 
 else:
 
-    dominant=net_pnl.abs().idxmax()
+```
+def describe(v):
+    if v>0: return "you want HIGHER rates (hawkish surprise)"
+    if v<0: return "you want LOWER rates (dovish surprise)"
+    return "no view"
 
-    hawkish=net_pnl[net_pnl>0].sum()
-    dovish=net_pnl[net_pnl<0].sum()
+explanation=[]
+for m,v in net_pnl.items():
+    explanation.append([m,round(v,2),describe(v)])
 
-    if hawkish>abs(dovish):
-        bias="market pricing TOO MANY CUTS vs your position"
-    elif abs(dovish)>hawkish:
-        bias="market pricing TOO MANY HIKES vs your position"
-    else:
-        bias="terminal similar but timing wrong"
+explain_df=pd.DataFrame(explanation,columns=["Meeting","$PnL per 1bp","Your View"])
+st.dataframe(explain_df,use_container_width=True)
 
-    st.markdown(f"""
-### What your trade means
+dominant=net_pnl.abs().idxmax()
 
-Your position is mainly driven by **{dominant} FOMC meeting**
+st.markdown(f"""
+```
 
-**Interpretation:** {bias}
+### Plain English
 
-Positive bars → you benefit from HIGHER rates at that meeting  
-Negative bars → you benefit from LOWER rates at that meeting
+Your biggest risk is the **{dominant} FOMC meeting**.
 
-You are not trading carry or roll.
+Positive bar → you benefit if Fed surprises MORE HAWKISH
+Negative bar → you benefit if Fed surprises MORE DOVISH
 
-You are trading where along the policy path the market is wrong.
+You are NOT trading carry.
+You are NOT trading time decay.
+
+You are trading **where along the policy path the market is wrong**.
 """)
