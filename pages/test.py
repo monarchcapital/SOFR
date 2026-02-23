@@ -3688,3 +3688,125 @@ net_pnl.plot(kind="bar",ax=ax)
 ax.set_ylabel("Dollar PnL per 1bp meeting surprise")
 ax.set_title("Which FOMC meetings drive your position")
 st.pyplot(fig)
+# ------------------------------------------------------------
+# 7) HUMAN INTERPRETATION LAYER
+# ------------------------------------------------------------
+
+st.subheader("Policy Interpretation")
+
+if len(net_pnl)==0:
+    st.info("No meaningful meeting exposure")
+
+else:
+
+    # dominant meeting
+    dominant = net_pnl.abs().idxmax()
+    dom_val = net_pnl[dominant]
+
+    if dom_val > 0:
+        direction = "more hawkish (higher policy rate)"
+    else:
+        direction = "more dovish (lower policy rate)"
+
+    # classify trade type
+    pos_meetings = (net_pnl > 0).sum()
+    neg_meetings = (net_pnl < 0).sum()
+
+    if pos_meetings>0 and neg_meetings>0:
+        trade_type = "TIMING trade (shifts hikes/cuts across meetings)"
+    elif "Before First Meeting" in net_pnl.index and abs(net_pnl["Before First Meeting"])==net_pnl.abs().max():
+        trade_type = "NEAR-DATED anchored trade"
+    elif net_pnl.index[-1]==dominant:
+        trade_type = "TERMINAL rate trade"
+    else:
+        trade_type = "DIRECTIONAL path trade"
+
+    total_risk = net_pnl.abs().sum()
+
+    st.markdown(f"""
+### What your position is actually betting on
+
+**Primary driver:** {dominant} FOMC meeting  
+**You profit if:** the market prices **{direction}** at that meeting
+
+**Trade nature:** {trade_type}
+
+---
+
+### How the PnL happens
+
+This position does NOT make money from time passing.
+
+It only profits if the expected policy path is redistributed across meetings.
+
+• Positive bar → you want higher rates at that meeting  
+• Negative bar → you want lower rates at that meeting  
+
+The trade resolves when the market shifts *where in time* the tightening/easing occurs.
+""")
+
+    # additional intuitive description
+    early = net_pnl.iloc[:len(net_pnl)//2].sum()
+    late  = net_pnl.iloc[len(net_pnl)//2:].sum()
+
+    if early*late < 0:
+        st.markdown("""
+**Interpretation:**  
+You are trading the timing of the cycle — not the level.  
+You want hikes/cuts moved forward or backward along the timeline.
+""")
+    elif abs(late) > abs(early):
+        st.markdown("""
+**Interpretation:**  
+This is a long-run policy expectation trade (terminal rate belief).
+""")
+    else:
+        st.markdown("""
+**Interpretation:**  
+This is a near-cycle policy trade driven by upcoming meetings.
+""")
+# ------------------------------------------------------------
+# 8) IMPLIED FED PATH (TRADER INTERPRETATION)
+# ------------------------------------------------------------
+
+st.subheader("Implied Fed Path From Your Position")
+
+threshold = net_pnl.abs().max()*0.15  # ignore tiny noise
+
+rows = []
+
+for m,v in net_pnl.items():
+
+    if abs(v) < threshold:
+        view = "PAUSE / not important"
+    elif v > 0:
+        view = "HIKE priced too low (you want higher rate)"
+    else:
+        view = "CUT priced too low (you want lower rate)"
+
+    rows.append([m, round(v,2), view])
+
+fed_view_df = pd.DataFrame(rows,columns=["Meeting","PnL per 1bp ($)","Your Implied View"])
+st.dataframe(fed_view_df,use_container_width=True)
+
+# summary statement
+hikes = (fed_view_df["Your Implied View"].str.contains("HIKE")).sum()
+cuts  = (fed_view_df["Your Implied View"].str.contains("CUT")).sum()
+
+if hikes>cuts:
+    bias="overall more hawkish than market"
+elif cuts>hikes:
+    bias="overall more dovish than market"
+else:
+    bias="roughly same terminal rate but different timing"
+
+st.markdown(f"""
+### Position Meaning
+
+By trading **{lA} lots of {tA}** and **{lB} lots of {tB}**,  
+you are expressing a view that the Fed path should be:
+
+**{bias}**
+
+The table above shows exactly which meetings your position disagrees with the market on.
+""")
