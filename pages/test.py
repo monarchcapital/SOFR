@@ -3617,22 +3617,33 @@ carry_roll_all = pd.concat([spreads_cr, flies_cr])
 st.subheader("Carry + Roll (Daily Expected Drift)")
 st.dataframe(carry_roll_all.to_frame())
 
-# --- Tradable Ranking ---
-if mispricing_series is not None and not mispricing_series.empty:
-    aligned = mispricing_series.index.intersection(carry_roll_all.index)
-    ranked = pd.DataFrame({
-        'Mispricing (Rate %)': mispricing_series[aligned],
-        'Carry+Roll': carry_roll_all[aligned]
-    })
-    ranked['Tradable Score'] = ranked['Mispricing (Rate %)'] * np.sign(ranked['Carry+Roll'])
-    ranked = ranked.sort_values('Tradable Score', ascending=False)
+# --- Normalize labels ---
+def _clean_label(label: str):
+    if ': ' in label:
+        return label.split(': ', 1)[1]
+    return label
 
-    st.subheader("Tradable Opportunities (Carry Filtered)")
-    st.dataframe(ranked)
-else:
-    st.info("Mispricing data unavailable for ranking.")
+mispricing_clean = mispricing_series.copy()
+mispricing_clean.index = mispricing_clean.index.map(_clean_label)
 
+# --- Align instruments ---
+aligned = mispricing_clean.index.intersection(carry_roll_all.index)
 
+ranked = pd.DataFrame({
+    'Mispricing (Rate %)': mispricing_clean.loc[aligned],
+    'Carry+Roll': carry_roll_all.loc[aligned]
+})
+
+# Trade only if carry works in your favor
+ranked['Tradable Score'] = ranked['Mispricing (Rate %)'] * np.sign(ranked['Carry+Roll'])
+
+# Remove negative expectancy trades
+ranked = ranked[ranked['Tradable Score'] > 0]
+
+ranked = ranked.sort_values('Tradable Score', ascending=False)
+
+st.subheader("Tradable Opportunities (Carry Filtered)")
+st.dataframe(ranked)
 
 
 
