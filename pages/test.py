@@ -3544,7 +3544,7 @@ except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
 #---------------------------------------section 12 end here---------------#
 # ============================================================
-# SECTION 14 — SR3 FOMC POLICY EXPOSURE ENGINE (CORRECTED)
+# SECTION 14 — SR3 FOMC POLICY EXPOSURE ENGINE (FINAL FIXED)
 # ============================================================
 
 st.header("14. Policy Path Interpretation")
@@ -3555,7 +3555,7 @@ import matplotlib.pyplot as plt
 from pandas.tseries.offsets import DateOffset
 
 # ------------------------------------------------------------
-# 1) FOMC calendar (extend as needed)
+# 1) FOMC calendar (to Dec-2029)
 # ------------------------------------------------------------
 
 FOMC = pd.to_datetime([
@@ -3567,40 +3567,39 @@ FOMC = pd.to_datetime([
 
 # ------------------------------------------------------------
 # 2) Correct SR3 meeting weights
-# A meeting controls the rate AFTER it occurs
+# Policy decision affects days AFTER meeting
 # ------------------------------------------------------------
 
-def contract_meeting_weights(start, end):
+def contract_meeting_weights(start,end):
 
-    total_days = (end - start).days
-    weights = {}
+    total=(end-start).days
+    weights={}
 
-    meetings = list(FOMC[(FOMC > start) & (FOMC < end)])
-    timeline = [start] + meetings + [end]
+    meetings=list(FOMC[(FOMC>start)&(FOMC<end)])
+    timeline=[start]+meetings+[end]
 
-    for i in range(len(timeline) - 1):
+    for i in range(len(timeline)-1):
 
-        s = timeline[i]
-        e = timeline[i + 1]
-        days = (e - s).days
+        s=timeline[i]
+        e=timeline[i+1]
+        days=(e-s).days
 
-        # Rate in this interval set by LAST meeting
-        if i == 0:
-            label = "Before First Meeting"
+        # rate in interval determined by PREVIOUS meeting
+        if i==0:
+            label="Before First Meeting"
         else:
-            label = meetings[i - 1].strftime("%Y-%m")
+            label=meetings[i-1].strftime("%Y-%m")
 
-        weights[label] = weights.get(label, 0) + days / total_days
+        weights[label]=weights.get(label,0)+days/total
 
     return weights
 
-# Build contract weights
-contract_weights = {}
-
-for c, row in expiry_df.iterrows():
-    end = row["ExpiryDate"]
-    start = end - DateOffset(months=3)
-    contract_weights[c] = contract_meeting_weights(start, end)
+# build contract exposures
+contract_weights={}
+for c,row in expiry_df.iterrows():
+    end=row["ExpiryDate"]
+    start=end-DateOffset(months=3)
+    contract_weights[c]=contract_meeting_weights(start,end)
 
 # ------------------------------------------------------------
 # 3) Convert trade label → contract coefficients
@@ -3608,114 +3607,116 @@ for c, row in expiry_df.iterrows():
 
 def trade_contract_weights(label):
 
-    key = (label.replace("3M ","")
-                .replace("6M ","")
-                .replace("12M ","")
-                .replace("Spread: ","")
-                .replace("Fly: ","")
-                .replace("Double Fly: ",""))
+    key=(label.replace("3M ","").replace("6M ","").replace("12M ","")
+             .replace("Spread: ","").replace("Fly: ","").replace("Double Fly: ",""))
 
-    key = key.replace("2x","").replace("3x","")
-    parts = [p for p in key.replace("+","-").split("-") if p!=""]
+    key=key.replace("2x","").replace("3x","")
+    parts=[p for p in key.replace("+","-").split("-") if p!=""]
 
-    if len(parts) == 2:
-        w = [1,-1]
-    elif len(parts) == 3:
-        w = [1,-2,1]
-    elif len(parts) == 4:
-        w = [1,-3,3,-1]
-    else:
-        return None
+    if len(parts)==2: w=[1,-1]
+    elif len(parts)==3: w=[1,-2,1]
+    elif len(parts)==4: w=[1,-3,3,-1]
+    else: return None
 
     return dict(zip(parts,w))
 
 # ------------------------------------------------------------
-# 4) Build trade → meeting exposure matrix
+# 4) Build MEETING RATE EXPOSURE matrix
+# (rate sensitivity, not pnl yet)
 # ------------------------------------------------------------
 
-records = []
+records=[]
 
 for trade in mispricing_series.index:
 
-    cw = trade_contract_weights(trade)
-    if cw is None:
-        continue
+    cw=trade_contract_weights(trade)
+    if cw is None: continue
 
-    meeting_exp = {}
+    meeting_exp={}
 
-    for contract, coef in cw.items():
+    for contract,coef in cw.items():
 
-        if contract not in contract_weights:
-            continue
+        if contract not in contract_weights: continue
 
-        for m, w in contract_weights[contract].items():
-            meeting_exp[m] = meeting_exp.get(m,0) + coef*w
+        for m,w in contract_weights[contract].items():
+            meeting_exp[m]=meeting_exp.get(m,0)+coef*w
 
-    meeting_exp["Trade"] = trade
+    meeting_exp["Trade"]=trade
     records.append(meeting_exp)
 
-exposure_df = pd.DataFrame(records).set_index("Trade").fillna(0)
+exposure_df=pd.DataFrame(records).set_index("Trade").fillna(0)
 
-st.subheader("Meeting Exposure Matrix (bp change in trade per 1bp meeting repricing)")
+st.subheader("Rate Exposure Matrix (per 1bp policy change)")
 st.dataframe(exposure_df)
 
 # ------------------------------------------------------------
-# 5) Interactive position builder
+# 5) Interactive position builder (WITH SIDE)
 # ------------------------------------------------------------
 
 st.subheader("Position Policy Impact")
 
-trades = exposure_df.index.tolist()
+trades=exposure_df.index.tolist()
 
-c1,c2 = st.columns(2)
+c1,c2=st.columns(2)
 
 with c1:
-    tA = st.selectbox("Trade A", trades)
-    lA = st.number_input("Lots A", value=100, step=25)
+    tA=st.selectbox("Trade A",trades)
+    sideA=st.radio("Side A",["BUY","SELL"],horizontal=True)
+    lA=st.number_input("Lots A",value=100,step=25)
 
 with c2:
-    tB = st.selectbox("Trade B", trades, index=min(1,len(trades)-1))
-    lB = st.number_input("Lots B", value=0, step=25)
+    tB=st.selectbox("Trade B",trades,index=min(1,len(trades)-1))
+    sideB=st.radio("Side B",["BUY","SELL"],horizontal=True)
+    lB=st.number_input("Lots B",value=0,step=25)
 
-net_exp = exposure_df.loc[tA]*lA + exposure_df.loc[tB]*lB
-net_exp = net_exp[net_exp.abs() > 1e-6]
+signA = 1 if sideA=="BUY" else -1
+signB = 1 if sideB=="BUY" else -1
 
-st.subheader("Meeting Sensitivity (bp of trade value per 1bp meeting surprise)")
-st.dataframe(net_exp.to_frame("Exposure"))
+# rate sensitivity
+rate_expA = exposure_df.loc[tA]*lA
+rate_expB = exposure_df.loc[tB]*lB
+rate_exp = rate_expA + rate_expB
+
+# convert to PnL sensitivity (SR3 price = 100-rate)
+pnl_exp = -(rate_expA*signA + rate_expB*signB)
+pnl_exp = pnl_exp[pnl_exp.abs()>1e-6]
+
+st.subheader("Meeting Sensitivity (PnL per 1bp surprise)")
+st.dataframe(pnl_exp.to_frame("PnL sensitivity"))
 
 # ------------------------------------------------------------
 # 6) Bar chart
 # ------------------------------------------------------------
 
-fig, ax = plt.subplots()
-net_exp.plot(kind="bar", ax=ax)
-ax.set_ylabel("Trade value change per 1bp repricing")
-ax.set_title("Which FOMC meetings drive this position")
+fig,ax=plt.subplots(figsize=(10,4))
+pnl_exp.plot(kind="bar",ax=ax)
+ax.set_ylabel("PnL change per 1bp policy surprise")
+ax.set_title("Which FOMC meetings drive your PnL")
 st.pyplot(fig)
 
 # ------------------------------------------------------------
 # 7) Policy interpretation
 # ------------------------------------------------------------
 
-misA = mispricing_series.get(tA,0)*lA
-misB = mispricing_series.get(tB,0)*lB
-net_mis = misA + misB
-
 st.subheader("Policy Interpretation")
 
-if abs(net_mis) < 1e-6:
-    st.info("Position already near fair value")
+if len(pnl_exp)==0:
+    st.info("No meaningful policy exposure")
+
 else:
 
-    dominant = net_exp.abs().idxmax()
-    direction = "higher rates than priced" if net_mis < 0 else "lower rates than priced"
+    dominant=pnl_exp.abs().idxmax()
+    direction="HIGHER rates" if pnl_exp[dominant]>0 else "LOWER rates"
 
     st.markdown(f"""
-This position mainly depends on the **{dominant} FOMC meeting**.
+### What the trade is betting on
 
-To move toward fair value, the market must price **{direction}** around that meeting.
+Your position is mainly exposed to the **{dominant} FOMC meeting**.
 
-Interpretation:
-You are not betting on time passing — you are betting that
-the expected policy decision at this specific meeting is mispriced.
+You profit if the market prices **{direction}** at that meeting
+relative to current expectations.
+
+This is NOT time decay.
+
+The trade only makes money if the policy path itself reprices.
 """)
