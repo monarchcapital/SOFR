@@ -3546,7 +3546,17 @@ except Exception as e:
 # ============================================================
 # SECTION 14 — CARRY, ROLL & REGIME TRADE FILTER (FINAL)
 # ============================================================
-
+# ---- FOMC calendar (update when needed)
+FOMC_DATES = [
+    "2026-03-18",
+    "2026-05-06",
+    "2026-06-17",
+    "2026-07-29",
+    "2026-09-16",
+    "2026-11-04",
+    "2026-12-16"
+]
+FOMC_DATES = pd.to_datetime(FOMC_DATES)
 st.header("14. Carry & Roll Trade Filter")
 
 import numpy as np
@@ -3748,7 +3758,67 @@ for trade,key in zip(merged.index,merged["Key"]):
 
 sens=pd.DataFrame(sens).set_index("Trade")
 st.dataframe(sens)
+# ============================================================
+# FOMC EVENT RISK ANALYSIS
+# ============================================================
 
+st.subheader("🏛 FOMC Event Risk")
+
+# find next meeting
+future_meetings = FOMC_DATES[FOMC_DATES > analysis_dt]
+if len(future_meetings) == 0:
+    st.info("No future FOMC date configured")
+else:
+
+    next_meeting = future_meetings.min()
+    days_to_meeting = (next_meeting - analysis_dt).days
+
+    st.write(f"Next FOMC: **{next_meeting.date()}**  ({days_to_meeting} days)")
+
+    # assumed policy shocks (bp)
+    HIKE = +0.25
+    CUT  = -0.25
+    PAUSE = 0.0
+
+    def trade_weights(key):
+        key=key.replace("2x","").replace("3x","")
+        parts=key.replace("+","-").split("-")
+        parts=[p for p in parts if p!=""]
+        w={}
+        if len(parts)==2:
+            w[parts[0]]=1; w[parts[1]]=-1
+        elif len(parts)==3:
+            w[parts[0]]=1; w[parts[1]]=-2; w[parts[2]]=1
+        elif len(parts)==4:
+            w[parts[0]]=1; w[parts[1]]=-3; w[parts[2]]=3; w[parts[3]]=-1
+        return pd.Series(w)
+
+    def shock_curve(weights, shock):
+        # front loaded policy shock
+        maturities = ttm.loc[weights.index]
+        decay = np.exp(-3*maturities)   # front reacts most
+        return np.dot(weights, shock*decay)
+
+    rows=[]
+
+    for trade,key,carry,mis in zip(merged.index,merged["Key"],merged["Carry+Roll"],merged["Mispricing"]):
+
+        w=trade_weights(key).reindex(rates.index).fillna(0)
+
+        pnl_pause = carry * days_to_meeting
+        pnl_hike  = shock_curve(w,HIKE)
+        pnl_cut   = shock_curve(w,CUT)
+
+        rows.append({
+            "Trade":trade,
+            "Days to Fix":abs(mis/carry) if carry!=0 else np.nan,
+            "PnL to Meeting (Pause)":pnl_pause,
+            "PnL if Hike":pnl_hike,
+            "PnL if Cut":pnl_cut
+        })
+
+    event_df=pd.DataFrame(rows).set_index("Trade")
+    st.dataframe(event_df)
 # ============================================================
 # REGIME EXPLAINER
 # ============================================================
