@@ -1790,6 +1790,7 @@ if not price_df_filtered.empty:
             else:
                 st.warning("Generalized Minimum Variance Hedging calculation failed for the selected trade. Check if enough historical data is available after filtering.")
 
+
         # --------------------------- 8. PCA-Based Factor Hedging Strategy (Sensitivity Hedging - MODIFIED) ---------------------------
         st.header("8. PCA-Based Factor Hedging Strategy (Sensitivity Hedging)")
         st.markdown(f"""
@@ -3541,136 +3542,95 @@ try:
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
+#---------------------------------------section 12 end here---------------#
 # ===============================
-# CARRY & ROLL ANALYSIS SECTION
-# Drop-in module for SOFR PCA Analyzer
+# SECTION 14 — CARRY & ROLL TRADE FILTER (INLINE VERSION)
+# Paste this directly into your main Streamlit file
+# Requires: analysis_dt, historical_outrights_df, expiry_df, mispricing_series
 # ===============================
 
-import pandas as pd
-import numpy as np
-import streamlit as st
+st.header("14. Carry & Roll Trade Filter")
 
-# -------------------------------------------------
-# 1) Convert futures prices -> implied rates
-# -------------------------------------------------
+# --- Helper Functions ---
+def _prices_to_rates(series):
+    return 100.0 - series
 
-def prices_to_rates(outright_df: pd.DataFrame) -> pd.DataFrame:
-    # Price = 100 - rate
-    return 100.0 - outright_df
 
-# -------------------------------------------------
-# 2) Compute maturity in years from expiry table
-# expiry_df indexed by Contract with ExpiryDate
-# -------------------------------------------------
+def _time_to_maturity(expiry_df, valuation_date):
+    return ((expiry_df['ExpiryDate'] - valuation_date).dt.days / 365.0).clip(lower=1/365)
 
-def compute_time_to_maturity(expiry_df: pd.DataFrame, valuation_date) -> pd.Series:
-    ttm = (expiry_df['ExpiryDate'] - valuation_date).dt.days / 365.0
-    return ttm.clip(lower=1/365)  # avoid zero
 
-# -------------------------------------------------
-# 3) Curve slope dF/dT (forward slope approximation)
-# -------------------------------------------------
-
-def compute_forward_slope(rates_row: pd.Series, ttm: pd.Series) -> pd.Series:
-    contracts = rates_row.index.intersection(ttm.index)
-    rates = rates_row[contracts]
-    times = ttm[contracts]
-
+def _forward_slope(rates, ttm):
+    contracts = list(rates.index.intersection(ttm.index))
     slopes = {}
     for i in range(len(contracts)-1):
         c1, c2 = contracts[i], contracts[i+1]
-        dt = times[c2] - times[c1]
-        if dt <= 0:
-            slopes[c1] = 0.0
-        else:
-            slopes[c1] = (rates[c2] - rates[c1]) / dt
+        dt = ttm[c2] - ttm[c1]
+        slopes[c1] = 0.0 if dt <= 0 else (rates[c2] - rates[c1]) / dt
     slopes[contracts[-1]] = slopes[list(slopes.keys())[-1]]
     return pd.Series(slopes)
 
-# -------------------------------------------------
-# 4) Roll (daily expected drift from maturity decay)
-# -------------------------------------------------
 
-def compute_roll(slopes: pd.Series) -> pd.Series:
-    # dPrice/dt = -dF/dT * 1/365
+def _roll(slopes):
     return -slopes / 365.0
 
-# -------------------------------------------------
-# 5) Spread carry + roll
-# -------------------------------------------------
 
-def compute_spread_carry_roll(rates_row, roll_series, k=1):
-    contracts = list(rates_row.index)
+def _spread_carry_roll(rates, roll, k=1):
+    contracts = list(rates.index)
     data = {}
     for i in range(len(contracts)-k):
         c1, c2 = contracts[i], contracts[i+k]
-        carry = rates_row[c1] - rates_row[c2]
-        roll = roll_series[c2] - roll_series[c1]
-        data[f"{c1}-{c2}"] = carry + roll
+        carry = rates[c1] - rates[c2]
+        r = roll[c2] - roll[c1]
+        data[f"{c1}-{c2}"] = carry + r
     return pd.Series(data, name="Carry+Roll")
 
-# -------------------------------------------------
-# 6) Fly carry + roll
-# -------------------------------------------------
 
-def compute_fly_carry_roll(rates_row, roll_series, k=1):
-    contracts = list(rates_row.index)
+def _fly_carry_roll(rates, roll, k=1):
+    contracts = list(rates.index)
     data = {}
     for i in range(len(contracts)-2*k):
         c1, c2, c3 = contracts[i], contracts[i+k], contracts[i+2*k]
-        carry = rates_row[c1] - 2*rates_row[c2] + rates_row[c3]
-        roll = roll_series[c1] - 2*roll_series[c2] + roll_series[c3]
-        data[f"{c1}-2x{c2}+{c3}"] = carry + roll
+        carry = rates[c1] - 2*rates[c2] + rates[c3]
+        r = roll[c1] - 2*roll[c2] + roll[c3]
+        data[f"{c1}-2x{c2}+{c3}"] = carry + r
     return pd.Series(data, name="Carry+Roll")
 
-# -------------------------------------------------
-# 7) Rank trades with carry filter
-# -------------------------------------------------
+# --- Compute Today Curve ---
+try:
+    outrights_today = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
+    outrights_today.index = outrights_today.index.str.replace(' (Original)', '')
+except KeyError:
+    st.warning("Selected date not available for carry/roll computation")
+    st.stop()
 
-def rank_trades(mispricing: pd.Series, carry_roll: pd.Series):
-    aligned = mispricing.index.intersection(carry_roll.index)
-    df = pd.DataFrame({
-        'Mispricing': mispricing[aligned],
-        'Carry+Roll': carry_roll[aligned]
+rates = _prices_to_rates(outrights_today)
+ttm = _time_to_maturity(expiry_df, analysis_dt)
+slopes = _forward_slope(rates, ttm)
+roll = _roll(slopes)
+
+# --- Instruments ---
+spreads_cr = _spread_carry_roll(rates, roll, k=1)
+flies_cr = _fly_carry_roll(rates, roll, k=1)
+carry_roll_all = pd.concat([spreads_cr, flies_cr])
+
+st.subheader("Carry + Roll (Daily Expected Drift)")
+st.dataframe(carry_roll_all.to_frame())
+
+# --- Tradable Ranking ---
+if mispricing_series is not None and not mispricing_series.empty:
+    aligned = mispricing_series.index.intersection(carry_roll_all.index)
+    ranked = pd.DataFrame({
+        'Mispricing (Rate %)': mispricing_series[aligned],
+        'Carry+Roll': carry_roll_all[aligned]
     })
-    df['Tradable Score'] = df['Mispricing'] * np.sign(df['Carry+Roll'])
-    return df.sort_values('Tradable Score', ascending=False)
+    ranked['Tradable Score'] = ranked['Mispricing (Rate %)'] * np.sign(ranked['Carry+Roll'])
+    ranked = ranked.sort_values('Tradable Score', ascending=False)
 
-# -------------------------------------------------
-# 8) Streamlit display section
-# -------------------------------------------------
-
-def render_carry_roll_section(analysis_dt, historical_outrights_df, expiry_df, mispricing_series):
-    st.header("9. Carry & Roll Trade Filter")
-
-    try:
-        outrights_today = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
-        outrights_today.index = outrights_today.index.str.replace(' (Original)', '')
-    except KeyError:
-        st.warning("Selected date not available for carry/roll computation")
-        return
-
-    rates = prices_to_rates(outrights_today.to_frame().T).iloc[0]
-    ttm = compute_time_to_maturity(expiry_df, analysis_dt)
-    slopes = compute_forward_slope(rates, ttm)
-    roll = compute_roll(slopes)
-
-    spreads_cr = compute_spread_carry_roll(rates, roll, k=1)
-    flies_cr = compute_fly_carry_roll(rates, roll, k=1)
-
-    st.subheader("Spread Carry + Roll")
-    st.dataframe(spreads_cr.to_frame())
-
-    st.subheader("Fly Carry + Roll")
-    st.dataframe(flies_cr.to_frame())
-
-    if mispricing_series is not None and not mispricing_series.empty:
-        st.subheader("Tradable Opportunities (Carry Filtered)")
-        ranked = rank_trades(mispricing_series, pd.concat([spreads_cr, flies_cr]))
-        st.dataframe(ranked)
-
-
-
+    st.subheader("Tradable Opportunities (Carry Filtered)")
+    st.dataframe(ranked)
+else:
+    st.info("Mispricing data unavailable for ranking.")
 
 
 
