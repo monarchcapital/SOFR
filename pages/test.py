@@ -3810,3 +3810,49 @@ you are expressing a view that the Fed path should be:
 
 The table above shows exactly which meetings your position disagrees with the market on.
 """)
+# ------------------------------------------------------------
+# 9) CURRENT MARKET PREMIUM / DISCOUNT
+# ------------------------------------------------------------
+
+st.subheader("Current Market Premium (What You Pay For This View)")
+
+# premium in bp from fair value
+premA = mispricing_series.get(tA,0)
+premB = mispricing_series.get(tB,0)
+
+# signed by position
+signedA = premA * signA
+signedB = premB * signB
+
+net_premium_bp = signedA*lA + signedB*lB
+net_premium_dollar = net_premium_bp * BP_VALUE
+
+st.markdown(f"""
+### Trade Pricing vs Fair Value
+
+**{tA}**
+- Market premium: {premA:.2f} bp
+- Position impact: {(signedA*lA):.2f} bp
+
+**{tB}**
+- Market premium: {premB:.2f} bp
+- Position impact: {(signedB*lB):.2f} bp
+
+---
+
+### Net Position Pricing
+
+You are entering the position at:
+
+**{net_premium_bp:.2f} bp from fair value**  
+≈ **${net_premium_dollar:,.0f}**
+
+""")
+
+# interpretation
+if net_premium_bp > 0:
+    st.info("You are PAYING for this macro view (market disagrees with you).")
+elif net_premium_bp < 0:
+    st.success("You are RECEIVING premium (market is giving you this view cheaply).")
+else:
+    st.write("Position entered near fair value.")
