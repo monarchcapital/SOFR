@@ -3544,12 +3544,7 @@ except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
 #---------------------------------------section 12 end here---------------#
 # ============================================================
-# SECTION 14 — CARRY & ROLL TRADE FILTER (FULL INLINE BLOCK)
-# Requires:
-# analysis_dt
-# historical_outrights_df
-# expiry_df
-# mispricing_series   (from your PCA mispricing section)
+# SECTION 14 — CARRY & ROLL TRADE FILTER (FULL EDUCATIONAL)
 # ============================================================
 
 st.header("14. Carry & Roll Trade Filter")
@@ -3557,9 +3552,72 @@ st.header("14. Carry & Roll Trade Filter")
 import numpy as np
 import pandas as pd
 
-# -------------------------------
+# ============================================================
+# EXPLANATION PANEL
+# ============================================================
+
+with st.expander("📘 What is Carry & Roll and how to interpret trades?"):
+
+    st.markdown("""
+### Futures do NOT pay coupons
+Instead they **converge to realised overnight rates**.
+
+So if the yield curve does not change tomorrow:
+
+> Prices STILL move.
+
+That predictable movement = **Carry + Roll**
+
+---
+
+### Mathematical intuition
+
+Let price = `100 - expected rate`
+
+As time passes:
+- Near contracts become realised sooner
+- Far contracts still contain expectations
+
+Therefore spreads naturally change.
+
+---
+
+### Instruments
+
+**Spread**
+F₁ − F₂  
+Measures slope of curve
+
+**Fly**
+F₁ − 2F₂ + F₃  
+Measures curvature
+
+**Double Fly**
+F₁ − 3F₂ + 3F₃ − F₄  
+Measures curvature acceleration
+
+---
+
+### Why traders care
+
+We only trade anomalies that also decay toward fair value.
+
+| Situation | Meaning | Trade |
+|--------|------|------|
+Cheap + positive carry | rises naturally | BUY |
+Rich + positive carry | falls naturally | SELL |
+Cheap + negative carry | trap | AVOID |
+Rich + negative carry | trap | AVOID |
+
+So the model answers:
+
+> Not "what is weird?"  
+> But "what gets fixed automatically?"
+""")
+
+# ============================================================
 # Helper functions
-# -------------------------------
+# ============================================================
 
 def _prices_to_rates(series):
     return 100.0 - series
@@ -3580,58 +3638,36 @@ def _forward_slope(rates, ttm):
 def _roll(slopes):
     return -slopes / 365.0
 
-def _spread_carry_roll(rates, roll, k=1):
-    contracts = list(rates.index)
-    data = {}
-    for i in range(len(contracts)-k):
-        c1, c2 = contracts[i], contracts[i+k]
-        carry = rates[c1] - rates[c2]
-        r = roll[c2] - roll[c1]
-        data[f"{c1}-{c2}"] = carry + r
-    return pd.Series(data, name="Carry+Roll")
-
-def _fly_carry_roll(rates, roll, k=1):
-    contracts = list(rates.index)
-    data = {}
-    for i in range(len(contracts)-2*k):
-        c1, c2, c3 = contracts[i], contracts[i+k], contracts[i+2*k]
-        carry = rates[c1] - 2*rates[c2] + rates[c3]
-        r = roll[c1] - 2*roll[c2] + roll[c3]
-        data[f"{c1}-2x{c2}+{c3}"] = carry + r
-    return pd.Series(data, name="Carry+Roll")
-
 def _clean_label(label):
     if ': ' in label:
         return label.split(': ', 1)[1]
     return label
 
 def _trade_action(mispricing, carry):
-    # Mispricing = Market - Fair
     if mispricing > 0 and carry > 0:
-        return "SELL (rich, decay helps)"
+        return "SELL (rich & decays down)"
     if mispricing < 0 and carry < 0:
-        return "BUY (cheap, decay helps)"
+        return "BUY (cheap & rises)"
     if mispricing > 0 and carry < 0:
-        return "AVOID (rich but costs carry)"
+        return "AVOID (rich but bleeds)"
     if mispricing < 0 and carry > 0:
-        return "AVOID (cheap but costs carry)"
+        return "AVOID (cheap but bleeds)"
     return "NEUTRAL"
 
 def _family(label):
-    if '-3x' in label:
-        return 'Double Fly'
-    if '-2x' in label:
-        return 'Fly'
+    if 'Double Fly' in label: return 'Double Fly'
+    if 'Fly' in label: return 'Fly'
     return 'Spread'
 
-# -------------------------------
+# ============================================================
 # Build today's curve
-# -------------------------------
+# ============================================================
+
 try:
     outrights_today = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
     outrights_today.index = outrights_today.index.str.replace(' (Original)', '')
 except KeyError:
-    st.warning("Selected date not available for carry/roll computation")
+    st.warning("Selected date not available")
     st.stop()
 
 rates = _prices_to_rates(outrights_today)
@@ -3639,17 +3675,53 @@ ttm = _time_to_maturity(expiry_df, analysis_dt)
 slopes = _forward_slope(rates, ttm)
 roll = _roll(slopes)
 
-spreads_cr = _spread_carry_roll(rates, roll)
-flies_cr = _fly_carry_roll(rates, roll)
+# ============================================================
+# Generate all derivative families
+# ============================================================
 
-carry_roll_all = pd.concat([spreads_cr, flies_cr])
+all_cr = []
+
+for k, label in [(1,"3M"), (2,"6M"), (4,"12M")]:
+
+    contracts = list(rates.index)
+
+    # spreads
+    s = {}
+    for i in range(len(contracts)-k):
+        c1, c2 = contracts[i], contracts[i+k]
+        carry = rates[c1] - rates[c2]
+        r = roll[c2] - roll[c1]
+        s[f"{label} Spread: {c1}-{c2}"] = carry + r
+    all_cr.append(pd.Series(s))
+
+    # flies
+    f = {}
+    for i in range(len(contracts)-2*k):
+        c1, c2, c3 = contracts[i], contracts[i+k], contracts[i+2*k]
+        carry = rates[c1] - 2*rates[c2] + rates[c3]
+        r = roll[c1] - 2*roll[c2] + roll[c3]
+        f[f"{label} Fly: {c1}-2x{c2}+{c3}"] = carry + r
+    all_cr.append(pd.Series(f))
+
+    # double flies
+    dfly = {}
+    for i in range(len(contracts)-3*k):
+        c1, c2, c3, c4 = contracts[i], contracts[i+k], contracts[i+2*k], contracts[i+3*k]
+        carry = rates[c1] - 3*rates[c2] + 3*rates[c3] - rates[c4]
+        r = roll[c1] - 3*roll[c2] + 3*roll[c3] - roll[c4]
+        dfly[f"{label} Double Fly: {c1}-3x{c2}+3x{c3}-{c4}"] = carry + r
+    if dfly:
+        all_cr.append(pd.Series(dfly))
+
+carry_roll_all = pd.concat(all_cr).dropna()
 
 st.subheader("Carry + Roll (Daily Expected Drift)")
-st.dataframe(carry_roll_all.to_frame())
+st.dataframe(carry_roll_all.to_frame("Carry+Roll"))
 
-# -------------------------------
+# ============================================================
 # Match with PCA mispricing
-# -------------------------------
+# ============================================================
+
 if mispricing_series is not None and not mispricing_series.empty:
 
     mispricing_clean = mispricing_series.copy()
@@ -3662,11 +3734,9 @@ if mispricing_series is not None and not mispricing_series.empty:
         'Carry+Roll': carry_roll_all.loc[aligned]
     })
 
-    # keep only trades where carry works in your favor
     ranked['Tradable Score'] = ranked['Mispricing (Rate %)'] * np.sign(ranked['Carry+Roll'])
     ranked = ranked[ranked['Tradable Score'] > 0]
 
-    # explanations
     ranked['Action'] = [_trade_action(m, c) for m, c in zip(ranked['Mispricing (Rate %)'], ranked['Carry+Roll'])]
     ranked['Family'] = [_family(idx) for idx in ranked.index]
     ranked['Expected Move'] = np.where(ranked['Mispricing (Rate %)'] > 0,
