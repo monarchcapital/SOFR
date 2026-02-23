@@ -1789,16 +1789,6 @@ if not price_df_filtered.empty:
                 )
             else:
                 st.warning("Generalized Minimum Variance Hedging calculation failed for the selected trade. Check if enough historical data is available after filtering.")
-#------------------------------------------------------carry and roll-------------#
-            from carry_roll_section import render_carry_roll_section
-            
-            render_carry_roll_section(
-                analysis_dt,
-                historical_outrights_df,
-                expiry_df,
-                mispricing_series
-            )
-#------------------------------------------------------------carry and roll end---------------------#  
 
         # --------------------------- 8. PCA-Based Factor Hedging Strategy (Sensitivity Hedging - MODIFIED) ---------------------------
         st.header("8. PCA-Based Factor Hedging Strategy (Sensitivity Hedging)")
