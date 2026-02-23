@@ -3544,7 +3544,7 @@ except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
 #---------------------------------------section 12 end here---------------#
 # ============================================================
-# SECTION 14 — SR3 FOMC POLICY EXPOSURE ENGINE (CORRECT LOGIC)
+# SECTION 14 — SR3 FOMC POLICY EXPOSURE ENGINE (CORRECTED)
 # ============================================================
 
 st.header("14. Policy Path Interpretation")
@@ -3555,7 +3555,7 @@ import matplotlib.pyplot as plt
 from pandas.tseries.offsets import DateOffset
 
 # ------------------------------------------------------------
-# 1) FOMC calendar to Dec-2029
+# 1) FOMC calendar (extend as needed)
 # ------------------------------------------------------------
 
 FOMC = pd.to_datetime([
@@ -3566,76 +3566,97 @@ FOMC = pd.to_datetime([
 ])
 
 # ------------------------------------------------------------
-# 2) Build SR3 meeting weights (day accurate)
+# 2) Correct SR3 meeting weights
+# A meeting controls the rate AFTER it occurs
 # ------------------------------------------------------------
 
-def contract_meeting_weights(start,end):
+def contract_meeting_weights(start, end):
 
-    total=(end-start).days
-    weights={}
-    timeline=[start]+list(FOMC[(FOMC>start)&(FOMC<end)])+[end]
+    total_days = (end - start).days
+    weights = {}
 
-    for i in range(len(timeline)-1):
-        s=timeline[i]
-        e=timeline[i+1]
-        days=(e-s).days
-        meeting_label=e.strftime("%Y-%m") if e!=end else "Terminal"
-        weights[meeting_label]=weights.get(meeting_label,0)+days/total
+    meetings = list(FOMC[(FOMC > start) & (FOMC < end)])
+    timeline = [start] + meetings + [end]
+
+    for i in range(len(timeline) - 1):
+
+        s = timeline[i]
+        e = timeline[i + 1]
+        days = (e - s).days
+
+        # Rate in this interval set by LAST meeting
+        if i == 0:
+            label = "Before First Meeting"
+        else:
+            label = meetings[i - 1].strftime("%Y-%m")
+
+        weights[label] = weights.get(label, 0) + days / total_days
 
     return weights
 
-contract_weights={}
+# Build contract weights
+contract_weights = {}
 
-for c,row in expiry_df.iterrows():
-    end=row["ExpiryDate"]
-    start=end-DateOffset(months=3)
-    contract_weights[c]=contract_meeting_weights(start,end)
+for c, row in expiry_df.iterrows():
+    end = row["ExpiryDate"]
+    start = end - DateOffset(months=3)
+    contract_weights[c] = contract_meeting_weights(start, end)
 
 # ------------------------------------------------------------
-# 3) Convert trade label → contract weights
+# 3) Convert trade label → contract coefficients
 # ------------------------------------------------------------
 
 def trade_contract_weights(label):
 
-    key=(label.replace("3M ","").replace("6M ","").replace("12M ","")
-             .replace("Spread: ","").replace("Fly: ","").replace("Double Fly: ",""))
+    key = (label.replace("3M ","")
+                .replace("6M ","")
+                .replace("12M ","")
+                .replace("Spread: ","")
+                .replace("Fly: ","")
+                .replace("Double Fly: ",""))
 
-    key=key.replace("2x","").replace("3x","")
-    parts=[p for p in key.replace("+","-").split("-") if p!=""]
+    key = key.replace("2x","").replace("3x","")
+    parts = [p for p in key.replace("+","-").split("-") if p!=""]
 
-    if len(parts)==2: w=[1,-1]
-    elif len(parts)==3: w=[1,-2,1]
-    elif len(parts)==4: w=[1,-3,3,-1]
-    else: return None
+    if len(parts) == 2:
+        w = [1,-1]
+    elif len(parts) == 3:
+        w = [1,-2,1]
+    elif len(parts) == 4:
+        w = [1,-3,3,-1]
+    else:
+        return None
 
     return dict(zip(parts,w))
 
 # ------------------------------------------------------------
-# 4) Build meeting exposure matrix
+# 4) Build trade → meeting exposure matrix
 # ------------------------------------------------------------
 
-records=[]
+records = []
 
 for trade in mispricing_series.index:
 
-    cw=trade_contract_weights(trade)
-    if cw is None: continue
+    cw = trade_contract_weights(trade)
+    if cw is None:
+        continue
 
-    meeting_exp={}
+    meeting_exp = {}
 
-    for contract,coef in cw.items():
+    for contract, coef in cw.items():
 
-        if contract not in contract_weights: continue
+        if contract not in contract_weights:
+            continue
 
-        for m,w in contract_weights[contract].items():
-            meeting_exp[m]=meeting_exp.get(m,0)+coef*w
+        for m, w in contract_weights[contract].items():
+            meeting_exp[m] = meeting_exp.get(m,0) + coef*w
 
-    meeting_exp["Trade"]=trade
+    meeting_exp["Trade"] = trade
     records.append(meeting_exp)
 
-exposure_df=pd.DataFrame(records).set_index("Trade").fillna(0)
+exposure_df = pd.DataFrame(records).set_index("Trade").fillna(0)
 
-st.subheader("Meeting Exposure Matrix")
+st.subheader("Meeting Exposure Matrix (bp change in trade per 1bp meeting repricing)")
 st.dataframe(exposure_df)
 
 # ------------------------------------------------------------
@@ -3644,69 +3665,57 @@ st.dataframe(exposure_df)
 
 st.subheader("Position Policy Impact")
 
-trades=exposure_df.index.tolist()
+trades = exposure_df.index.tolist()
 
-c1,c2=st.columns(2)
+c1,c2 = st.columns(2)
 
 with c1:
-    tA=st.selectbox("Trade A",trades)
-    lA=st.number_input("Lots A",value=100,step=25)
+    tA = st.selectbox("Trade A", trades)
+    lA = st.number_input("Lots A", value=100, step=25)
 
 with c2:
-    tB=st.selectbox("Trade B",trades,index=min(1,len(trades)-1))
-    lB=st.number_input("Lots B",value=0,step=25)
+    tB = st.selectbox("Trade B", trades, index=min(1,len(trades)-1))
+    lB = st.number_input("Lots B", value=0, step=25)
 
-net_exp=exposure_df.loc[tA]*lA + exposure_df.loc[tB]*lB
-net_exp=net_exp[net_exp.abs()>1e-6]
+net_exp = exposure_df.loc[tA]*lA + exposure_df.loc[tB]*lB
+net_exp = net_exp[net_exp.abs() > 1e-6]
 
-st.subheader("Meeting Sensitivity (per 1bp policy surprise)")
+st.subheader("Meeting Sensitivity (bp of trade value per 1bp meeting surprise)")
 st.dataframe(net_exp.to_frame("Exposure"))
 
 # ------------------------------------------------------------
 # 6) Bar chart
 # ------------------------------------------------------------
 
-fig,ax=plt.subplots()
-net_exp.plot(kind="bar",ax=ax)
-ax.set_ylabel("Trade PnL sensitivity per 1bp surprise")
+fig, ax = plt.subplots()
+net_exp.plot(kind="bar", ax=ax)
+ax.set_ylabel("Trade value change per 1bp repricing")
+ax.set_title("Which FOMC meetings drive this position")
 st.pyplot(fig)
 
 # ------------------------------------------------------------
-# 7) Required policy change to reach fair value
+# 7) Policy interpretation
 # ------------------------------------------------------------
 
-misA=mispricing_series.get(tA,0)*lA
-misB=mispricing_series.get(tB,0)*lB
-net_mis=misA+misB
+misA = mispricing_series.get(tA,0)*lA
+misB = mispricing_series.get(tB,0)*lB
+net_mis = misA + misB
 
-total_sens=net_exp.abs().sum()
+st.subheader("Policy Interpretation")
 
-st.subheader("Required Fed Action")
-
-if total_sens<1e-6:
-    st.info("No meaningful meeting exposure")
+if abs(net_mis) < 1e-6:
+    st.info("Position already near fair value")
 else:
 
-    avg_shift=-net_mis/total_sens
-    dominant=net_exp.abs().idxmax()
-
-    st.write(f"Net mispricing: {net_mis:.2f} bp")
-    st.write(f"Average policy shift needed: {avg_shift:.2f} bp")
-
-    if avg_shift>0:
-        direction="more easing (cuts earlier/deeper)"
-    else:
-        direction="less easing or hikes"
+    dominant = net_exp.abs().idxmax()
+    direction = "higher rates than priced" if net_mis < 0 else "lower rates than priced"
 
     st.markdown(f"""
-### Interpretation
+This position mainly depends on the **{dominant} FOMC meeting**.
 
-The trade is mainly driven by **{dominant} meeting**.
+To move toward fair value, the market must price **{direction}** around that meeting.
 
-To reach fair value the Fed would need:
-
-• {direction}
-• roughly {abs(avg_shift):.1f}bp repricing distributed across meetings
-
-This is not time decay — the trade resolves only if policy expectations change.
+Interpretation:
+You are not betting on time passing — you are betting that
+the expected policy decision at this specific meeting is mispriced.
 """)
