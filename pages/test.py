@@ -3544,7 +3544,7 @@ except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
 #---------------------------------------section 12 end here---------------#
 # ============================================================
-# SECTION 14 — POLICY PATH PnL ENGINE (CONTRACT LEVEL CORRECT)
+# SECTION 14 — SR3 POLICY PATH ENGINE (FINAL CORRECT VERSION)
 # ============================================================
 
 st.header("14. Policy Path Interpretation")
@@ -3553,11 +3553,13 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pandas.tseries.offsets import DateOffset
+import re
 
-BP_VALUE = 25  # $ per bp per SR3 contract
+BP_VALUE = 25  # $ per bp per contract
+
 
 # ------------------------------------------------------------
-# 1) FOMC CALENDAR
+# 1) FOMC CALENDAR (TO 2029)
 # ------------------------------------------------------------
 
 FOMC = pd.to_datetime([
@@ -3567,54 +3569,81 @@ FOMC = pd.to_datetime([
 "2029-01-31","2029-03-20","2029-05-01","2029-06-19","2029-07-31","2029-09-18","2029-11-07","2029-12-18"
 ])
 
+
 # ------------------------------------------------------------
-# 2) CONTRACT MEETING FRACTIONS
+# 2) CONTRACT ACCRUAL WINDOW → MEETING WEIGHTS
 # ------------------------------------------------------------
 
 def contract_meeting_weights(start,end):
 
     total=(end-start).days
     weights={}
+
     meetings=list(FOMC[(FOMC>start)&(FOMC<end)])
     timeline=[start]+meetings+[end]
 
     for i in range(len(timeline)-1):
+
         s=timeline[i]
         e=timeline[i+1]
         days=(e-s).days
 
-        label="Before First Meeting" if i==0 else meetings[i-1].strftime("%Y-%m")
+        if i==0:
+            label="Before First Meeting"
+        else:
+            label=meetings[i-1].strftime("%Y-%m")
+
         weights[label]=weights.get(label,0)+days/total
 
     return weights
 
+
 contract_weights={}
+
 for c,row in expiry_df.iterrows():
+
     end=row["ExpiryDate"]
     start=end-DateOffset(months=3)
+
     contract_weights[c]=contract_meeting_weights(start,end)
 
+
 # ------------------------------------------------------------
-# 3) PARSE TRADE STRUCTURE
+# 3) UNIVERSAL TRADE PARSER (NO HARDCODING)
 # ------------------------------------------------------------
 
 def trade_contract_weights(label):
 
-    key=(label.replace("3M ","").replace("6M ","").replace("12M ","")
-             .replace("Spread: ","").replace("Fly: ","").replace("Double Fly: ",""))
+    key=(label.replace("3M ","")
+                .replace("6M ","")
+                .replace("12M ","")
+                .replace("Spread: ","")
+                .replace("Fly: ","")
+                .replace("Double Fly: ",""))
 
-    key=key.replace("2x","").replace("3x","")
-    parts=[p for p in key.replace("+","-").split("-") if p!=""]
+    tokens=re.findall(r'([+-]?[^+-]+)',key)
 
-    if len(parts)==2: w=[1,-1]
-    elif len(parts)==3: w=[1,-2,1]
-    elif len(parts)==4: w=[1,-3,3,-1]
-    else: return None
+    weights={}
 
-    return dict(zip(parts,w))
+    for t in tokens:
+
+        sign=-1 if t.startswith('-') else 1
+        t=t.replace('+','').replace('-','')
+
+        if 'x' in t:
+            mult,contract=t.split('x')
+            mult=int(mult)
+        else:
+            mult=1
+            contract=t
+
+        weights[contract]=weights.get(contract,0)+sign*mult
+
+    return weights
+
 
 # ------------------------------------------------------------
-# 4) BUILD MEETING → PnL SENSITIVITY (CORRECT)
+# 4) MEETING → PRICE SENSITIVITY PER TRADE
 # ------------------------------------------------------------
 
 records=[]
@@ -3622,33 +3651,32 @@ records=[]
 for trade in mispricing_series.index:
 
     structure=trade_contract_weights(trade)
-    if structure is None: continue
 
-    meeting_pnl={}
+    meeting_sens={}
 
-    for meeting in sorted({m for c in contract_weights.values() for m in c}):
+    for meeting in sorted({m for cw in contract_weights.values() for m in cw}):
 
-        pnl=0
+        sens=0
 
         for contract,coef in structure.items():
+
             if contract not in contract_weights: continue
 
             w=contract_weights[contract].get(meeting,0)
 
-            # meeting raises rate → price falls
-            price_move = -w  # in bp
+            # rate ↑ => price ↓
+            sens += coef * (-w)
 
-            pnl += coef * price_move * BP_VALUE  # $ per 1 lot
+        meeting_sens[meeting]=sens
 
-        meeting_pnl[meeting]=pnl
+    meeting_sens["Trade"]=trade
+    records.append(meeting_sens)
 
-    meeting_pnl["Trade"]=trade
-    records.append(meeting_pnl)
+sens_matrix=pd.DataFrame(records).set_index("Trade").fillna(0)
 
-pnl_matrix=pd.DataFrame(records).set_index("Trade").fillna(0)
+st.subheader("Rate Exposure Matrix (price bp per 1bp policy move)")
+st.dataframe(sens_matrix.round(4))
 
-st.subheader("PnL per 1bp meeting surprise ($ per lot)")
-st.dataframe(pnl_matrix.round(2))
 
 # ------------------------------------------------------------
 # 5) POSITION BUILDER
@@ -3656,7 +3684,7 @@ st.dataframe(pnl_matrix.round(2))
 
 st.subheader("Position Policy Impact")
 
-trades=pnl_matrix.index.tolist()
+trades=sens_matrix.index.tolist()
 
 c1,c2=st.columns(2)
 
@@ -3673,191 +3701,79 @@ with c2:
 signA=1 if sideA=="BUY" else -1
 signB=1 if sideB=="BUY" else -1
 
-net_pnl = pnl_matrix.loc[tA]*lA*signA + pnl_matrix.loc[tB]*lB*signB
-net_pnl = net_pnl[net_pnl.abs()>1e-6]
+net_rate = sens_matrix.loc[tA]*lA*signA + sens_matrix.loc[tB]*lB*signB
+net_rate = net_rate[net_rate.abs()>1e-6]
 
-st.subheader("Meeting PnL ($)")
-st.dataframe(net_pnl.to_frame("PnL per 1bp shock").round(2))
+net_pnl = net_rate * BP_VALUE
+
 
 # ------------------------------------------------------------
-# 6) BAR CHART
+# 6) MEETING PNL
 # ------------------------------------------------------------
+
+st.subheader("Meeting PnL ($ per 1bp surprise)")
+st.dataframe(net_pnl.to_frame("PnL").round(2))
 
 fig,ax=plt.subplots(figsize=(10,4))
 net_pnl.plot(kind="bar",ax=ax)
-ax.set_ylabel("Dollar PnL per 1bp meeting surprise")
+ax.set_ylabel("$ PnL per 1bp policy shock")
 ax.set_title("Which FOMC meetings drive your position")
 st.pyplot(fig)
+
+
 # ------------------------------------------------------------
-# 7) HUMAN INTERPRETATION LAYER
+# 7) CURRENT MARKET PREMIUM PER MEETING
 # ------------------------------------------------------------
 
-st.subheader("Policy Interpretation")
+st.subheader("Market Premium Embedded In Your Trade")
+
+misA=mispricing_series.get(tA,0)*lA*signA
+misB=mispricing_series.get(tB,0)*lB*signB
+total_mis=misA+misB
+
+weights=net_rate.abs()/net_rate.abs().sum()
+premium_per_meeting=weights*total_mis
+
+st.dataframe(pd.DataFrame({
+"Meeting":premium_per_meeting.index,
+"Premium(bp)":premium_per_meeting.values
+}).set_index("Meeting").round(3))
+
+
+# ------------------------------------------------------------
+# 8) HUMAN INTERPRETATION
+# ------------------------------------------------------------
+
+st.subheader("Human Interpretation")
 
 if len(net_pnl)==0:
-    st.info("No meaningful meeting exposure")
+    st.info("No policy exposure")
 
 else:
 
-    # dominant meeting
-    dominant = net_pnl.abs().idxmax()
-    dom_val = net_pnl[dominant]
+    dominant=net_pnl.abs().idxmax()
 
-    if dom_val > 0:
-        direction = "more hawkish (higher policy rate)"
+    hawkish=net_pnl[net_pnl>0].sum()
+    dovish=net_pnl[net_pnl<0].sum()
+
+    if hawkish>abs(dovish):
+        bias="market pricing TOO MANY CUTS vs your position"
+    elif abs(dovish)>hawkish:
+        bias="market pricing TOO MANY HIKES vs your position"
     else:
-        direction = "more dovish (lower policy rate)"
-
-    # classify trade type
-    pos_meetings = (net_pnl > 0).sum()
-    neg_meetings = (net_pnl < 0).sum()
-
-    if pos_meetings>0 and neg_meetings>0:
-        trade_type = "TIMING trade (shifts hikes/cuts across meetings)"
-    elif "Before First Meeting" in net_pnl.index and abs(net_pnl["Before First Meeting"])==net_pnl.abs().max():
-        trade_type = "NEAR-DATED anchored trade"
-    elif net_pnl.index[-1]==dominant:
-        trade_type = "TERMINAL rate trade"
-    else:
-        trade_type = "DIRECTIONAL path trade"
-
-    total_risk = net_pnl.abs().sum()
+        bias="terminal similar but timing wrong"
 
     st.markdown(f"""
-### What your position is actually betting on
+### What your trade means
 
-**Primary driver:** {dominant} FOMC meeting  
-**You profit if:** the market prices **{direction}** at that meeting
+Your position is mainly driven by **{dominant} FOMC meeting**
 
-**Trade nature:** {trade_type}
+**Interpretation:** {bias}
 
----
+Positive bars → you benefit from HIGHER rates at that meeting  
+Negative bars → you benefit from LOWER rates at that meeting
 
-### How the PnL happens
+You are not trading carry or roll.
 
-This position does NOT make money from time passing.
-
-It only profits if the expected policy path is redistributed across meetings.
-
-• Positive bar → you want higher rates at that meeting  
-• Negative bar → you want lower rates at that meeting  
-
-The trade resolves when the market shifts *where in time* the tightening/easing occurs.
-""")
-
-    # additional intuitive description
-    early = net_pnl.iloc[:len(net_pnl)//2].sum()
-    late  = net_pnl.iloc[len(net_pnl)//2:].sum()
-
-    if early*late < 0:
-        st.markdown("""
-**Interpretation:**  
-You are trading the timing of the cycle — not the level.  
-You want hikes/cuts moved forward or backward along the timeline.
-""")
-    elif abs(late) > abs(early):
-        st.markdown("""
-**Interpretation:**  
-This is a long-run policy expectation trade (terminal rate belief).
-""")
-    else:
-        st.markdown("""
-**Interpretation:**  
-This is a near-cycle policy trade driven by upcoming meetings.
-""")
-# ------------------------------------------------------------
-# 8) IMPLIED FED PATH (TRADER INTERPRETATION)
-# ------------------------------------------------------------
-
-st.subheader("Implied Fed Path From Your Position")
-
-threshold = net_pnl.abs().max()*0.15  # ignore tiny noise
-
-rows = []
-
-for m,v in net_pnl.items():
-
-    if abs(v) < threshold:
-        view = "PAUSE / not important"
-    elif v > 0:
-        view = "HIKE priced too low (you want higher rate)"
-    else:
-        view = "CUT priced too low (you want lower rate)"
-
-    rows.append([m, round(v,2), view])
-
-fed_view_df = pd.DataFrame(rows,columns=["Meeting","PnL per 1bp ($)","Your Implied View"])
-st.dataframe(fed_view_df,use_container_width=True)
-
-# summary statement
-hikes = (fed_view_df["Your Implied View"].str.contains("HIKE")).sum()
-cuts  = (fed_view_df["Your Implied View"].str.contains("CUT")).sum()
-
-if hikes>cuts:
-    bias="overall more hawkish than market"
-elif cuts>hikes:
-    bias="overall more dovish than market"
-else:
-    bias="roughly same terminal rate but different timing"
-
-st.markdown(f"""
-### Position Meaning
-
-By trading **{lA} lots of {tA}** and **{lB} lots of {tB}**,  
-you are expressing a view that the Fed path should be:
-
-**{bias}**
-
-The table above shows exactly which meetings your position disagrees with the market on.
-""")
-# ------------------------------------------------------------
-# 10) MEETING PREMIUM DECOMPOSITION
-# ------------------------------------------------------------
-
-st.subheader("Where The Market Disagrees With You (Premium by Meeting)")
-
-def meeting_premium_breakdown(trade, lots, sign):
-
-    if trade not in pnl_matrix.index:
-        return None
-
-    trade_premium = mispricing_series.get(trade,0) * sign  # bp vs fair
-    sens = pnl_matrix.loc[trade] / BP_VALUE  # convert $ -> bp sensitivity
-
-    total = sens.abs().sum()
-    if total==0:
-        return None
-
-    meeting_bp = trade_premium * (sens.abs()/total) * np.sign(sens)
-
-    df=pd.DataFrame({
-        "Meeting":meeting_bp.index,
-        "Implied Mispricing (bp)":meeting_bp.values,
-    })
-
-    return df
-
-premA = meeting_premium_breakdown(tA,lA,signA)
-premB = meeting_premium_breakdown(tB,lB,signB)
-
-premium_table = premA.copy()
-
-if premB is not None:
-    premium_table["Implied Mispricing (bp)"] += premB["Implied Mispricing (bp)"]
-
-premium_table = premium_table[premium_table["Implied Mispricing (bp)"].abs()>0.01]
-
-st.dataframe(premium_table,use_container_width=True)
-
-# explanation
-st.markdown("""
-**Interpretation**
-
-This shows where the current trade valuation comes from along the Fed path.
-
-Positive value → market pricing too many hikes there  
-Negative value → market pricing too many cuts there  
-
-So instead of saying *the fly is rich*, you now see  
-*which meeting is rich*.
+You are trading where along the policy path the market is wrong.
 """)
