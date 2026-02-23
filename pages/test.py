@@ -3543,22 +3543,29 @@ try:
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
 #---------------------------------------section 12 end here---------------#
-# ===============================
-# SECTION 14 — CARRY & ROLL TRADE FILTER (INLINE VERSION)
-# Paste this directly into your main Streamlit file
-# Requires: analysis_dt, historical_outrights_df, expiry_df, mispricing_series
-# ===============================
+# ============================================================
+# SECTION 14 — CARRY & ROLL TRADE FILTER (FULL INLINE BLOCK)
+# Requires:
+# analysis_dt
+# historical_outrights_df
+# expiry_df
+# mispricing_series   (from your PCA mispricing section)
+# ============================================================
 
 st.header("14. Carry & Roll Trade Filter")
 
-# --- Helper Functions ---
+import numpy as np
+import pandas as pd
+
+# -------------------------------
+# Helper functions
+# -------------------------------
+
 def _prices_to_rates(series):
     return 100.0 - series
 
-
 def _time_to_maturity(expiry_df, valuation_date):
     return ((expiry_df['ExpiryDate'] - valuation_date).dt.days / 365.0).clip(lower=1/365)
-
 
 def _forward_slope(rates, ttm):
     contracts = list(rates.index.intersection(ttm.index))
@@ -3570,10 +3577,8 @@ def _forward_slope(rates, ttm):
     slopes[contracts[-1]] = slopes[list(slopes.keys())[-1]]
     return pd.Series(slopes)
 
-
 def _roll(slopes):
     return -slopes / 365.0
-
 
 def _spread_carry_roll(rates, roll, k=1):
     contracts = list(rates.index)
@@ -3585,7 +3590,6 @@ def _spread_carry_roll(rates, roll, k=1):
         data[f"{c1}-{c2}"] = carry + r
     return pd.Series(data, name="Carry+Roll")
 
-
 def _fly_carry_roll(rates, roll, k=1):
     contracts = list(rates.index)
     data = {}
@@ -3596,7 +3600,33 @@ def _fly_carry_roll(rates, roll, k=1):
         data[f"{c1}-2x{c2}+{c3}"] = carry + r
     return pd.Series(data, name="Carry+Roll")
 
-# --- Compute Today Curve ---
+def _clean_label(label):
+    if ': ' in label:
+        return label.split(': ', 1)[1]
+    return label
+
+def _trade_action(mispricing, carry):
+    # Mispricing = Market - Fair
+    if mispricing > 0 and carry > 0:
+        return "SELL (rich, decay helps)"
+    if mispricing < 0 and carry < 0:
+        return "BUY (cheap, decay helps)"
+    if mispricing > 0 and carry < 0:
+        return "AVOID (rich but costs carry)"
+    if mispricing < 0 and carry > 0:
+        return "AVOID (cheap but costs carry)"
+    return "NEUTRAL"
+
+def _family(label):
+    if '-3x' in label:
+        return 'Double Fly'
+    if '-2x' in label:
+        return 'Fly'
+    return 'Spread'
+
+# -------------------------------
+# Build today's curve
+# -------------------------------
 try:
     outrights_today = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
     outrights_today.index = outrights_today.index.str.replace(' (Original)', '')
@@ -3609,55 +3639,44 @@ ttm = _time_to_maturity(expiry_df, analysis_dt)
 slopes = _forward_slope(rates, ttm)
 roll = _roll(slopes)
 
-# --- Instruments ---
-spreads_cr = _spread_carry_roll(rates, roll, k=1)
-flies_cr = _fly_carry_roll(rates, roll, k=1)
+spreads_cr = _spread_carry_roll(rates, roll)
+flies_cr = _fly_carry_roll(rates, roll)
+
 carry_roll_all = pd.concat([spreads_cr, flies_cr])
 
 st.subheader("Carry + Roll (Daily Expected Drift)")
 st.dataframe(carry_roll_all.to_frame())
 
-# --- Tradable Ranking ---
+# -------------------------------
+# Match with PCA mispricing
+# -------------------------------
 if mispricing_series is not None and not mispricing_series.empty:
-    aligned = mispricing_series.index.intersection(carry_roll_all.index)
+
+    mispricing_clean = mispricing_series.copy()
+    mispricing_clean.index = mispricing_clean.index.map(_clean_label)
+
+    aligned = mispricing_clean.index.intersection(carry_roll_all.index)
+
     ranked = pd.DataFrame({
-        'Mispricing (Rate %)': mispricing_series[aligned],
-        'Carry+Roll': carry_roll_all[aligned]
+        'Mispricing (Rate %)': mispricing_clean.loc[aligned],
+        'Carry+Roll': carry_roll_all.loc[aligned]
     })
+
+    # keep only trades where carry works in your favor
     ranked['Tradable Score'] = ranked['Mispricing (Rate %)'] * np.sign(ranked['Carry+Roll'])
+    ranked = ranked[ranked['Tradable Score'] > 0]
+
+    # explanations
+    ranked['Action'] = [_trade_action(m, c) for m, c in zip(ranked['Mispricing (Rate %)'], ranked['Carry+Roll'])]
+    ranked['Family'] = [_family(idx) for idx in ranked.index]
+    ranked['Expected Move'] = np.where(ranked['Mispricing (Rate %)'] > 0,
+                                       'Down toward fair',
+                                       'Up toward fair')
+
     ranked = ranked.sort_values('Tradable Score', ascending=False)
 
     st.subheader("Tradable Opportunities (Carry Filtered)")
+    st.dataframe(ranked)
 
-# --- Trade interpretation ---
-def _trade_action(mispricing, carry):
-    # Mispricing defined as Market - Fair
-    # If positive -> market rich -> sell
-    # If negative -> market cheap -> buy
-    if mispricing > 0 and carry > 0:
-        return "SELL (rich, pays carry)"
-    if mispricing < 0 and carry < 0:
-        return "BUY (cheap, pays carry)"
-    if mispricing > 0 and carry < 0:
-        return "AVOID (rich but negative carry)"
-    if mispricing < 0 and carry > 0:
-        return "AVOID (cheap but negative carry)"
-    return "NEUTRAL"
-
-ranked['Action'] = [ _trade_action(m, c) for m, c in zip(ranked['Mispricing (Rate %)'], ranked['Carry+Roll']) ]
-
-# classify instrument family
-def _family(label):
-    if '-3x' in label:
-        return 'Double Fly'
-    if '-2x' in label:
-        return 'Fly'
-    return 'Spread'
-
-ranked['Family'] = [ _family(idx) for idx in ranked.index ]
-
-# fair value direction explanation
-ranked['Expected Move'] = np.where(ranked['Mispricing (Rate %)'] > 0, 'Down toward fair', 'Up toward fair')
-
-st.dataframe(ranked)
-st.info("Mispricing data unavailable for ranking.")
+else:
+    st.info("Mispricing data unavailable for ranking.")
