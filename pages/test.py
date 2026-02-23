@@ -3544,298 +3544,169 @@ except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
 #---------------------------------------section 12 end here---------------#
 # ============================================================
-# SECTION 14 — CARRY, ROLL & REGIME TRADE FILTER (FINAL)
+# SECTION 14 — SR3 FOMC POLICY EXPOSURE ENGINE (CORRECT LOGIC)
 # ============================================================
-# ---- FOMC calendar (update when needed)
-FOMC_DATES = [
-    "2026-03-18",
-    "2026-05-06",
-    "2026-06-17",
-    "2026-07-29",
-    "2026-09-16",
-    "2026-11-04",
-    "2026-12-16"
-]
-FOMC_DATES = pd.to_datetime(FOMC_DATES)
-st.header("14. Carry & Roll Trade Filter")
 
-import numpy as np
+st.header("14. Policy Path Interpretation")
+
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pandas.tseries.offsets import DateOffset
 
-# ============================================================
-# EDUCATIONAL EXPLAINER (TOP)
-# ============================================================
+# ------------------------------------------------------------
+# 1) FOMC calendar to Dec-2029
+# ------------------------------------------------------------
 
-with st.expander("📘 How Carry & Roll trades work (Trader interpretation)"):
+FOMC = pd.to_datetime([
+"2026-03-18","2026-05-06","2026-06-17","2026-07-29","2026-09-16","2026-11-04","2026-12-16",
+"2027-01-27","2027-03-17","2027-04-28","2027-06-16","2027-07-28","2027-09-22","2027-11-03","2027-12-15",
+"2028-01-26","2028-03-15","2028-05-03","2028-06-14","2028-07-26","2028-09-20","2028-11-01","2028-12-13",
+"2029-01-31","2029-03-20","2029-05-01","2029-06-19","2029-07-31","2029-09-18","2029-11-07","2029-12-18"
+])
 
-    st.markdown("""
-### Why futures move even if nothing happens
+# ------------------------------------------------------------
+# 2) Build SR3 meeting weights (day accurate)
+# ------------------------------------------------------------
 
-SOFR futures don't pay coupons.
-Instead they converge to realised overnight rates.
+def contract_meeting_weights(start,end):
 
-That creates predictable PnL:
+    total=(end-start).days
+    weights={}
+    timeline=[start]+list(FOMC[(FOMC>start)&(FOMC<end)])+[end]
 
-**Carry + Roll = expected daily drift assuming curve unchanged**
+    for i in range(len(timeline)-1):
+        s=timeline[i]
+        e=timeline[i+1]
+        days=(e-s).days
+        meeting_label=e.strftime("%Y-%m") if e!=end else "Terminal"
+        weights[meeting_label]=weights.get(meeting_label,0)+days/total
 
-So this tool does NOT ask:
-"Is this weird?"
+    return weights
 
-It asks:
-"Will the market fix this automatically?"
+contract_weights={}
 
----
+for c,row in expiry_df.iterrows():
+    end=row["ExpiryDate"]
+    start=end-DateOffset(months=3)
+    contract_weights[c]=contract_meeting_weights(start,end)
 
-### Structures
+# ------------------------------------------------------------
+# 3) Convert trade label → contract weights
+# ------------------------------------------------------------
 
-Spread → slope of policy path  
-Fly → timing of pivot  
-Double Fly → regime transition
+def trade_contract_weights(label):
 
----
+    key=(label.replace("3M ","").replace("6M ","").replace("12M ","")
+             .replace("Spread: ","").replace("Fly: ","").replace("Double Fly: ",""))
 
-### How to read Action
-
-BUY → cheap & naturally rises  
-SELL → rich & naturally falls  
-AVOID → time works against you
-""")
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def _prices_to_rates(series):
-    return 100.0 - series
-
-def _time_to_maturity(expiry_df, valuation_date):
-    return ((expiry_df['ExpiryDate'] - valuation_date).dt.days / 365.0).clip(lower=1/365)
-
-def _forward_slope(rates, ttm):
-    contracts=list(rates.index.intersection(ttm.index))
-    slopes={}
-    for i in range(len(contracts)-1):
-        c1,c2=contracts[i],contracts[i+1]
-        dt=ttm[c2]-ttm[c1]
-        slopes[c1]=0.0 if dt<=0 else (rates[c2]-rates[c1])/dt
-    slopes[contracts[-1]]=slopes[list(slopes.keys())[-1]]
-    return pd.Series(slopes)
-
-def _roll(slopes):
-    return -slopes/365.0
-
-def _canonical(label):
-    label=label.replace("3M ","").replace("6M ","").replace("12M ","")
-    label=label.replace("Spread: ","").replace("Fly: ","").replace("Double Fly: ","")
-    return label.strip()
-
-def _family(label):
-    if "Double Fly" in label: return "Double Fly"
-    if "Fly" in label: return "Fly"
-    return "Spread"
-
-def _action(m,c):
-    if m>0 and c>0: return "SELL (rich & decays)"
-    if m<0 and c<0: return "BUY (cheap & rises)"
-    if m>0 and c<0: return "AVOID (rich but widens)"
-    if m<0 and c>0: return "AVOID (cheap but bleeds)"
-    return "NEUTRAL"
-
-# ============================================================
-# BUILD CURVE
-# ============================================================
-
-try:
-    outrights_today=historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
-    outrights_today.index=outrights_today.index.str.replace(' (Original)','')
-except KeyError:
-    st.warning("Date not available")
-    st.stop()
-
-rates=_prices_to_rates(outrights_today)
-ttm=_time_to_maturity(expiry_df,analysis_dt)
-slopes=_forward_slope(rates,ttm)
-roll=_roll(slopes)
-
-# ============================================================
-# CARRY CALCULATION
-# ============================================================
-
-carry_records=[]
-contracts=list(rates.index)
-
-for k,label in [(1,"3M"),(2,"6M"),(4,"12M")]:
-
-    # spreads
-    for i in range(len(contracts)-k):
-        c1,c2=contracts[i],contracts[i+k]
-        carry=rates[c1]-rates[c2]
-        r=roll[c2]-roll[c1]
-        name=f"{label} Spread: {c1}-{c2}"
-        carry_records.append((name,_canonical(name),carry+r))
-
-    # flies
-    for i in range(len(contracts)-2*k):
-        c1,c2,c3=contracts[i],contracts[i+k],contracts[i+2*k]
-        carry=rates[c1]-2*rates[c2]+rates[c3]
-        r=roll[c1]-2*roll[c2]+roll[c3]
-        name=f"{label} Fly: {c1}-2x{c2}+{c3}"
-        carry_records.append((name,_canonical(name),carry+r))
-
-    # double flies
-    for i in range(len(contracts)-3*k):
-        c1,c2,c3,c4=contracts[i],contracts[i+k],contracts[i+2*k],contracts[i+3*k]
-        carry=rates[c1]-3*rates[c2]+3*rates[c3]-rates[c4]
-        r=roll[c1]-3*roll[c2]+3*roll[c3]-roll[c4]
-        name=f"{label} Double Fly: {c1}-3x{c2}+3x{c3}-{c4}"
-        carry_records.append((name,_canonical(name),carry+r))
-
-carry_df=pd.DataFrame(carry_records,columns=["Label","Key","Carry+Roll"]).set_index("Label")
-
-st.subheader("Carry + Roll (Daily Expected Drift)")
-st.dataframe(carry_df[["Carry+Roll"]])
-
-# ============================================================
-# ALIGN WITH MISPRICING
-# ============================================================
-
-if mispricing_series is None or mispricing_series.empty:
-    st.info("Mispricing unavailable")
-    st.stop()
-
-mis_df=mispricing_series.to_frame("Mispricing")
-mis_df["Key"]=mis_df.index.map(_canonical)
-
-merged=carry_df.reset_index().merge(mis_df,on="Key",how="inner").set_index("Label")
-
-merged["Tradable Score"]=merged["Mispricing"]*np.sign(merged["Carry+Roll"])
-merged=merged[merged["Tradable Score"]>0]
-
-merged["Action"]=[_action(m,c) for m,c in zip(merged["Mispricing"],merged["Carry+Roll"])]
-merged["Family"]=[_family(i) for i in merged.index]
-merged["Expected Move"]=np.where(merged["Mispricing"]>0,"Down toward fair","Up toward fair")
-
-merged=merged.sort_values("Tradable Score",ascending=False)
-
-st.subheader("Tradable Opportunities (Carry Filtered)")
-st.dataframe(merged)
-
-# ============================================================
-# REGIME SENSITIVITY
-# ============================================================
-
-st.subheader("Regime Sensitivity")
-
-def weights_from_key(key):
     key=key.replace("2x","").replace("3x","")
-    parts=key.replace("+","-").split("-")
-    parts=[p for p in parts if p!=""]
-    w={}
-    if len(parts)==2:
-        w[parts[0]]=1; w[parts[1]]=-1
-    elif len(parts)==3:
-        w[parts[0]]=1; w[parts[1]]=-2; w[parts[2]]=1
-    elif len(parts)==4:
-        w[parts[0]]=1; w[parts[1]]=-3; w[parts[2]]=3; w[parts[3]]=-1
-    return pd.Series(w)
+    parts=[p for p in key.replace("+","-").split("-") if p!=""]
 
-sens=[]
-for trade,key in zip(merged.index,merged["Key"]):
+    if len(parts)==2: w=[1,-1]
+    elif len(parts)==3: w=[1,-2,1]
+    elif len(parts)==4: w=[1,-3,3,-1]
+    else: return None
 
-    w=weights_from_key(key).reindex(rates.index).fillna(0).values
-    n=len(w)
+    return dict(zip(parts,w))
 
-    level=np.ones(n)
-    slope=np.linspace(1,-1,n)
-    curve=np.zeros(n); curve[n//2]=2; curve-=1
+# ------------------------------------------------------------
+# 4) Build meeting exposure matrix
+# ------------------------------------------------------------
 
-    sens.append({
-        "Trade":trade,
-        "Level":np.sign(np.dot(w,level)),
-        "Steepener":np.sign(np.dot(w,slope)),
-        "Curvature":np.sign(np.dot(w,curve))
-    })
+records=[]
 
-sens=pd.DataFrame(sens).set_index("Trade")
-st.dataframe(sens)
-# ============================================================
-# FOMC EVENT RISK ANALYSIS
-# ============================================================
+for trade in mispricing_series.index:
 
-st.subheader("🏛 FOMC Event Risk")
+    cw=trade_contract_weights(trade)
+    if cw is None: continue
 
-# find next meeting
-future_meetings = FOMC_DATES[FOMC_DATES > analysis_dt]
-if len(future_meetings) == 0:
-    st.info("No future FOMC date configured")
+    meeting_exp={}
+
+    for contract,coef in cw.items():
+
+        if contract not in contract_weights: continue
+
+        for m,w in contract_weights[contract].items():
+            meeting_exp[m]=meeting_exp.get(m,0)+coef*w
+
+    meeting_exp["Trade"]=trade
+    records.append(meeting_exp)
+
+exposure_df=pd.DataFrame(records).set_index("Trade").fillna(0)
+
+st.subheader("Meeting Exposure Matrix")
+st.dataframe(exposure_df)
+
+# ------------------------------------------------------------
+# 5) Interactive position builder
+# ------------------------------------------------------------
+
+st.subheader("Position Policy Impact")
+
+trades=exposure_df.index.tolist()
+
+c1,c2=st.columns(2)
+
+with c1:
+    tA=st.selectbox("Trade A",trades)
+    lA=st.number_input("Lots A",value=100,step=25)
+
+with c2:
+    tB=st.selectbox("Trade B",trades,index=min(1,len(trades)-1))
+    lB=st.number_input("Lots B",value=0,step=25)
+
+net_exp=exposure_df.loc[tA]*lA + exposure_df.loc[tB]*lB
+net_exp=net_exp[net_exp.abs()>1e-6]
+
+st.subheader("Meeting Sensitivity (per 1bp policy surprise)")
+st.dataframe(net_exp.to_frame("Exposure"))
+
+# ------------------------------------------------------------
+# 6) Bar chart
+# ------------------------------------------------------------
+
+fig,ax=plt.subplots()
+net_exp.plot(kind="bar",ax=ax)
+ax.set_ylabel("Trade PnL sensitivity per 1bp surprise")
+st.pyplot(fig)
+
+# ------------------------------------------------------------
+# 7) Required policy change to reach fair value
+# ------------------------------------------------------------
+
+misA=mispricing_series.get(tA,0)*lA
+misB=mispricing_series.get(tB,0)*lB
+net_mis=misA+misB
+
+total_sens=net_exp.abs().sum()
+
+st.subheader("Required Fed Action")
+
+if total_sens<1e-6:
+    st.info("No meaningful meeting exposure")
 else:
 
-    next_meeting = future_meetings.min()
-    days_to_meeting = (next_meeting - analysis_dt).days
+    avg_shift=-net_mis/total_sens
+    dominant=net_exp.abs().idxmax()
 
-    st.write(f"Next FOMC: **{next_meeting.date()}**  ({days_to_meeting} days)")
+    st.write(f"Net mispricing: {net_mis:.2f} bp")
+    st.write(f"Average policy shift needed: {avg_shift:.2f} bp")
 
-    # assumed policy shocks (bp)
-    HIKE = +0.25
-    CUT  = -0.25
-    PAUSE = 0.0
+    if avg_shift>0:
+        direction="more easing (cuts earlier/deeper)"
+    else:
+        direction="less easing or hikes"
 
-    def trade_weights(key):
-        key=key.replace("2x","").replace("3x","")
-        parts=key.replace("+","-").split("-")
-        parts=[p for p in parts if p!=""]
-        w={}
-        if len(parts)==2:
-            w[parts[0]]=1; w[parts[1]]=-1
-        elif len(parts)==3:
-            w[parts[0]]=1; w[parts[1]]=-2; w[parts[2]]=1
-        elif len(parts)==4:
-            w[parts[0]]=1; w[parts[1]]=-3; w[parts[2]]=3; w[parts[3]]=-1
-        return pd.Series(w)
+    st.markdown(f"""
+### Interpretation
 
-    def shock_curve(weights, shock):
-        # front loaded policy shock
-        maturities = ttm.loc[weights.index]
-        decay = np.exp(-3*maturities)   # front reacts most
-        return np.dot(weights, shock*decay)
+The trade is mainly driven by **{dominant} meeting**.
 
-    rows=[]
+To reach fair value the Fed would need:
 
-    for trade,key,carry,mis in zip(merged.index,merged["Key"],merged["Carry+Roll"],merged["Mispricing"]):
+• {direction}
+• roughly {abs(avg_shift):.1f}bp repricing distributed across meetings
 
-        w=trade_weights(key).reindex(rates.index).fillna(0)
-
-        pnl_pause = carry * days_to_meeting
-        pnl_hike  = shock_curve(w,HIKE)
-        pnl_cut   = shock_curve(w,CUT)
-
-        rows.append({
-            "Trade":trade,
-            "Days to Fix":abs(mis/carry) if carry!=0 else np.nan,
-            "PnL to Meeting (Pause)":pnl_pause,
-            "PnL if Hike":pnl_hike,
-            "PnL if Cut":pnl_cut
-        })
-
-    event_df=pd.DataFrame(rows).set_index("Trade")
-    st.dataframe(event_df)
-# ============================================================
-# REGIME EXPLAINER
-# ============================================================
-
-with st.expander("📊 How to interpret Regime Sensitivity"):
-
-    st.markdown("""
-Level → inflation surprise / central bank shock  
-Steepener → recession vs delayed cuts  
-Curvature → pivot timing
-
-+1 = trade profits  
--1 = trade loses
-
-Good trades:
-carry aligned + regime resilient
-
-Bad trades:
-carry good but macro kills it
+This is not time decay — the trade resolves only if policy expectations change.
 """)
