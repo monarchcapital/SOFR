@@ -3811,48 +3811,53 @@ you are expressing a view that the Fed path should be:
 The table above shows exactly which meetings your position disagrees with the market on.
 """)
 # ------------------------------------------------------------
-# 9) CURRENT MARKET PREMIUM / DISCOUNT
+# 10) MEETING PREMIUM DECOMPOSITION
 # ------------------------------------------------------------
 
-st.subheader("Current Market Premium (What You Pay For This View)")
+st.subheader("Where The Market Disagrees With You (Premium by Meeting)")
 
-# premium in bp from fair value
-premA = mispricing_series.get(tA,0)
-premB = mispricing_series.get(tB,0)
+def meeting_premium_breakdown(trade, lots, sign):
 
-# signed by position
-signedA = premA * signA
-signedB = premB * signB
+    if trade not in pnl_matrix.index:
+        return None
 
-net_premium_bp = signedA*lA + signedB*lB
-net_premium_dollar = net_premium_bp * BP_VALUE
+    trade_premium = mispricing_series.get(trade,0) * sign  # bp vs fair
+    sens = pnl_matrix.loc[trade] / BP_VALUE  # convert $ -> bp sensitivity
 
-st.markdown(f"""
-### Trade Pricing vs Fair Value
+    total = sens.abs().sum()
+    if total==0:
+        return None
 
-**{tA}**
-- Market premium: {premA:.2f} bp
-- Position impact: {(signedA*lA):.2f} bp
+    meeting_bp = trade_premium * (sens.abs()/total) * np.sign(sens)
 
-**{tB}**
-- Market premium: {premB:.2f} bp
-- Position impact: {(signedB*lB):.2f} bp
+    df=pd.DataFrame({
+        "Meeting":meeting_bp.index,
+        "Implied Mispricing (bp)":meeting_bp.values,
+    })
 
----
+    return df
 
-### Net Position Pricing
+premA = meeting_premium_breakdown(tA,lA,signA)
+premB = meeting_premium_breakdown(tB,lB,signB)
 
-You are entering the position at:
+premium_table = premA.copy()
 
-**{net_premium_bp:.2f} bp from fair value**  
-≈ **${net_premium_dollar:,.0f}**
+if premB is not None:
+    premium_table["Implied Mispricing (bp)"] += premB["Implied Mispricing (bp)"]
 
+premium_table = premium_table[premium_table["Implied Mispricing (bp)"].abs()>0.01]
+
+st.dataframe(premium_table,use_container_width=True)
+
+# explanation
+st.markdown("""
+**Interpretation**
+
+This shows where the current trade valuation comes from along the Fed path.
+
+Positive value → market pricing too many hikes there  
+Negative value → market pricing too many cuts there  
+
+So instead of saying *the fly is rich*, you now see  
+*which meeting is rich*.
 """)
-
-# interpretation
-if net_premium_bp > 0:
-    st.info("You are PAYING for this macro view (market disagrees with you).")
-elif net_premium_bp < 0:
-    st.success("You are RECEIVING premium (market is giving you this view cheaply).")
-else:
-    st.write("Position entered near fair value.")
