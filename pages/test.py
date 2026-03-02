@@ -9,7 +9,17 @@ from datetime import datetime, date
 
 from io import BytesIO
 from matplotlib.backends.backend_pdf import PdfPages
+# --- Paired figure registration helpers ---
+def register_mispricing_chart(name, fig):
+    if name not in PAIRED_EXPORTS:
+        PAIRED_EXPORTS[name] = {}
+    PAIRED_EXPORTS[name]["mispricing"] = fig
 
+
+def register_envelope_chart(name, fig):
+    if name not in PAIRED_EXPORTS:
+        PAIRED_EXPORTS[name] = {}
+    PAIRED_EXPORTS[name]["envelope"] = fig
 # --- PDF figure collections ---
 SECTION5_FIGURES = []
 SECTION9_FIGURES = []
@@ -1376,7 +1386,7 @@ if not price_df_filtered.empty:
 
                 # Collect Section 5 figure for PDF download
                 SECTION5_FIGURES.append((fig, f"Section 5 – {derivative_type}"))
-
+                register_mispricing_chart(derivative_type, fig)
                 # --- Detailed Table ---
                 st.markdown(f"###### {derivative_type} Mispricing (Today vs PCA, with Prev Day if available)")
                 detailed_comparison = comparison.copy()
@@ -1463,6 +1473,7 @@ if not price_df_filtered.empty:
 
             # Collect Section 9 shock figure for PDF download
             SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
+            register_envelope_chart(derivative_type, fig)
 
 
         # --- 5.1 Outright Price/Rate Curve Snapshot ---
@@ -3542,3 +3553,97 @@ try:
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
+# ============================================================
+# SECTION 11 — TRADING SHEET GENERATOR (MISPRICING + ENVELOPE)
+# ============================================================
+
+st.header("11. Trading Sheet Export (Paired RV Diagnostics)")
+
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+PAIRED_EXPORTS = {}
+
+
+# --- Register figures from Section 5 ---
+def register_mispricing_chart(name, fig):
+    if name not in PAIRED_EXPORTS:
+        PAIRED_EXPORTS[name] = {}
+    PAIRED_EXPORTS[name]["mispricing"] = fig
+
+
+# --- Register figures from Section 10 ---
+def register_envelope_chart(name, fig):
+    if name not in PAIRED_EXPORTS:
+        PAIRED_EXPORTS[name] = {}
+    PAIRED_EXPORTS[name]["envelope"] = fig
+
+
+# --- Build side-by-side page ---
+def build_report_page(left_fig, right_fig, title):
+
+    new_fig = plt.figure(figsize=(17, 8))
+    gs = new_fig.add_gridspec(1, 2)
+
+    # Convert matplotlib → image
+    def fig_to_img(fig):
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
+        img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+        return img
+
+    # LEFT (Section 5)
+    ax1 = new_fig.add_subplot(gs[0])
+    ax1.imshow(fig_to_img(left_fig))
+    ax1.axis("off")
+    ax1.set_title("Market vs PCA Fair")
+
+    # RIGHT (Section 10)
+    ax2 = new_fig.add_subplot(gs[1])
+    ax2.imshow(fig_to_img(right_fig))
+    ax2.axis("off")
+    ax2.set_title("Adaptive Sigma Envelope")
+
+    new_fig.suptitle(title, fontsize=16)
+    plt.tight_layout()
+
+    return new_fig
+
+
+# --- Build PDF ---
+def generate_trading_sheet():
+
+    buffer = BytesIO()
+
+    with PdfPages(buffer) as pdf:
+
+        for instrument, figs in PAIRED_EXPORTS.items():
+
+            if "mispricing" in figs and "envelope" in figs:
+
+                page = build_report_page(
+                    figs["mispricing"],
+                    figs["envelope"],
+                    instrument
+                )
+
+                pdf.savefig(page)
+                plt.close(page)
+
+    buffer.seek(0)
+    return buffer
+
+
+# --- Download button ---
+if st.button("Generate Trading Sheet"):
+
+    if len(PAIRED_EXPORTS) == 0:
+        st.warning("No paired figures registered yet.")
+    else:
+        pdf_buffer = generate_trading_sheet()
+
+        st.download_button(
+            label="Download RV Trading Sheet",
+            data=pdf_buffer,
+            file_name="Curve_RV_Trading_Sheet.pdf",
+            mime="application/pdf"
+        )
