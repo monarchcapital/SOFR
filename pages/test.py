@@ -16,7 +16,7 @@ SECTION9_FIGURES = []
 
 
 # --- Configuration ---
-st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
+st.set_page_config(layout="wide", page_title="CANADA Futures PCA Analyzer")
 
 # --- Helper Functions for Data Processing ---
 
@@ -977,12 +977,12 @@ def create_instrument_universe_table(factor_sensitivities_df, Sigma_Raw_df, misp
 
 # --- Streamlit Application Layout ---
 
-st.title("SOFR Futures PCA Analyzer")
+st.title("CANADA Futures PCA Analyzer")
 
 # --- Sidebar Inputs ---
 st.sidebar.header("1. Data Uploads")
 price_file = st.sidebar.file_uploader(
-    "Upload Historical Price Data (e.g., 'SOFR rates.csv')", 
+    "Upload Historical Price Data (e.g., 'CANADA rates.csv')", 
     type=['csv'], 
     key='price_upload'
 )
@@ -1639,7 +1639,7 @@ if not price_df_filtered.empty:
             st.download_button(
                 label="📥 Download Section 5 Snapshots as PDF",
                 data=pdf_buffer_5,
-                file_name="SOFR.pdf",
+                file_name="CANADA.pdf",
                 mime="application/pdf",
             )
 
@@ -3542,217 +3542,3 @@ try:
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
-#---------------------------------------section 12 end here---------------#
-
-#---------------------------------------section 12 end here---------------#
-# ============================================================
-# SECTION 14 — SR3 POLICY PATH ENGINE (ECONOMICALLY CORRECT)
-# ============================================================
-
-st.header("14. Policy Path Interpretation")
-
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from pandas.tseries.offsets import DateOffset
-import re
-
-BP_VALUE = 25  # $ per bp per contract
-
-
-# ------------------------------------------------------------
-# 1) FOMC CALENDAR
-# ------------------------------------------------------------
-
-FOMC = pd.to_datetime([
-"2026-03-18","2026-05-06","2026-06-17","2026-07-29","2026-09-16","2026-11-04","2026-12-16",
-"2027-01-27","2027-03-17","2027-04-28","2027-06-16","2027-07-28","2027-09-22","2027-11-03","2027-12-15",
-"2028-01-26","2028-03-15","2028-05-03","2028-06-14","2028-07-26","2028-09-20","2028-11-01","2028-12-13",
-"2029-01-31","2029-03-20","2029-05-01","2029-06-19","2029-07-31","2029-09-18","2029-11-07","2029-12-18"
-])
-
-
-# ------------------------------------------------------------
-# 2) CONTRACT ACCRUAL WINDOW → POLICY STEP IMPACT
-# ------------------------------------------------------------
-
-def contract_meeting_weights(start,end):
-
-    total_days = (end-start).days
-    weights = {}
-
-    meetings = list(FOMC[(FOMC>start)&(FOMC<end)])
-    timeline = [start] + meetings + [end]
-
-    for i in range(len(timeline)-1):
-
-        segment_start = timeline[i]
-        segment_end   = timeline[i+1]
-
-        if i == 0:
-            label = "Before First Meeting"
-        else:
-            label = meetings[i-1].strftime("%Y-%m")
-
-        days = (segment_end-segment_start).days
-        weights[label] = weights.get(label,0) + days/total_days
-
-    return weights
-
-
-contract_weights = {}
-
-for c,row in expiry_df.iterrows():
-    end   = row["ExpiryDate"]
-    start = end - DateOffset(months=3)
-    contract_weights[c] = contract_meeting_weights(start,end)
-
-
-# ------------------------------------------------------------
-# 3) UNIVERSAL TRADE PARSER (WORKS FOR SPREAD/FLY/DFLY)
-# ------------------------------------------------------------
-
-def trade_contract_weights(label):
-
-    key=(label.replace("3M ","")
-                .replace("6M ","")
-                .replace("12M ","")
-                .replace("Spread: ","")
-                .replace("Fly: ","")
-                .replace("Double Fly: ",""))
-
-    tokens=re.findall(r'([+-]?[^+-]+)',key)
-
-    weights={}
-
-    for t in tokens:
-
-        sign=-1 if t.startswith('-') else 1
-        t=t.replace('+','').replace('-','')
-
-        if 'x' in t:
-            mult,contract=t.split('x')
-            mult=int(mult)
-        else:
-            mult=1
-            contract=t
-
-        weights[contract]=weights.get(contract,0)+sign*mult
-
-    return weights
-
-
-# ------------------------------------------------------------
-# 4) BUILD RATE SENSITIVITY MATRIX
-# ------------------------------------------------------------
-
-records=[]
-
-all_meetings=sorted({m for cw in contract_weights.values() for m in cw})
-
-for trade in mispricing_series.index:
-
-    structure=trade_contract_weights(trade)
-
-    row={}
-
-    for meeting in all_meetings:
-
-        sens=0
-
-        for contract,coef in structure.items():
-
-            if contract not in contract_weights: 
-                continue
-
-            frac=contract_weights[contract].get(meeting,0)
-
-            sens += coef * (-frac)
-
-        row[meeting]=sens
-
-    row["Trade"]=trade
-    records.append(row)
-
-sens_matrix=pd.DataFrame(records).set_index("Trade").fillna(0)
-
-st.subheader("Rate Exposure (price bp per 1bp policy move)")
-st.dataframe(sens_matrix.round(4))
-
-
-# ------------------------------------------------------------
-# 5) POSITION BUILDER
-# ------------------------------------------------------------
-
-st.subheader("Position Policy Impact")
-
-trades=sens_matrix.index.tolist()
-
-c1,c2=st.columns(2)
-
-with c1:
-    tA=st.selectbox("Trade A",trades)
-    sideA=st.radio("Side A",["BUY","SELL"],horizontal=True)
-    lA=st.number_input("Lots A",value=100,step=25)
-
-with c2:
-    tB=st.selectbox("Trade B",trades,index=min(1,len(trades)-1))
-    sideB=st.radio("Side B",["BUY","SELL"],horizontal=True)
-    lB=st.number_input("Lots B",value=0,step=25)
-
-signA=1 if sideA=="BUY" else -1
-signB=1 if sideB=="BUY" else -1
-
-net_rate = sens_matrix.loc[tA]*lA*signA + sens_matrix.loc[tB]*lB*signB
-net_rate = net_rate[net_rate.abs()>1e-8]
-
-net_pnl = net_rate * BP_VALUE
-
-
-# ------------------------------------------------------------
-# 6) MEETING PNL OUTPUT
-# ------------------------------------------------------------
-
-st.subheader("Meeting PnL ($ per 1bp surprise)")
-st.dataframe(net_pnl.to_frame("PnL").round(2))
-
-fig,ax=plt.subplots(figsize=(10,4))
-net_pnl.plot(kind="bar",ax=ax)
-ax.set_ylabel("$ PnL per 1bp policy shock")
-ax.set_title("Which FOMC meetings drive your position")
-st.pyplot(fig)
-
-
-# ------------------------------------------------------------
-# 7) HUMAN INTERPRETATION
-# ------------------------------------------------------------
-
-st.subheader("What Your Trade Is Saying About The Fed")
-
-if len(net_pnl)==0:
-    st.info("No policy exposure")
-
-else:
-
-    def describe(v):
-        if v>0: return "you want HIGHER rates (hawkish surprise)"
-        if v<0: return "you want LOWER rates (dovish surprise)"
-        return "no view"
-
-    explanation=[]
-    for m,v in net_pnl.items():
-        explanation.append([m,round(v,2),describe(v)])
-
-    explain_df=pd.DataFrame(explanation,columns=["Meeting","$PnL per 1bp","Your View"])
-    st.dataframe(explain_df,use_container_width=True)
-
-    dominant=net_pnl.abs().idxmax()
-
-    st.markdown(f"""
-### Plain English
-
-Your biggest risk is the **{dominant} FOMC meeting**.
-
-Positive bar → you benefit if Fed surprises MORE HAWKISH  
-Negative bar → you benefit if Fed surprises MORE DOVISH
-""")
