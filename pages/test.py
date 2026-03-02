@@ -16,7 +16,8 @@ if "SECTION5_FIGURES" not in st.session_state:
 
 if "SECTION9_FIGURES" not in st.session_state:
     st.session_state.SECTION9_FIGURES = []
-
+if "SNAPSHOT_READY" not in st.session_state:
+    st.session_state.SNAPSHOT_READY = False
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="CANADA Futures PCA Analyzer")
 
@@ -1464,7 +1465,8 @@ if not price_df_filtered.empty:
             st.pyplot(fig)
 
             # Collect Section 9 shock figure for PDF download
-            st.session_state.SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
+            if not st.session_state.SNAPSHOT_READY:
+             st.session_state.SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
 
 
         # --- 5.1 Outright Price/Rate Curve Snapshot ---
@@ -3650,7 +3652,7 @@ Graphs are paired derivative-wise:
 3M → 6M → 12M → ...
 """
 )
-
+st.session_state.SNAPSHOT_READY = True
 full_pdf = _export_full_curve_pdf()
 
 if full_pdf is not None:
