@@ -9,17 +9,7 @@ from datetime import datetime, date
 
 from io import BytesIO
 from matplotlib.backends.backend_pdf import PdfPages
-# --- Paired figure registration helpers ---
-def register_mispricing_chart(name, fig):
-    if name not in PAIRED_EXPORTS:
-        PAIRED_EXPORTS[name] = {}
-    PAIRED_EXPORTS[name]["mispricing"] = fig
 
-
-def register_envelope_chart(name, fig):
-    if name not in PAIRED_EXPORTS:
-        PAIRED_EXPORTS[name] = {}
-    PAIRED_EXPORTS[name]["envelope"] = fig
 # --- PDF figure collections ---
 SECTION5_FIGURES = []
 SECTION9_FIGURES = []
@@ -1386,7 +1376,7 @@ if not price_df_filtered.empty:
 
                 # Collect Section 5 figure for PDF download
                 SECTION5_FIGURES.append((fig, f"Section 5 – {derivative_type}"))
-                register_mispricing_chart(derivative_type, fig)
+
                 # --- Detailed Table ---
                 st.markdown(f"###### {derivative_type} Mispricing (Today vs PCA, with Prev Day if available)")
                 detailed_comparison = comparison.copy()
@@ -1473,7 +1463,6 @@ if not price_df_filtered.empty:
 
             # Collect Section 9 shock figure for PDF download
             SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
-            register_envelope_chart(derivative_type, fig)
 
 
         # --- 5.1 Outright Price/Rate Curve Snapshot ---
@@ -3553,97 +3542,126 @@ try:
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
+
 # ============================================================
-# SECTION 11 — TRADING SHEET GENERATOR (MISPRICING + ENVELOPE)
+# FINAL BLOCK — COMBINED SECTION 5 + SECTION 10 EXPORT
 # ============================================================
 
-st.header("11. Trading Sheet Export (Paired RV Diagnostics)")
+from io import BytesIO
+from matplotlib.backends.backend_pdf import PdfPages
+import re
 
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-PAIRED_EXPORTS = {}
+# ---------- Helper: normalize derivative names ----------
+def _normalize_derivative_name(title: str):
+    """
+    Converts titles like:
+    'Section 5 – 3M Fly'
+    'Section 9 – 3M Fly (1σ & 2σ)'
+    into common comparable key: '3M Fly'
+    """
+    if "–" in title:
+        title = title.split("–", 1)[1].strip()
 
+    # remove envelope text
+    title = title.replace("(1σ & 2σ)", "")
+    title = title.replace("σ", "")
+    title = title.replace("  ", " ")
 
-# --- Register figures from Section 5 ---
-def register_mispricing_chart(name, fig):
-    if name not in PAIRED_EXPORTS:
-        PAIRED_EXPORTS[name] = {}
-    PAIRED_EXPORTS[name]["mispricing"] = fig
-
-
-# --- Register figures from Section 10 ---
-def register_envelope_chart(name, fig):
-    if name not in PAIRED_EXPORTS:
-        PAIRED_EXPORTS[name] = {}
-    PAIRED_EXPORTS[name]["envelope"] = fig
-
-
-# --- Build side-by-side page ---
-def build_report_page(left_fig, right_fig, title):
-
-    new_fig = plt.figure(figsize=(17, 8))
-    gs = new_fig.add_gridspec(1, 2)
-
-    # Convert matplotlib → image
-    def fig_to_img(fig):
-        canvas = FigureCanvasAgg(fig)
-        canvas.draw()
-        img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
-        img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-        return img
-
-    # LEFT (Section 5)
-    ax1 = new_fig.add_subplot(gs[0])
-    ax1.imshow(fig_to_img(left_fig))
-    ax1.axis("off")
-    ax1.set_title("Market vs PCA Fair")
-
-    # RIGHT (Section 10)
-    ax2 = new_fig.add_subplot(gs[1])
-    ax2.imshow(fig_to_img(right_fig))
-    ax2.axis("off")
-    ax2.set_title("Adaptive Sigma Envelope")
-
-    new_fig.suptitle(title, fontsize=16)
-    plt.tight_layout()
-
-    return new_fig
+    return title.strip()
 
 
-# --- Build PDF ---
-def generate_trading_sheet():
+# ---------- Build paired ordering ----------
+def _build_combined_figure_order(section5_figs, section9_figs):
+    """
+    Creates ordered list:
+    3M Spread (S5)
+    3M Spread (S10)
+    3M Fly (S5)
+    3M Fly (S10)
+    6M Spread ...
+    """
+    grouped = {}
+
+    # collect section 5
+    for fig, name in section5_figs:
+        key = _normalize_derivative_name(name)
+        grouped.setdefault(key, {})["sec5"] = (fig, name)
+
+    # collect section 10
+    for fig, name in section9_figs:
+        key = _normalize_derivative_name(name)
+        grouped.setdefault(key, {})["sec9"] = (fig, name)
+
+    # natural tenor sorting (3M, 6M, 12M...)
+    def tenor_sort(k):
+        m = re.search(r'(\d+)', k)
+        return int(m.group(1)) if m else 999
+
+    ordered_keys = sorted(grouped.keys(), key=tenor_sort)
+
+    ordered = []
+    for k in ordered_keys:
+        block = grouped[k]
+        if "sec5" in block:
+            ordered.append(block["sec5"])
+        if "sec9" in block:
+            ordered.append(block["sec9"])
+
+    return ordered
+
+
+# ---------- Export PDF ----------
+def _export_full_curve_pdf():
+    if len(SECTION5_FIGURES) == 0 and len(SECTION9_FIGURES) == 0:
+        return None
+
+    ordered_figs = _build_combined_figure_order(SECTION5_FIGURES, SECTION9_FIGURES)
 
     buffer = BytesIO()
-
     with PdfPages(buffer) as pdf:
-
-        for instrument, figs in PAIRED_EXPORTS.items():
-
-            if "mispricing" in figs and "envelope" in figs:
-
-                page = build_report_page(
-                    figs["mispricing"],
-                    figs["envelope"],
-                    instrument
-                )
-
-                pdf.savefig(page)
-                plt.close(page)
+        for fig, title in ordered_figs:
+            try:
+                fig.suptitle(title, fontsize=14)
+                pdf.savefig(fig, bbox_inches="tight")
+            except Exception:
+                continue
 
     buffer.seek(0)
     return buffer
 
 
-# --- Download button ---
-if st.button("Generate Trading Sheet"):
+# ---------- UI ----------
+st.markdown("---")
+st.header("Full Curve Diagnostics Export")
 
-    if len(PAIRED_EXPORTS) == 0:
-        st.warning("No paired figures registered yet.")
-    else:
-        pdf_buffer = generate_trading_sheet()
+st.write(
+"""
+Downloads ONE combined PDF containing:
 
-        st.download_button(
-            label="Download RV Trading Sheet",
-            data=pdf_buffer,
-            file_name="Curve_RV_Trading_Sheet.pdf",
-            mime="application/pdf"
-        )
+• Section 5 — Market vs PCA snapshots  
+• Section 10 — Precision Adaptive Envelopes (1σ & 2σ)
+
+Graphs are paired derivative-wise:
+3M → 6M → 12M → ...
+"""
+)
+
+full_pdf = _export_full_curve_pdf()
+
+if full_pdf is not None:
+    st.download_button(
+        label="Download Full Curve Diagnostics PDF",
+        data=full_pdf,
+        file_name=f"Full_Curve_Diagnostics_{analysis_date}.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
+else:
+    st.info("Generate Section 5 and Section 10 charts first.")
+
+
+
+
+
+
+
