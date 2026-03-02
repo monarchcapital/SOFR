@@ -11,9 +11,11 @@ from io import BytesIO
 from matplotlib.backends.backend_pdf import PdfPages
 
 # --- PDF figure collections ---
-SECTION5_FIGURES = []
-SECTION9_FIGURES = []
+if "SECTION5_FIGURES" not in st.session_state:
+    st.session_state.SECTION5_FIGURES = []
 
+if "SECTION9_FIGURES" not in st.session_state:
+    st.session_state.SECTION9_FIGURES = []
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="CANADA Futures PCA Analyzer")
@@ -1375,7 +1377,7 @@ if not price_df_filtered.empty:
                 st.pyplot(fig)
 
                 # Collect Section 5 figure for PDF download
-                SECTION5_FIGURES.append((fig, f"Section 5 – {derivative_type}"))
+                st.session_state.SECTION5_FIGURES.append((fig, f"Section 5 – {derivative_type}"))
 
                 # --- Detailed Table ---
                 st.markdown(f"###### {derivative_type} Mispricing (Today vs PCA, with Prev Day if available)")
@@ -1462,7 +1464,7 @@ if not price_df_filtered.empty:
             st.pyplot(fig)
 
             # Collect Section 9 shock figure for PDF download
-            SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
+            st.session_state.SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
 
 
         # --- 5.1 Outright Price/Rate Curve Snapshot ---
@@ -1534,7 +1536,7 @@ if not price_df_filtered.empty:
             st.pyplot(fig_curve)
 
             # Collect Outright curve figure for Section 5 PDF
-            SECTION5_FIGURES.append((fig_curve, "Section 5 – Outright Curve"))
+            st.session_state.SECTION5_FIGURES.append((fig_curve, "Section 5 – Outright Curve"))
 
             # --- Detailed Contract Price/Rate Table (Outright) ---
             st.markdown("###### Outright Price and Rate Mispricing")
@@ -1623,13 +1625,14 @@ if not price_df_filtered.empty:
         
         # --------------------------- Download all Section 5 snapshots as PDF ---------------------------
         st.subheader("Download All Section 5 Snapshots as PDF")
+        SECTIONS_FIGURES = st.session_state.SECTION5_FIGURES
 
-        if not SECTION5_FIGURES:
+        if not st.session_state.SECTION5_FIGURES:
             st.info("Generate the Section 5 charts above to enable PDF download.")
         else:
             pdf_buffer_5 = BytesIO()
             with PdfPages(pdf_buffer_5) as pdf:
-                for fig, title in SECTION5_FIGURES:
+                for fig, title in st.session_state.SECTION5_FIGURES:
                     if title:
                         fig.suptitle(title)
                     pdf.savefig(fig, bbox_inches="tight")
@@ -3612,11 +3615,13 @@ def _build_combined_figure_order(section5_figs, section9_figs):
 
 # ---------- Export PDF ----------
 def _export_full_curve_pdf():
-    if len(SECTION5_FIGURES) == 0 and len(SECTION9_FIGURES) == 0:
+    if len(st.session_state.SECTION5_FIGURES) == 0 and len(st.session_state.SECTION9_FIGURES) == 0:
         return None
 
-    ordered_figs = _build_combined_figure_order(SECTION5_FIGURES, SECTION9_FIGURES)
-
+    ordered_figs = _build_combined_figure_order(
+    st.session_state.SECTION5_FIGURES,
+    st.session_state.SECTION9_FIGURES
+)
     buffer = BytesIO()
     with PdfPages(buffer) as pdf:
         for fig, title in ordered_figs:
