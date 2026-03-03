@@ -11,10 +11,13 @@ from io import BytesIO
 from matplotlib.backends.backend_pdf import PdfPages
 
 # --- PDF figure collections ---
-SECTION5_FIGURES = []
-SECTION9_FIGURES = []
+if "SECTION5_FIGURES" not in st.session_state:
+    st.session_state.SECTION5_FIGURES = []
 
-
+if "SECTION9_FIGURES" not in st.session_state:
+    st.session_state.SECTION9_FIGURES = []
+if "SNAPSHOT_READY" not in st.session_state:
+    st.session_state.SNAPSHOT_READY = False
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="SONIA Futures PCA Analyzer")
 
@@ -1375,7 +1378,7 @@ if not price_df_filtered.empty:
                 st.pyplot(fig)
 
                 # Collect Section 5 figure for PDF download
-                SECTION5_FIGURES.append((fig, f"Section 5 – {derivative_type}"))
+                st.session_state.SECTION5_FIGURES.append((fig, f"Section 5 – {derivative_type}"))
 
                 # --- Detailed Table ---
                 st.markdown(f"###### {derivative_type} Mispricing (Today vs PCA, with Prev Day if available)")
@@ -1462,7 +1465,8 @@ if not price_df_filtered.empty:
             st.pyplot(fig)
 
             # Collect Section 9 shock figure for PDF download
-            SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
+            if not st.session_state.SNAPSHOT_READY:
+             st.session_state.SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
 
 
         # --- 5.1 Outright Price/Rate Curve Snapshot ---
@@ -1534,7 +1538,7 @@ if not price_df_filtered.empty:
             st.pyplot(fig_curve)
 
             # Collect Outright curve figure for Section 5 PDF
-            SECTION5_FIGURES.append((fig_curve, "Section 5 – Outright Curve"))
+            st.session_state.SECTION5_FIGURES.append((fig_curve, "Section 5 – Outright Curve"))
 
             # --- Detailed Contract Price/Rate Table (Outright) ---
             st.markdown("###### Outright Price and Rate Mispricing")
@@ -1623,13 +1627,14 @@ if not price_df_filtered.empty:
         
         # --------------------------- Download all Section 5 snapshots as PDF ---------------------------
         st.subheader("Download All Section 5 Snapshots as PDF")
+        SECTIONS_FIGURES = st.session_state.SECTION5_FIGURES
 
-        if not SECTION5_FIGURES:
+        if not st.session_state.SECTION5_FIGURES:
             st.info("Generate the Section 5 charts above to enable PDF download.")
         else:
             pdf_buffer_5 = BytesIO()
             with PdfPages(pdf_buffer_5) as pdf:
-                for fig, title in SECTION5_FIGURES:
+                for fig, title in st.session_state.SECTION5_FIGURES:
                     if title:
                         fig.suptitle(title)
                     pdf.savefig(fig, bbox_inches="tight")
@@ -2561,6 +2566,14 @@ def plot_with_stats_table(df, label, analysis_dt, window):
     ax.set_title(f"{label} Curve: Statistical Boundaries (Max-Rolling {window}d)", fontsize=14)
     ax.legend(loc='upper left', bbox_to_anchor=(1, 1)); ax.grid(True, alpha=0.15)
     st.pyplot(fig)
+
+    # ---- STORE FOR COMBINED PDF (Section 10) ----
+    if "SECTION9_FIGURES" not in st.session_state:
+        st.session_state.SECTION9_FIGURES = []
+    
+    st.session_state.SECTION9_FIGURES.append(
+        (fig, f"Section 10 – {label}")
+    )
 
     # --- TABLE ---
     st.write(f"**{label} Precision Statistics**")
@@ -3542,6 +3555,138 @@ try:
 
 except Exception as e:
     st.warning(f"Relationship analysis unavailable: {e}")
+
+# ============================================================
+# FINAL BLOCK — COMBINED SECTION 5 + SECTION 10 EXPORT
+# ============================================================
+
+from io import BytesIO
+from matplotlib.backends.backend_pdf import PdfPages
+import re
+
+# ---------- Helper: normalize derivative names ----------
+def _normalize_derivative_name(title: str):
+    """
+    Converts titles like:
+    'Section 5 – 3M Fly'
+    'Section 9 – 3M Fly (1σ & 2σ)'
+    into common comparable key: '3M Fly'
+    """
+    if "–" in title:
+        title = title.split("–", 1)[1].strip()
+
+    # remove envelope text
+    title = title.replace("(1σ & 2σ)", "")
+    title = title.replace("σ", "")
+    title = title.replace("  ", " ")
+
+    return title.strip()
+
+
+# ---------- Build paired ordering ----------
+def _build_combined_figure_order(section5_figs, section9_figs):
+    """
+    Creates ordered list:
+    3M Spread (S5)
+    3M Spread (S10)
+    3M Fly (S5)
+    3M Fly (S10)
+    6M Spread ...
+    """
+    grouped = {}
+
+    # collect section 5
+    for fig, name in section5_figs:
+        key = _normalize_derivative_name(name)
+        grouped.setdefault(key, {})["sec5"] = (fig, name)
+
+    # collect section 10
+    for fig, name in section9_figs:
+        key = _normalize_derivative_name(name)
+        grouped.setdefault(key, {})["sec9"] = (fig, name)
+
+    # natural tenor sorting (3M, 6M, 12M...)
+    def tenor_sort(k):
+        m = re.search(r'(\d+)', k)
+        return int(m.group(1)) if m else 999
+
+    ordered_keys = sorted(grouped.keys(), key=tenor_sort)
+
+    ordered = []
+    for k in ordered_keys:
+        block = grouped[k]
+        if "sec5" in block:
+            ordered.append(block["sec5"])
+        if "sec9" in block:
+            ordered.append(block["sec9"])
+
+    return ordered
+
+
+# ---------- Export PDF ----------
+def _export_full_curve_pdf():
+
+    sec5 = st.session_state.get("SECTION5_FIGURES", [])
+    sec10 = st.session_state.get("SECTION9_FIGURES", [])
+
+    if len(sec5) == 0 and len(sec10) == 0:
+        return None
+
+    ordered = _build_combined_figure_order(sec5, sec10)
+
+    buffer = BytesIO()
+    with PdfPages(buffer) as pdf:
+        for fig, title in ordered:
+            try:
+                if title:
+                    fig.suptitle(title)
+                pdf.savefig(fig, bbox_inches="tight")
+            except Exception:
+                pass
+
+    buffer.seek(0)
+    return buffer
+
+# ---------- UI ----------
+st.markdown("---")
+st.header("Full Curve Diagnostics Export")
+st.markdown("### DEBUG FIGURE COUNTS")
+
+st.write("SEC5 stored:", len(st.session_state.get("SECTION5_FIGURES", [])))
+st.write("SEC10 stored:", len(st.session_state.get("SECTION9_FIGURES", [])))
+
+if st.session_state.get("SECTION9_FIGURES"):
+    st.write("First SEC10 title:",
+             st.session_state.SECTION9_FIGURES[0][1])
+st.write(
+"""
+Downloads ONE combined PDF containing:
+
+• Section 5 — Market vs PCA snapshots  
+• Section 10 — Precision Adaptive Envelopes (1σ & 2σ)
+
+Graphs are paired derivative-wise:
+3M → 6M → 12M → ...
+"""
+)
+generate_pdf = st.button("Prepare Combined PDF")
+
+if generate_pdf:
+    st.session_state.SNAPSHOT_READY = True
+    full_pdf = _export_full_curve_pdf()
+else:
+    full_pdf = None
+
+if full_pdf is not None:
+    st.download_button(
+        label="Download Full Curve Diagnostics PDF",
+        data=full_pdf,
+        file_name=f"Full_Curve_Diagnostics_{analysis_date}.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
+else:
+    st.info("Generate Section 5 and Section 10 charts first.")
 
 
 
