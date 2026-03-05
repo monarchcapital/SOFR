@@ -10,6 +10,647 @@ from datetime import datetime, date
 from io import BytesIO
 from matplotlib.backends.backend_pdf import PdfPages
 import re
+import threading
+import time
+import queue
+import traceback
+
+# =============================================================================
+# LIVE FEED MODULE  —  Lightstreamer → price_df row injector
+# =============================================================================
+#
+# Architecture:
+#   • A single background thread runs the Lightstreamer client.
+#   • Updates arrive in onItemUpdate() and are pushed onto a thread-safe
+#     queue.Queue.
+#   • On every Streamlit rerun, the main thread drains the queue and writes
+#     the latest prices into st.session_state["live_prices"]
+#     (dict: contract_code → price float).
+#   • inject_live_row(price_df) appends (or overwrites) today's row in the
+#     historical price DataFrame so the rest of the app sees live data.
+#
+# Contract mapping:
+#   The Lightstreamer item name is "TT-<InstrumentId>".
+#   We resolve InstrumentId → SOFR contract code (Z25, H26 …) via a
+#   user-supplied mapping table in the sidebar.
+# =============================================================================
+
+_LS_SERVER   = "https://ls-md.corp.hertshtengroup.com/"
+_LS_ADAPTER  = "TTsdkLSAdapter"
+_LS_DATA_ADT = "HGL1_Adapter"
+
+_LS_FIELDS = [
+    "command", "Exchange", "Contract", "Product", "InstrumentId",
+    "ClientRecvTime", "ExchangeRecvTime", "ServerRecvTime",
+    "Open", "High", "Low", "Close", "Volume",
+    "Last", "LastQty", "SeriesStatus",
+    "Settle", "PrevSettle",
+    "BestAsk", "BestAskQty", "BestBid", "BestBidQty",
+    "IndSettle", "Price", "AdminPrice", "Admin", "Direction"
+]
+
+# Price field preference order — VWAP first, then fallbacks
+_PRICE_FIELD_PRIORITY = ["Settle", "Last", "IndSettle", "Price", "Close"]
+
+# TT prices arrive as integer ticks: 9633 = 96.330, 9675.5 = 96.755
+# CME 3-Month SOFR: divide raw tick value by 100 to get xx.xxx
+_TT_PRICE_SCALE = 100.0
+
+# Session-state keys
+_SS_LIVE_PRICES   = "live_prices"       # dict: contract -> price float (xx.xxx)
+_SS_VWAP_STATE    = "vwap_state"        # dict: contract -> {"pv": float, "vol": float}
+_SS_VWAP_PRICES   = "vwap_prices"       # dict: contract -> {"vwap": float, "bid": float, "ask": float, "ts": str}
+_SS_LS_THREAD     = "ls_thread"
+_SS_LS_CLIENT     = "ls_client"
+_SS_LS_SUB        = "ls_subscription"
+_SS_LS_QUEUE      = "ls_queue"
+_SS_LS_CONNECTED  = "ls_connected"
+_SS_LS_STATUS_MSG = "ls_status_msg"
+_SS_ID_MAP        = "ls_id_map"
+_SS_LS_LOG        = "ls_log"
+_SS_LS_LOG_Q      = "ls_log_q"          # thread-safe queue for log messages from background thread
+
+
+def _init_live_session_state():
+    """Initialise all live-feed keys in session state (idempotent)."""
+    defaults = {
+        _SS_LIVE_PRICES:   {},
+        _SS_VWAP_STATE:    {},    # VWAP accumulators per contract
+        _SS_VWAP_PRICES:   {},    # latest VWAP snapshot with timestamp
+        _SS_LS_THREAD:     None,
+        _SS_LS_CLIENT:     None,
+        _SS_LS_SUB:        None,
+        _SS_LS_QUEUE:      queue.Queue(),
+        _SS_LS_CONNECTED:  False,
+        _SS_LS_STATUS_MSG: "Disconnected",
+        _SS_ID_MAP:        dict(_DEFAULT_ID_MAP),
+        _SS_LS_LOG:        [],
+        _SS_LS_LOG_Q:      queue.Queue(),  # log messages from background thread
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def _ls_log(msg: str):
+    """
+    Append a timestamped log message.
+    Safe to call from main thread — drains log_q first then appends.
+    Background thread logs are pushed onto _SS_LS_LOG_Q instead.
+    """
+    ts = datetime.now().strftime("%H:%M:%S")
+    log = st.session_state.get(_SS_LS_LOG, [])
+    log.append(f"[{ts}] {msg}")
+    st.session_state[_SS_LS_LOG] = log[-50:]
+
+
+def _drain_log_queue():
+    """Move messages from the background thread's log queue into the session log list."""
+    log_q = st.session_state.get(_SS_LS_LOG_Q)
+    if not log_q:
+        return
+    log = st.session_state.get(_SS_LS_LOG, [])
+    while not log_q.empty():
+        try:
+            log.append(log_q.get_nowait())
+        except queue.Empty:
+            break
+    st.session_state[_SS_LS_LOG] = log[-50:]
+
+
+def _raw_to_float(raw) -> float:
+    """Parse a raw tick string/number to float, return None on failure."""
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def _scale_price(raw_price: float) -> float:
+    """
+    Convert TT raw tick to proper SOFR price (xx.xxx).
+    TT sends e.g. 9633 or 9675.5 — divide by 100 → 96.330 / 96.755.
+    """
+    if raw_price is None:
+        return None
+    return round(raw_price / _TT_PRICE_SCALE, 5)
+
+
+def _pick_raw_price(update, fields) -> float:
+    """
+    Return the best available RAW tick price from a Lightstreamer update.
+    VWAP is computed separately; this is used as the fallback non-VWAP price.
+    """
+    for field in _PRICE_FIELD_PRIORITY:
+        if field == "VWAP":
+            continue   # VWAP computed internally, not a field in the update
+        if field in fields:
+            raw = update.getValue(field)
+            v = _raw_to_float(raw)
+            if v is not None:
+                return v
+    return None
+
+
+def _compute_vwap_payload(acc: dict,
+                          ask_raw: float, ask_qty: float,
+                          bid_raw: float, bid_qty: float,
+                          last_raw: float, last_qty: float):
+    """
+    Pure function — NO session_state access. Safe to call from any thread.
+
+    Computes the VWAP contribution from this update tick using:
+        VWAP = (bid_price × ask_qty + ask_price × bid_qty) / (ask_qty + bid_qty)
+
+    'ask_qty' and 'bid_qty' are the OPPOSITE side's quantities, so a large ask
+    queue means competition on the buy side — the bid price is weighted higher,
+    and vice versa.  Confirmed trades (Last × LastQty) also contribute.
+
+    Returns (new_acc, snapshot_dict) where snapshot_dict contains all display fields.
+    Returns (acc, None) if no usable data in this tick.
+    """
+    has_quote = (ask_raw is not None and ask_qty is not None and ask_qty > 0
+                 and bid_raw is not None and bid_qty is not None and bid_qty > 0)
+    has_trade = (last_raw is not None and last_qty is not None and last_qty > 0)
+
+    if not has_quote and not has_trade:
+        return acc, None
+
+    new_acc = {"pv": acc["pv"], "vol": acc["vol"]}   # copy
+
+    if has_quote:
+        new_acc["pv"]  += bid_raw * ask_qty + ask_raw * bid_qty
+        new_acc["vol"] += ask_qty + bid_qty
+
+    if has_trade:
+        new_acc["pv"]  += last_raw * last_qty
+        new_acc["vol"] += last_qty
+
+    if new_acc["vol"] <= 0:
+        return new_acc, None
+
+    vwap_scaled = _scale_price(new_acc["pv"] / new_acc["vol"])
+    snapshot = {
+        "vwap":     vwap_scaled,
+        "bid":      _scale_price(bid_raw)  if bid_raw  is not None else None,
+        "ask":      _scale_price(ask_raw)  if ask_raw  is not None else None,
+        "bid_qty":  bid_qty,
+        "ask_qty":  ask_qty,
+        "last":     _scale_price(last_raw) if last_raw is not None else None,
+        "last_qty": last_qty,
+        "ts":       datetime.now().strftime("%H:%M:%S"),
+        "acc_vol":  new_acc["vol"],
+    }
+    return new_acc, snapshot
+
+
+def _tt_contract_to_sofr_code(tt_code: str) -> str:
+    """
+    Convert TT-style CME SOFR contract codes to the app contract codes.
+    Handles prefixes: SR, SR3 (3-month SOFR), GE, 3SR
+    Examples:  SR3Z5 → Z25,  SR3H6 → H26,  SR3M6 → M26,  SRH6 → H26
+    Only returns a code for valid SOFR months: Z, H, M, U.
+    """
+    import re as _re
+    # Strip known prefixes including SR3 (3-month SOFR futures)
+    m = _re.match(r'^(?:SR3|SR|GE|3SR)?([FGHJKMNQUVXZ])(\d{1,2})$',
+                  tt_code.strip().upper())
+    if not m:
+        return None
+    month_letter = m.group(1)
+    year_digits  = m.group(2)
+    if month_letter not in {'Z', 'H', 'M', 'U'}:
+        return None
+    # Single digit year: '5' → '25', '6' → '26', etc.
+    year_2d = f"2{year_digits}" if len(year_digits) == 1 else year_digits[-2:]
+    return f"{month_letter}{year_2d}"
+
+
+# ── Known instrument ID map (pre-populated, user can extend in sidebar) ──────
+# SR3 = CME 3-Month SOFR Futures
+_DEFAULT_ID_MAP = {
+    "17739299224602468339": "Z25",
+    "2264814074172926158":  "H26",
+    "2518875037886751798":  "M26",
+    "10056698436755136015": "U26",
+    "3761391845186607269":  "Z26",
+    "8786029629332899618":  "H27",
+    "6064266935547558467":  "M27",
+    "10582686653072545408": "U27",
+    "17925935412019565973": "Z27",
+    "3822227243959035490":  "H28",
+    "12741923103719175711": "M28",
+    "16673841811510079166": "U28",
+    "7359239446017790966":  "Z28",
+    "4211986922965728750":  "H29",
+    "11432813735419224277": "M29",
+    "9909662404632894188":  "U29",
+    "12350987571259131621": "Z29",
+}
+
+
+def _resolve_contract(update, id_map: dict) -> str:
+    """
+    Map a Lightstreamer update to a SOFR contract code (e.g. 'H26').
+    Tries (in order):
+      1. InstrumentId field → id_map lookup
+      2. Item name  "TT-<id>" → id_map lookup
+      3. Contract field value  (TT CME style 'SRH6') → convert
+    """
+    inst_id = (update.getValue("InstrumentId") or "").strip()
+    if inst_id and inst_id in id_map:
+        return id_map[inst_id]
+
+    item_name = update.getItemName()
+    raw_id = item_name.replace("TT-", "").strip()
+    if raw_id in id_map:
+        return id_map[raw_id]
+
+    contract_raw = (update.getValue("Contract") or "").strip()
+    if contract_raw:
+        return _tt_contract_to_sofr_code(contract_raw)
+
+    return None
+
+
+class _SubListener:
+    """
+    Lightstreamer subscription listener — runs on the BACKGROUND THREAD.
+    IMPORTANT: Does NOT read or write st.session_state (not thread-safe).
+    All raw field values are packed into the queue as a dict.
+    The main thread's _drain_queue_to_session() does all accumulation + state writes.
+    """
+
+    def __init__(self, q: queue.Queue, id_map_ref: dict, log_q: queue.Queue):
+        self._q      = q        # price update queue
+        self._id_map = id_map_ref
+        self._log_q  = log_q    # separate log queue (avoids session_state writes)
+
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        try:
+            self._log_q.put_nowait(f"[{ts}] {msg}")
+        except Exception:
+            pass
+
+    def onItemUpdate(self, update):
+        contract = _resolve_contract(update, self._id_map)
+        if not contract:
+            self._log(f"SKIP {update.getItemName()} — contract not resolved")
+            return
+
+        # Pack all raw values — accumulation happens in main thread
+        payload = {
+            "contract": contract,
+            "ask_raw":  _raw_to_float(update.getValue("BestAsk")),
+            "ask_qty":  _raw_to_float(update.getValue("BestAskQty")),
+            "bid_raw":  _raw_to_float(update.getValue("BestBid")),
+            "bid_qty":  _raw_to_float(update.getValue("BestBidQty")),
+            "last_raw": _raw_to_float(update.getValue("Last")),
+            "last_qty": _raw_to_float(update.getValue("LastQty")),
+            # Fallback price fields (scaled when used)
+            "settle":   _raw_to_float(update.getValue("Settle")),
+            "last_p":   _raw_to_float(update.getValue("Last")),
+        }
+        self._q.put(payload)
+
+        b = f"{_scale_price(payload['bid_raw']):.3f}" if payload['bid_raw'] else "—"
+        a = f"{_scale_price(payload['ask_raw']):.3f}" if payload['ask_raw'] else "—"
+        self._log(f"TICK {contract}  bid={b}  ask={a}")
+
+    def onSubscriptionError(self, code, message):
+        self._log(f"SUB ERROR {code}: {message}")
+
+    def onEndOfSnapshot(self, item_name, item_pos):
+        _ls_log(f"Snapshot complete: {item_name}")
+
+
+def _run_ls_client(server, adapter, data_adapter, items, fields,
+                   id_map_ref, q: queue.Queue):
+    """
+    Background thread: connects to Lightstreamer and listens for updates.
+    Runs until _SS_LS_CONNECTED is set to False (via Disconnect button).
+    """
+    try:
+        from lightstreamer.client import LightstreamerClient, Subscription as LSSub
+
+        st.session_state[_SS_LS_STATUS_MSG] = "Connecting…"
+        _ls_log(f"Connecting to {server}")
+
+        ls = LightstreamerClient(server, adapter)
+        ls.connect()
+
+        st.session_state[_SS_LS_CLIENT]     = ls
+        st.session_state[_SS_LS_CONNECTED]  = True
+        st.session_state[_SS_LS_STATUS_MSG] = "Connected ✅"
+        _ls_log("Connected")
+
+        sub = LSSub("MERGE", ["TT-" + i for i in items], fields)
+        sub.setDataAdapter(data_adapter)
+        sub.setRequestedMaxFrequency("0.5")
+        sub.setRequestedSnapshot("yes")
+
+        log_q    = st.session_state.get(_SS_LS_LOG_Q, queue.Queue())
+        listener = _SubListener(q, id_map_ref, log_q)
+        sub.addListener(listener)
+        ls.subscribe(sub)
+
+        st.session_state[_SS_LS_SUB]        = sub
+        st.session_state[_SS_LS_STATUS_MSG] = "Streaming ✅"
+        _ls_log(f"Subscribed — {len(items)} instruments")
+
+        while st.session_state.get(_SS_LS_CONNECTED, False):
+            time.sleep(1)
+
+        # Clean disconnect
+        try:
+            ls.unsubscribe(sub)
+            ls.disconnect()
+        except Exception:
+            pass
+        _ls_log("Disconnected cleanly")
+
+    except ImportError:
+        msg = ("lightstreamer-client-lib not installed. "
+               "Run:  pip install lightstreamer-client-lib")
+        _ls_log(f"ERROR: {msg}")
+        st.session_state[_SS_LS_STATUS_MSG] = f"⚠️ {msg}"
+        st.session_state[_SS_LS_CONNECTED]  = False
+
+    except Exception as e:
+        _ls_log(f"ERROR: {e}\n{traceback.format_exc()}")
+        st.session_state[_SS_LS_STATUS_MSG] = f"Error: {e}"
+        st.session_state[_SS_LS_CONNECTED]  = False
+
+
+def _drain_queue_to_session(q: queue.Queue) -> bool:
+    """
+    Main-thread only. Drains all raw update payloads from the queue,
+    accumulates VWAP, and writes results to session_state.
+
+    Each payload is a dict with raw field values from onItemUpdate.
+    All session_state writes happen here — never in the background thread.
+    """
+    _drain_log_queue()   # pull log messages from background thread first
+
+    updated = False
+    vwap_state  = st.session_state.get(_SS_VWAP_STATE,  {})
+    vwap_prices = st.session_state.get(_SS_VWAP_PRICES, {})
+    live_prices = st.session_state.get(_SS_LIVE_PRICES, {})
+    src_map     = st.session_state.get("live_prices_source", {})
+
+    while not q.empty():
+        try:
+            payload = q.get_nowait()
+        except queue.Empty:
+            break
+
+        contract = payload.get("contract")
+        if not contract:
+            continue
+
+        # Retrieve existing accumulator for this contract
+        acc = vwap_state.get(contract, {"pv": 0.0, "vol": 0.0})
+
+        # Compute VWAP (pure function — no session_state access)
+        new_acc, snapshot = _compute_vwap_payload(
+            acc,
+            payload.get("ask_raw"), payload.get("ask_qty"),
+            payload.get("bid_raw"), payload.get("bid_qty"),
+            payload.get("last_raw"), payload.get("last_qty"),
+        )
+        vwap_state[contract] = new_acc
+
+        if snapshot is not None:
+            # VWAP available — store snapshot and use as the live price
+            vwap_prices[contract] = snapshot
+            live_prices[contract] = snapshot["vwap"]
+            src_map[contract]     = "VWAP"
+        else:
+            # Fallback: use Settle then Last (already scaled by sender)
+            if src_map.get(contract) == "VWAP":
+                pass   # keep existing VWAP price — don't overwrite with fallback
+            else:
+                for raw_field in ["settle", "last_p"]:
+                    raw = payload.get(raw_field)
+                    if raw is not None:
+                        live_prices[contract] = _scale_price(raw)
+                        src_map[contract]     = "Fallback"
+                        break
+
+        updated = True
+
+    # Flush all writes to session_state in one pass
+    st.session_state[_SS_VWAP_STATE]        = vwap_state
+    st.session_state[_SS_VWAP_PRICES]       = vwap_prices
+    st.session_state[_SS_LIVE_PRICES]       = live_prices
+    st.session_state["live_prices_source"]  = src_map
+
+    return updated
+
+
+def inject_live_row(price_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Inject today's live prices as the most-recent row in price_df.
+    If a row for today already exists it is overwritten.
+    Only contracts that appear as columns in price_df are updated —
+    no new columns are added.
+    """
+    live = st.session_state.get(_SS_LIVE_PRICES, {})
+    if not live:
+        return price_df
+
+    today = pd.Timestamp(date.today())
+    known_contracts = price_df.columns.tolist()
+
+    row_data = {c: live.get(c, np.nan) for c in known_contracts}
+    new_row  = pd.Series(row_data, name=today)
+
+    if new_row.notna().any():
+        price_df = price_df.copy()
+        if today in price_df.index:
+            price_df.loc[today] = new_row
+        else:
+            price_df = pd.concat([price_df, new_row.to_frame().T])
+        price_df.index = pd.to_datetime(price_df.index)
+        price_df = price_df.sort_index()
+
+    return price_df
+
+
+def render_live_feed_sidebar(expiry_df: pd.DataFrame = None) -> bool:
+    """
+    Render the Live Feed section in the Streamlit sidebar.
+    Call this after loading the expiry file.
+    Returns True if at least one live price is available.
+    """
+    _init_live_session_state()
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("🔴 Live Feed (Lightstreamer)")
+
+    # ── Resolve connection state via thread.is_alive() ────────────────────
+    thread = st.session_state.get(_SS_LS_THREAD)
+    thread_alive = thread is not None and thread.is_alive()
+    if thread_alive and not st.session_state.get(_SS_LS_CONNECTED):
+        st.session_state[_SS_LS_CONNECTED] = True
+    elif not thread_alive and st.session_state.get(_SS_LS_CONNECTED):
+        st.session_state[_SS_LS_CONNECTED] = False
+        st.session_state[_SS_LS_STATUS_MSG] = "Disconnected"
+
+    is_connected = thread_alive
+    _drain_log_queue()   # pull log messages even before price queue is drained
+    live_prices  = st.session_state.get(_SS_LIVE_PRICES, {})
+    n_live = sum(1 for v in live_prices.values()
+                 if v is not None and not (isinstance(v, float) and np.isnan(v)))
+
+    # ── Status banner ─────────────────────────────────────────────────────
+    if is_connected:
+        src_map = st.session_state.get("live_prices_source", {})
+        n_vwap  = sum(1 for c,s in src_map.items() if s == "VWAP" and c in live_prices)
+        st.sidebar.success(f"● Streaming — {n_live} contracts  ({n_vwap} VWAP)")
+    else:
+        st.sidebar.info(st.session_state.get(_SS_LS_STATUS_MSG, "Disconnected"))
+
+    # ── Instrument ID mapping ─────────────────────────────────────────────
+    st.sidebar.markdown("**Instrument ID → Contract mapping**")
+    st.sidebar.caption("Pre-populated with all 17 SR3 SOFR contracts.")
+    current_map  = st.session_state.get(_SS_ID_MAP, dict(_DEFAULT_ID_MAP)) or dict(_DEFAULT_ID_MAP)
+    default_text = "\n".join(f"{k},{v}" for k, v in sorted(current_map.items(), key=lambda x: x[1]))
+    id_map_text  = st.sidebar.text_area("ID Mapping (InstrumentId,Code)",
+                                        value=default_text, height=150,
+                                        key="ls_id_map_input")
+    parsed_map = {}
+    for line in id_map_text.strip().splitlines():
+        if "," in line:
+            parts = line.split(",", 1)
+            if len(parts) == 2:
+                iid, code = parts[0].strip(), parts[1].strip().upper()
+                if iid and code:
+                    parsed_map[iid] = code
+    if not parsed_map:
+        parsed_map = dict(_DEFAULT_ID_MAP)
+    st.session_state[_SS_ID_MAP] = parsed_map
+
+    all_mapped_ids   = list(parsed_map.keys())
+    default_ids_text = "\n".join(all_mapped_ids)
+    with st.sidebar.expander("Edit subscribed IDs (advanced)", expanded=False):
+        st.caption("All mapped IDs are subscribed by default.")
+        subscribed_text = st.text_area("Subscribed IDs", value=default_ids_text,
+                                       height=200, key="ls_subscribed_ids")
+    subscribed_ids = [s.strip() for s in
+                      st.session_state.get("ls_subscribed_ids", default_ids_text).splitlines()
+                      if s.strip()]
+
+    # ── Fallback price field ──────────────────────────────────────────────
+    price_field_choice = st.sidebar.selectbox(
+        "Fallback price field (when no VWAP yet)",
+        options=["Settle", "Last", "IndSettle", "Price", "Close"],
+        index=0, key="ls_price_field",
+        help="VWAP is computed automatically from bid/ask. This is the fallback.")
+    _PRICE_FIELD_PRIORITY.clear()
+    _PRICE_FIELD_PRIORITY.extend(
+        [price_field_choice] + [f for f in ["Settle","Last","IndSettle","Price","Close"]
+                                if f != price_field_choice])
+
+    # ── Connect / Disconnect / Refresh row ───────────────────────────────
+    c1, c2, c3 = st.sidebar.columns(3)
+    with c1:
+        if st.button("▶ Connect", key="ls_connect_btn", disabled=is_connected):
+            if not subscribed_ids:
+                st.sidebar.warning("Add at least one Instrument ID first.")
+            else:
+                st.session_state[_SS_LS_CONNECTED]  = True
+                st.session_state[_SS_LS_STATUS_MSG] = "Connecting…"
+                t = threading.Thread(
+                    target=_run_ls_client,
+                    args=(_LS_SERVER, _LS_ADAPTER, _LS_DATA_ADT,
+                          subscribed_ids, _LS_FIELDS,
+                          st.session_state[_SS_ID_MAP],
+                          st.session_state[_SS_LS_QUEUE]),
+                    daemon=True, name="LightstreamerFeedThread")
+                st.session_state[_SS_LS_THREAD] = t
+                t.start()
+                st.rerun()
+    with c2:
+        if st.button("⏹ Stop", key="ls_disconnect_btn", disabled=not is_connected):
+            st.session_state[_SS_LS_CONNECTED]  = False
+            st.session_state[_SS_LS_STATUS_MSG] = "Disconnected"
+            st.rerun()
+    with c3:
+        if st.button("🔃 Refresh", key="ls_refresh_btn",
+                     help="Drain queue and refresh prices now"):
+            q = st.session_state.get(_SS_LS_QUEUE)
+            if q:
+                _drain_queue_to_session(q)
+            st.rerun()
+
+    # ── Auto-refresh interval slider ──────────────────────────────────────
+    auto_refresh = st.sidebar.checkbox("Auto-refresh", value=False, key="ls_auto_refresh")
+    refresh_secs = st.sidebar.slider("Refresh interval (seconds)", min_value=5,
+                                     max_value=60, value=15, step=5,
+                                     key="ls_refresh_interval",
+                                     disabled=not auto_refresh)
+
+    # ── VWAP reset ────────────────────────────────────────────────────────
+    if st.sidebar.button("🔄 Reset VWAP", key="ls_vwap_reset",
+                         help="Clear intraday VWAP — use at session start"):
+        st.session_state[_SS_VWAP_STATE]       = {}
+        st.session_state[_SS_VWAP_PRICES]      = {}
+        st.session_state["live_prices_source"] = {}
+        st.session_state[_SS_LIVE_PRICES]      = {}
+        _ls_log("VWAP reset by user")
+        st.rerun()
+
+    # ── Drain queue ───────────────────────────────────────────────────────
+    q = st.session_state.get(_SS_LS_QUEUE)
+    if q:
+        _drain_queue_to_session(q)
+    # Re-read after drain
+    live_prices = st.session_state.get(_SS_LIVE_PRICES, {})
+    n_live = sum(1 for v in live_prices.values()
+                 if v is not None and not (isinstance(v, float) and np.isnan(v)))
+
+    # ── VWAP live table (sidebar) ─────────────────────────────────────────
+    if n_live > 0:
+        src_map    = st.session_state.get("live_prices_source", {})
+        vwap_snap  = st.session_state.get(_SS_VWAP_PRICES, {})
+        with st.sidebar.expander("📊 Live VWAP prices", expanded=True):
+            rows = []
+            for contract in sorted(live_prices.keys()):
+                price  = live_prices[contract]
+                source = src_map.get(contract, "Fallback")
+                snap   = vwap_snap.get(contract, {})
+                rows.append({
+                    "Contract": contract,
+                    "Price":    f"{price:.3f}" if price is not None else "—",
+                    "Source":   "VWAP" if source == "VWAP" else "Fallback",
+                    "Bid":      f"{snap['bid']:.3f}" if snap.get("bid") else "—",
+                    "Ask":      f"{snap['ask']:.3f}" if snap.get("ask") else "—",
+                    "Updated":  snap.get("ts", "—"),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.sidebar.caption("No live prices yet — connect and wait for updates.")
+
+    # ── Feed log ──────────────────────────────────────────────────────────
+    with st.sidebar.expander("Feed log", expanded=False):
+        log = st.session_state.get(_SS_LS_LOG, [])
+        st.text("\n".join(reversed(log)) if log else "No log entries yet.")
+
+    # ── Auto-refresh trigger ──────────────────────────────────────────────
+    if auto_refresh and is_connected:
+        time.sleep(refresh_secs)
+        st.rerun()
+
+    return n_live > 0
+
+
+# =============================================================================
+# END LIVE FEED MODULE
+# =============================================================================
 
 # --- Configuration --- (FIXED: must be the very first Streamlit call)
 st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
@@ -1015,6 +1656,121 @@ expiry_file = st.sidebar.file_uploader(
 price_df = load_data(price_file)
 expiry_df = load_data(expiry_file)
 
+# ── Live Feed ─────────────────────────────────────────────────────────────────
+# Render the live feed sidebar section (connect/disconnect/config).
+# This also drains the update queue on every rerun.
+_live_active = render_live_feed_sidebar(expiry_df)
+
+# If live prices are available, inject today's row into price_df so the rest
+# of the app treats live data exactly like historical data.
+if _live_active and price_df is not None:
+    price_df = inject_live_row(price_df)
+
+# ── End Live Feed ─────────────────────────────────────────────────────────────
+
+# ── Price Source Log Panel (main area, visible when live feed is active) ─────
+def render_price_source_panel(price_df_today, contracts_in_use, analysis_date):
+    """
+    Renders a collapsible panel in the main area showing the price source
+    for every outright, spread, fly, and double-fly that will be used on
+    the analysis date.  Sources: 'Live VWAP', 'Live Fallback', or 'CSV'.
+    """
+    live_prices = st.session_state.get("live_prices", {})
+    src_map     = st.session_state.get("live_prices_source", {})
+    vwap_snap   = st.session_state.get("vwap_prices", {})
+    today       = date.today()
+    is_today    = (analysis_date == today)
+
+    rows = []
+    for contract in contracts_in_use:
+        price = price_df_today.get(contract, None)
+        if price is None or (isinstance(price, float) and np.isnan(price)):
+            price_str = "—"
+            source    = "Missing"
+            bid_str   = "—"
+            ask_str   = "—"
+            ts_str    = "—"
+        elif is_today and contract in live_prices:
+            raw_source = src_map.get(contract, "Fallback")
+            source     = "Live VWAP" if raw_source == "VWAP" else "Live Fallback"
+            price_str  = f"{price:.3f}"
+            snap       = vwap_snap.get(contract, {})
+            bid_str    = f"{snap['bid']:.3f}" if snap.get("bid") else "—"
+            ask_str    = f"{snap['ask']:.3f}" if snap.get("ask") else "—"
+            ts_str     = snap.get("ts", "—")
+        else:
+            source    = "CSV"
+            price_str = f"{price:.3f}"
+            bid_str   = "—"
+            ask_str   = "—"
+            ts_str    = str(analysis_date)
+
+        rows.append({
+            "Contract": contract,
+            "Price":    price_str,
+            "Source":   source,
+            "Bid":      bid_str,
+            "Ask":      ask_str,
+            "As of":    ts_str,
+        })
+
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows)
+
+    # Colour-code by source
+    def colour_source(val):
+        if val == "Live VWAP":
+            return "background-color: #d4edda; color: #155724"
+        elif val == "Live Fallback":
+            return "background-color: #fff3cd; color: #856404"
+        elif val == "Missing":
+            return "background-color: #f8d7da; color: #721c24"
+        return ""
+
+    with st.expander("📋 Price Source Log — inputs used for today's calculations", expanded=False):
+        col_l, col_r = st.columns([3, 1])
+        with col_l:
+            st.caption(
+                f"Analysis date: **{analysis_date}** | "
+                f"Live contracts: **{sum(1 for r in rows if 'Live' in r['Source'])}** | "
+                f"CSV contracts: **{sum(1 for r in rows if r['Source'] == 'CSV')}** | "
+                f"Missing: **{sum(1 for r in rows if r['Source'] == 'Missing')}**"
+            )
+        with col_r:
+            if st.button("🔃 Refresh prices", key="price_log_refresh"):
+                q = st.session_state.get("ls_queue")
+                if q:
+                    # drain inline
+                    while not q.empty():
+                        try:
+                            item = q.get_nowait()
+                            contract2, price2 = item[0], item[1]
+                            source2 = item[2] if len(item) > 2 else "price"
+                            existing_src = st.session_state.get("live_prices_source", {}).get(contract2, "price")
+                            if source2 == "VWAP" or existing_src != "VWAP":
+                                st.session_state["live_prices"][contract2] = price2
+                                sm = st.session_state.get("live_prices_source", {})
+                                sm[contract2] = source2
+                                st.session_state["live_prices_source"] = sm
+                        except Exception:
+                            break
+                st.rerun()
+
+        st.dataframe(
+            df.style.map(colour_source, subset=["Source"]),
+            use_container_width=True,
+            hide_index=True,
+            height=min(400, 35 * len(df) + 40),
+        )
+        st.caption("🟢 Live VWAP = (bid×ask_qty + ask×bid_qty)/(ask_qty+bid_qty)  "
+                   "🟡 Live Fallback = Settle/Last from feed  "
+                   "⬜ CSV = historical file")
+
+# Store reference for use after analysis_date is known
+st.session_state["_price_source_panel_fn"] = render_price_source_panel
+
 # Placeholder for L_D Loadings and Sigma_Raw_df, calculated in Section 7 and used in Section 8
 loadings_df_gen = pd.DataFrame()
 Sigma_Raw_df = pd.DataFrame()
@@ -1037,11 +1793,16 @@ if price_df is not None and expiry_df is not None:
     
     # --- Analysis Date Selector (Maturity Roll) ---
     st.sidebar.header("3. Curve Analysis Date")
-    
-    default_analysis_date = end_date
+
+    # If live data was injected, default the analysis date to today
+    today_date = date.today()
+    if _live_active and today_date >= min_date and today_date <= max_date:
+        default_analysis_date = today_date
+    else:
+        default_analysis_date = end_date
     if default_analysis_date < min_date:
         default_analysis_date = min_date
-        
+
     analysis_date = st.sidebar.date_input(
         "Select **Single Date** for Curve Snapshot",
         value=default_analysis_date,
@@ -1100,6 +1861,19 @@ if not price_df_filtered.empty:
     col3.metric("3M Flies", butterflies_3M_df.shape[1])
     col4.metric("3M Double Flies", double_butterflies_3M_df.shape[1])
     col5.metric("Date Range Days", price_df_filtered.shape[0])
+
+    # ── Price Source Log Panel ────────────────────────────────────────────
+    # Build a dict of {contract: price} for the analysis date row
+    _price_row = {}
+    if analysis_dt in analysis_curve_df.index:
+        _price_row = analysis_curve_df.loc[analysis_dt].to_dict()
+    elif pd.Timestamp(analysis_date) in analysis_curve_df.index:
+        _price_row = analysis_curve_df.loc[pd.Timestamp(analysis_date)].to_dict()
+
+    _panel_fn = st.session_state.get("_price_source_panel_fn")
+    if _panel_fn is not None:
+        _panel_fn(_price_row, contract_labels, analysis_date)
+    # ── End Price Source Log ──────────────────────────────────────────────
 
 
     # 4. Perform PCA on 3M Spreads (Fair Curve)
