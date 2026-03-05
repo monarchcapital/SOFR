@@ -9,6 +9,7 @@ from datetime import datetime, date
 
 from io import BytesIO
 from matplotlib.backends.backend_pdf import PdfPages
+import re
 
 # --- Configuration --- (FIXED: must be the very first Streamlit call)
 st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
@@ -556,18 +557,19 @@ def calculate_best_and_worst_hedge_3M(trade_label, loadings_df, eigenvalues, pc_
         else:
             k_star = Cov_TH / Var_Hedge
             
-        # 2. Residual Variance of the hedged portfolio (Var(T - k*H) = Var(T) - k*Cov(T,H))
+        # 2. Residual Variance at the minimum-variance hedge ratio k*:
+        #    Var(T - k*H) = Var(T) - Cov(T,H)²/Var(H)  ≡  Var(T) - k* · Cov(T,H)
+        #    This simplified form is ONLY valid at the optimal k* (not for arbitrary k).
         Residual_Variance = Var_Trade - (k_star * Cov_TH)
         Residual_Variance = max(0, Residual_Variance) 
         
-        # 3. Residual Volatility (Score) in Rate % (was BPS, now divided by 100)
-        # 1 point = 100 BPS = 1% Rate
-        Residual_Volatility_Rate_Pct = np.sqrt(Residual_Variance) * 100 # MODIFIED: * 10000 -> * 100
+        # 3. Residual Volatility in Rate % (1 price point = 100 bps = 1% Rate)
+        Residual_Volatility_Rate_Pct = np.sqrt(Residual_Variance) * 100
         
         results.append({
             'Hedge Spread': hedge_spread,
             'Hedge Ratio (k*)': k_star,
-            'Residual Volatility (Rate %)': Residual_Volatility_Rate_Pct # MODIFIED: Column name update
+            'Residual Volatility (Rate %)': Residual_Volatility_Rate_Pct
         })
 
     if not results:
@@ -670,18 +672,18 @@ def calculate_best_and_worst_hedge_generalized(trade_label, Sigma_Raw_df):
         else:
             k_star = Cov_TH / Var_Hedge
             
-        # 2. Residual Variance of the hedged portfolio (Var(T - k*H) = Var(T) - k*Cov(T,H))
+        # 2. Residual Variance at the minimum-variance hedge ratio k*:
+        #    Var(T - k*H) = Var(T) - Cov(T,H)²/Var(H)  ≡  Var(T) - k* · Cov(T,H)
         Residual_Variance = Var_Trade - (k_star * Cov_TH)
         Residual_Variance = max(0, Residual_Variance) 
         
-        # 3. Residual Volatility (Score) in Rate % (was BPS, now divided by 100)
-        # 1 point = 100 BPS = 1% Rate
-        Residual_Volatility_Rate_Pct = np.sqrt(Residual_Variance) * 100 # MODIFIED: * 10000 -> * 100
+        # 3. Residual Volatility in Rate % (1 price point = 100 bps = 1% Rate)
+        Residual_Volatility_Rate_Pct = np.sqrt(Residual_Variance) * 100
         
         results.append({
             'Hedge Instrument': hedge_instrument,
             'Hedge Ratio (k*)': k_star,
-            'Residual Volatility (Rate %)': Residual_Volatility_Rate_Pct # MODIFIED: Column name update
+            'Residual Volatility (Rate %)': Residual_Volatility_Rate_Pct
         })
 
     if not results:
@@ -843,24 +845,23 @@ def calculate_all_factor_hedges(trade_label, factor_name, factor_sensitivities_d
                 k_factor = 0.0
                 Residual_Volatility_Rate_Pct = np.nan # Cannot neutralize factor with zero-exposure hedge
             else:
-                # k_factor is the ratio of sensitivities: k = Beta_T / Beta_H
+                # k_factor neutralises the target factor: k = Beta_T / Beta_H
                 k_factor = Trade_Exposure / Hedge_Exposure
                 
-                # 2. Calculate Residual Variance of the hedged portfolio (Var(T - k*H))
-                # Var(P) = Var(T) + k^2 Var(H) - 2k Cov(T, H)
+                # Residual Variance: Var(T - k*H) = Var(T) + k²Var(H) - 2k·Cov(T,H)
+                # Full formula used here because k_factor ≠ MVHR k*
                 Residual_Variance = Var_Trade + (k_factor**2 * Var_Hedge) - (2 * k_factor * Cov_TH)
                 Residual_Variance = max(0, Residual_Variance) 
                 
-                # 3. Residual Volatility (Score) in Rate % (was BPS, now divided by 100)
-                # 1 point = 100 BPS = 1% Rate
-                Residual_Volatility_Rate_Pct = np.sqrt(Residual_Variance) * 100 # MODIFIED: * 10000 -> * 100
+                # Residual Volatility in Rate % (1 price point = 100 bps = 1% Rate)
+                Residual_Volatility_Rate_Pct = np.sqrt(Residual_Variance) * 100
                 
             results.append({
                 'Hedge Instrument': hedge_instrument,
                 'Trade Sensitivity': Trade_Exposure,
                 'Hedge Sensitivity': Hedge_Exposure,
                 f'Factor Hedge Ratio (k_factor)': k_factor,
-                'Residual Volatility (Rate %)': Residual_Volatility_Rate_Pct # MODIFIED: Column name update
+                'Residual Volatility (Rate %)': Residual_Volatility_Rate_Pct
             })
             
         except Exception as e:
@@ -1285,6 +1286,8 @@ if not price_df_filtered.empty:
         # --- Curve Snapshot (Section 5) ---
         st.header("5. Curve Snapshot (Original vs. PCA Fair Value)")
         
+        # FIXED: clear figure lists before populating to prevent duplicates on re-run
+        st.session_state.SECTION5_FIGURES = []
 
         def get_previous_date(df, current_date):
             """Return the last available previous date in df before current_date."""
@@ -1670,8 +1673,8 @@ if not price_df_filtered.empty:
         This section calculates the **Minimum Variance Hedge Ratio ($k^*$ )** for a chosen **3M spread** trade, using *another 3M spread* as the hedge. The calculation uses the **Covariance Matrix** of the **3M spreads**, which is **reconstructed using the selected {pc_count} Principal Components**.
         * **Trade:** Long 1 unit of the selected 3M spread.
         * **Hedge:** Short $k^*$ units of the hedging 3M spread.
-        * **Volatility:** Expressed as **Rate %** ($1\% = 100 \text{{ BPS}}$).
-        """) 
+        * **Volatility:** Expressed as **Rate %** ($1\\% = 100 \\text{{ BPS}}$).
+        """)
         
         if spreads_3M_df_clean.shape[1] < 2:
             st.warning("Not enough 3M spreads available to calculate a hedge.")
@@ -1730,8 +1733,8 @@ if not price_df_filtered.empty:
         This section calculates the **Minimum Variance Hedge Ratio ($k^*$ )** for *any* derivative trade, using *any* other derivative as a hedge. The calculation is based on the **full covariance matrix** of all derivatives, which is **reconstructed using the selected {pc_count} Principal Components** derived from the 3M Spreads.
         * **Trade:** Long 1 unit of the selected instrument.
         * **Hedge:** Short $k^*$ units of the hedging instrument.
-        * **Volatility:** Expressed as **Rate %** ($1\% = 100 \text{{ BPS}}$).
-        """) # MODIFIED: Note on Rate % update
+        * **Volatility:** Expressed as **Rate %** ($1\\% = 100 \\text{{ BPS}}$).
+        """) # Note on Rate % update
 
         # --- HEDGING DATA PREPARATION (FOR SECTIONS 7 & 8) ---
         
@@ -1816,7 +1819,7 @@ if not price_df_filtered.empty:
         st.markdown(f"""
         This strategy uses the Level, Slope, and Curvature factors (PC1, PC2, PC3) to identify hedges that neutralize specific factor exposures.
         * **Factor Exposures:** Standardized sensitivities (Beta) to the principal components.
-        * **Volatility/Mispricing:** Expressed as **Rate %** ($1\% = 100 \text{{ BPS}}$).
+        * **Volatility/Mispricing:** Expressed as **Rate %** ($1\\% = 100 \\text{{ BPS}}$).
         """) 
         
         # 1. Calculate Factor Sensitivities (L_D columns renamed)
@@ -1976,7 +1979,7 @@ if not price_df_filtered.empty:
                 # --- NEW EXPLANATION OF THE TABLE ---
                 st.markdown("---")
                 st.markdown("### 💡 Explanation of Single Factor Hedging Results")
-                st.markdown("""
+                st.markdown(r"""
                 The table in **Section 8.2** shows the **ideal hedge instrument** to neutralize the risk from a *single, specific market factor* (Level, Slope, or Curvature).
 
                 A hedge is considered 'better' in this context because it **minimizes the Residual Volatility** for that specific factor's risk:
@@ -2290,11 +2293,6 @@ if not price_df_filtered.empty:
 # ------------------- Section 9: PCA Factor Shocks & Whole-Instrument Anchoring -------------------
 st.header("9. PCA Factor Shocks & Whole-Instrument Anchoring")
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import re
-
 # =============================================================================
 # Helper functions
 # =============================================================================
@@ -2369,13 +2367,19 @@ anchor_label = st.selectbox(
 
 if st.button("Run Whole-Instrument Anchor Shock"):
     try:
-        # ---------------------------------------------------------------------
         # STEP A: PCA FACTOR SHIFT (minimum-norm)
-        # ---------------------------------------------------------------------
+        # ----------------------------------------------------------------
+        # mkt_val: market price of the anchor on analysis date
+        # pca_fair: PCA model's fair value = (score · L) * sigma + mean
+        # Z_target: gap in units of the instrument's own std dev (dimensionless)
+        # delta_PC: minimum-norm PC shift to close that gap
+        # ----------------------------------------------------------------
         mkt_val = all_deriv_df.loc[analysis_dt, anchor_label]
 
         L = loadings_gen.loc[anchor_label].iloc[:pc_count].values
         sigma = all_deriv_df[anchor_label].std()
+        if sigma < 1e-9:
+            sigma = 1.0
         mean = all_deriv_df[anchor_label].mean()
 
         pca_fair = (scores.loc[analysis_dt].iloc[:pc_count].values @ L) * sigma + mean
@@ -2397,7 +2401,11 @@ if st.button("Run Whole-Instrument Anchor Shock"):
             c.replace(" (PCA)", "").replace("3M Spread: ", "") for c in base_spreads.index
         ]
 
-        shocked_spreads = base_spreads + delta_spreads
+        # FIXED: align delta_spreads (numpy array) to base_spreads index by position
+        # Only apply delta to spreads that exist in base_spreads (lengths may differ if some were dropped)
+        n_common = min(len(base_spreads), len(delta_spreads))
+        shocked_spreads = base_spreads.copy()
+        shocked_spreads.iloc[:n_common] = base_spreads.values[:n_common] + delta_spreads[:n_common]
 
         # ---------------------------------------------------------------------
         # STEP C: REBUILD OUTRIGHT CURVE (single pivot)
@@ -2465,7 +2473,8 @@ if st.button("Run Whole-Instrument Anchor Shock"):
         ]
 
         for label, hist_name, key in families:
-            hist_df = locals().get(hist_name)
+            # FIXED: use globals() not locals() - these vars are in module scope, not local function scope
+            hist_df = globals().get(hist_name)
             if hist_df is not None and not hist_df.empty:
                 with st.expander(f"View {label} Impact"):
                     plot_shock_derivative_snapshot(
@@ -2583,9 +2592,6 @@ def plot_with_stats_table(df, label, analysis_dt, window):
     st.pyplot(fig)
 
     # ---- STORE FOR COMBINED PDF (Section 10) ----
-    if "SECTION9_FIGURES" not in st.session_state:
-        st.session_state.SECTION9_FIGURES = []
-    
     st.session_state.SECTION9_FIGURES.append(
         (fig, f"Section 10 – {label}")
     )
@@ -2593,8 +2599,11 @@ def plot_with_stats_table(df, label, analysis_dt, window):
     # --- TABLE ---
     st.write(f"**{label} Precision Statistics**")
     
+    # FIXED: 'Dist to 2σ' = signed distance from current resid to the relevant 2σ boundary
+    # Positive Resid -> distance above +2σ band (negative means still within band)
+    # Negative Resid -> distance below -2σ band (positive means still within band)
     plot_df["Dist to 2σ (bps)"] = np.where(
-        plot_df["Resid (bps)"] > 0, 
+        plot_df["Resid (bps)"] >= 0,
         plot_df["Resid (bps)"] - (2 * plot_df["Max Sigma (bps)"]),
         plot_df["Resid (bps)"] + (2 * plot_df["Max Sigma (bps)"])
     )
@@ -2618,8 +2627,12 @@ families = [
     ("6M Double Fly", "historical_double_butterflies_6M_df")
 ]
 
+# FIXED: clear section 9/10 figures once before the loop to prevent duplicate PDF entries on re-run
+st.session_state.SECTION9_FIGURES = []
+
 for label, var in families:
-    df_found = locals().get(var)
+    # FIXED: use globals() not locals() - these dataframes are in module/global scope
+    df_found = globals().get(var)
     if df_found is not None and not df_found.empty:
         plot_with_stats_table(df_found, label, analysis_dt, lookback_selection)
 # ============================
@@ -2639,9 +2652,11 @@ The **output snapshot is identical to Section 5**, but uses **noise-filtered fac
 # ----------------------------
 
 def _estimate_phi_ar1(series, clip=(0.70, 0.995)):
-    x = np.asarray(series)
+    x = np.asarray(series, dtype=float)
     if len(x) < 10:
         return 0.95
+    # Demean before AR(1) OLS to get unbiased estimate
+    x = x - x.mean()
     x_lag = x[:-1]
     x_now = x[1:]
     denom = np.dot(x_lag, x_lag)
@@ -2656,7 +2671,8 @@ def _kalman_filter_1d(observed, phi, q, r):
     x_hat = np.zeros(n)
     P = np.zeros(n)
     x_hat[0] = observed[0]
-    P[0] = 1.0
+    # Initialise uncertainty to process variance (steady-state approximation)
+    P[0] = q / (1 - phi**2) if abs(phi) < 1.0 else r
 
     for t in range(1, n):
         x_pred = phi * x_hat[t - 1]
@@ -2682,7 +2698,7 @@ use_kalman = st.checkbox(
 # Apply Kalman to PCA scores
 # ----------------------------
 
-kalman_scores = scores.copy()
+kalman_scores = scores.copy() if scores is not None else pd.DataFrame()
 phi_rows = []
 
 if use_kalman:
@@ -2798,10 +2814,6 @@ plot_snapshot(
 # SECTION 12: TRADE STRUCTURING & PCA MISPRICING CAPTURE
 # ============================================================
 
-import numpy as np
-import pandas as pd
-import streamlit as st
-
 # -------------------------------------------------------------------
 # 12.0 EXPRESSION QUALITY OF THE SELECTED INSTRUMENT
 # -------------------------------------------------------------------
@@ -2815,7 +2827,9 @@ def compute_expression_quality(instrument, factor_sensitivities_df, Sigma_Raw_df
     mispricing = abs(mispricing_series.get(instrument, np.nan))
 
     # Factor purity: single-factor vs mixed exposure
-    factor_purity = betas.abs().max() / betas.abs().sum()
+    # FIXED: guard against zero total sensitivity
+    total_abs = betas.abs().sum()
+    factor_purity = betas.abs().max() / total_abs if total_abs > 1e-9 else 0.0
 
     # Avg absolute correlation vs entire universe — derived from covariance matrix
     diag = np.sqrt(np.diag(Sigma_Raw_df.values))
@@ -2870,9 +2884,13 @@ def find_alternative_expressions(
         C_betas = factor_sensitivities_df.loc[C]
 
         # Factor alignment (cosine similarity)
-        alignment = np.dot(T_betas, C_betas) / (
-            np.linalg.norm(T_betas) * np.linalg.norm(C_betas)
-        )
+        # FIXED: guard against zero-norm vectors
+        norm_T = np.linalg.norm(T_betas)
+        norm_C = np.linalg.norm(C_betas)
+        if norm_T < 1e-9 or norm_C < 1e-9:
+            alignment = 0.0
+        else:
+            alignment = np.dot(T_betas, C_betas) / (norm_T * norm_C)
 
         # Pairwise correlation vs selected instrument (from covariance matrix)
         var_T_loc = Sigma_Raw_df.loc[T, T]
@@ -2909,8 +2927,12 @@ def build_factor_isolated_combo(
 
     dominant_factor = T_betas.abs().idxmax()
 
-    # Hedge ratio removes dominant factor
-    k = T_betas[dominant_factor] / H_betas[dominant_factor]
+    # FIXED: guard against zero hedge sensitivity for the dominant factor
+    h_dominant = H_betas[dominant_factor]
+    if abs(h_dominant) < 1e-9:
+        k = 0.0
+    else:
+        k = T_betas[dominant_factor] / h_dominant
 
     residuals = T_betas - k * H_betas
 
@@ -2970,9 +2992,13 @@ def backtest_pca_mispricing_capture(
     capture = capture.dropna()
     cum_capture = capture.cumsum()
 
+    capture_std = capture.std()
+    sharpe = capture.mean() / capture_std * np.sqrt(252) if capture_std > 1e-9 else np.nan
+
     return {
         "Total Mispricing Captured (Rate %)": cum_capture.iloc[-1],
-        "Mean-Reversion Sharpe": capture.mean() / capture.std() * np.sqrt(252),
+        # FIXED: guard against zero std in Sharpe calculation
+        "Mean-Reversion Sharpe": sharpe,
         "Hit Rate": (capture > 0).mean(),
         "Max Drawdown (Rate %)": (cum_capture - cum_capture.cummax()).min()
     }
@@ -3354,8 +3380,7 @@ else:
 
 st.subheader("5.e Trade Relationship Explorer (Correlation + Lead/Lag + Granger Causality)")
 
-import numpy as np
-from statsmodels.tsa.stattools import grangercausalitytests
+from statsmodels.tsa.stattools import grangercausalitytests  # FIXED: moved statsmodels import here (not at top to keep optional)
 
 try:
 
@@ -3477,7 +3502,7 @@ try:
             result = grangercausalitytests(df, maxlag=max_lag, verbose=False)
             pvals = [result[i+1][0]["ssr_ftest"][1] for i in range(max_lag)]
             return min(pvals)
-        except:
+        except Exception:  # FIXED: bare except replaced with except Exception
             return None
 
     # ------------------------------------------------------
@@ -3586,9 +3611,7 @@ except Exception as e:
 # FINAL BLOCK — COMBINED SECTION 5 + SECTION 10 EXPORT
 # ============================================================
 
-from io import BytesIO
-from matplotlib.backends.backend_pdf import PdfPages
-import re
+# re is already imported in Section 9; BytesIO and PdfPages are imported at the top
 
 # ---------- Helper: normalize derivative names ----------
 def _normalize_derivative_name(title: str):
@@ -3650,8 +3673,7 @@ def _build_combined_figure_order(section5_figs, section9_figs):
 
 
 # ---------- Export PDF ----------
-def _export_full_curve_pdf():
-
+def _export_full_curve_pdf(analysis_date_str: str):
     sec5 = st.session_state.get("SECTION5_FIGURES", [])
     sec10 = st.session_state.get("SECTION9_FIGURES", [])
 
@@ -3662,10 +3684,18 @@ def _export_full_curve_pdf():
 
     buffer = BytesIO()
     with PdfPages(buffer) as pdf:
+        # PDF metadata
+        d = pdf.infodict()
+        d['Title'] = f"SOFR Futures PCA — Full Curve Diagnostics ({analysis_date_str})"
+        d['Subject'] = "PCA Curve Snapshots & Precision Adaptive Envelopes"
+
         for fig, title in ordered:
             try:
-                if title:
-                    fig.suptitle(title)
+                # Build a clean, readable title: strip "Section N –" prefix
+                display_title = title if title else "Chart"
+                # Add analysis date as subtitle
+                full_title = f"{display_title}\nAnalysis Date: {analysis_date_str}"
+                fig.suptitle(full_title, fontsize=11, y=1.01)
                 pdf.savefig(fig, bbox_inches="tight")
             except Exception:
                 pass
@@ -3675,15 +3705,8 @@ def _export_full_curve_pdf():
 
 # ---------- UI ----------
 st.markdown("---")
-st.header("Full Curve Diagnostics Export")
-st.markdown("### DEBUG FIGURE COUNTS")
+st.header("📥 Full Curve Diagnostics Export")
 
-st.write("SEC5 stored:", len(st.session_state.get("SECTION5_FIGURES", [])))
-st.write("SEC10 stored:", len(st.session_state.get("SECTION9_FIGURES", [])))
-
-if st.session_state.get("SECTION9_FIGURES"):
-    st.write("First SEC10 title:",
-             st.session_state.SECTION9_FIGURES[0][1])
 st.write(
 """
 Downloads ONE combined PDF containing:
@@ -3695,21 +3718,31 @@ Graphs are paired derivative-wise:
 3M → 6M → 12M → ...
 """
 )
-generate_pdf = st.button("Prepare Combined PDF")
+
+col_pdf1, col_pdf2 = st.columns(2)
+with col_pdf1:
+    st.metric("Section 5 charts ready", len(st.session_state.get("SECTION5_FIGURES", [])))
+with col_pdf2:
+    st.metric("Section 10 charts ready", len(st.session_state.get("SECTION9_FIGURES", [])))
+
+generate_pdf = st.button("Prepare Combined PDF", use_container_width=True)
 
 if generate_pdf:
     st.session_state.SNAPSHOT_READY = True
-    full_pdf = _export_full_curve_pdf()
+    full_pdf = _export_full_curve_pdf(str(analysis_date))
 else:
     full_pdf = None
 
 if full_pdf is not None:
+    # Filename: SOFR_PCA_Full_Diagnostics_<analysis_date>.pdf
+    safe_date = str(analysis_date).replace("/", "-").replace(" ", "_")
+    pdf_filename = f"SOFR_{safe_date}.pdf"
     st.download_button(
-        label="Download Full Curve Diagnostics PDF",
+        label=f"⬇️ Download Full Curve Diagnostics PDF  ({safe_date})",
         data=full_pdf,
-        file_name=f"Full_Curve_Diagnostics_{analysis_date}.pdf",
+        file_name=pdf_filename,
         mime="application/pdf",
         use_container_width=True
     )
 else:
-    st.info("Generate Section 5 and Section 10 charts first.")
+    st.info("Generate Section 5 and Section 10 charts first, then click Prepare Combined PDF.")
