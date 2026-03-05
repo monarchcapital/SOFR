@@ -10,6 +10,9 @@ from datetime import datetime, date
 from io import BytesIO
 from matplotlib.backends.backend_pdf import PdfPages
 
+# --- Configuration --- (FIXED: must be the very first Streamlit call)
+st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
+
 # --- PDF figure collections ---
 if "SECTION5_FIGURES" not in st.session_state:
     st.session_state.SECTION5_FIGURES = []
@@ -18,8 +21,6 @@ if "SECTION9_FIGURES" not in st.session_state:
     st.session_state.SECTION9_FIGURES = []
 if "SNAPSHOT_READY" not in st.session_state:
     st.session_state.SNAPSHOT_READY = False
-# --- Configuration ---
-st.set_page_config(layout="wide", page_title="CANADA Futures PCA Analyzer")
 
 # --- Helper Functions for Data Processing ---
 
@@ -79,6 +80,9 @@ def get_analysis_contracts(expiry_df, analysis_date):
     """Filters contract codes that expire on or after the analysis date."""
     if expiry_df is None:
         return pd.DataFrame()
+    # FIXED: ensure analysis_date is a datetime for consistent comparison with ExpiryDate (which is datetime)
+    if isinstance(analysis_date, date) and not isinstance(analysis_date, datetime):
+        analysis_date = datetime.combine(analysis_date, datetime.min.time())
     future_expiries = expiry_df[expiry_df['ExpiryDate'] >= analysis_date].copy()
     future_expiries = future_expiries.sort_values(by='ExpiryDate')
     
@@ -266,6 +270,8 @@ def perform_pca(data_df):
     # Standardize the data (PCA on Correlation Matrix - preferred for spread PCA)
     data_mean = data_df_clean.mean()
     data_std = data_df_clean.std()
+    # FIXED: replace zero std with 1 to prevent division-by-zero (constant columns)
+    data_std = data_std.replace(0, 1)
     data_scaled = (data_df_clean - data_mean) / data_std
     
     n_components = min(data_scaled.shape)
@@ -304,7 +310,11 @@ def perform_pca_on_prices(price_df):
         return None, None
         
     # Center the data, but DO NOT scale/standardize it (PCA on Covariance Matrix)
-    data_centered = data_df_clean - data_df_clean.mean() 
+    # FIXED: drop constant columns before centering to avoid degenerate covariance matrix
+    data_df_clean = data_df_clean.loc[:, data_df_clean.std() > 0]
+    if data_df_clean.empty:
+        return None, None
+    data_centered = data_df_clean - data_df_clean.mean()
     
     n_components = min(data_centered.shape)
 
@@ -348,7 +358,7 @@ def _reconstruct_derivative(original_df, reconstructed_prices, derivative_type='
                 else:
                     core_label = label
                     
-                c1, c_long = core_label.split('-')
+                c1, c_long = core_label.split('-', 1)
                 
                 reconstructed_data[label + ' (PCA)'] = (
                     reconstructed_prices_aligned[c1 + ' (PCA)'] - reconstructed_prices_aligned[c_long + ' (PCA)']
@@ -540,7 +550,8 @@ def calculate_best_and_worst_hedge_3M(trade_label, loadings_df, eigenvalues, pc_
         Cov_TH = Sigma_reconstructed.loc[trade_spread, hedge_spread]    # Cov(T, H)
         
         # 1. Minimum Variance Hedge Ratio (k*)
-        if Var_Hedge == 0:
+        # FIXED: use near-zero threshold instead of exact == 0 (floating-point safety)
+        if Var_Hedge <= 1e-9:
             k_star = 0
         else:
             k_star = Cov_TH / Var_Hedge
@@ -594,6 +605,8 @@ def calculate_derivatives_covariance_generalized(all_derivatives_df, scores_df, 
     # 2. Standardize all derivatives
     derivatives_mean = derivatives_aligned.mean()
     derivatives_std = derivatives_aligned.std()
+    # FIXED: prevent division-by-zero for constant derivative columns
+    derivatives_std = derivatives_std.replace(0, 1)
     # Subtract mean is important for proper regression/loadings calculation
     derivatives_scaled = (derivatives_aligned - derivatives_mean) / derivatives_std
     
@@ -883,14 +896,16 @@ def calculate_derivative_mispricings(historical_derivatives_list, analysis_dt):
     analysis_date_key = analysis_dt.strftime('%Y-%m-%d')
     
     for df in historical_derivatives_list:
-        if df.empty or analysis_date_key not in df.index:
+        if df.empty:
             continue
-            
+        # FIXED: try both datetime key and string key to handle mixed index types
         try:
-            # Try to get the row by the string key (works for DatetimeIndex)
-            row = df.loc[analysis_date_key]
+            row = df.loc[analysis_dt]
         except KeyError:
-            continue
+            try:
+                row = df.loc[analysis_date_key]
+            except KeyError:
+                continue
         
         # Iterate through all derivative columns that contain the original value
         for original_col in [col for col in df.columns if ' (Original)' in col]:
@@ -980,12 +995,12 @@ def create_instrument_universe_table(factor_sensitivities_df, Sigma_Raw_df, misp
 
 # --- Streamlit Application Layout ---
 
-st.title("CANADA Futures PCA Analyzer")
+st.title("SOFR Futures PCA Analyzer")
 
 # --- Sidebar Inputs ---
 st.sidebar.header("1. Data Uploads")
 price_file = st.sidebar.file_uploader(
-    "Upload Historical Price Data (e.g., 'CANADA rates.csv')", 
+    "Upload Historical Price Data (e.g., 'SOFR rates.csv')", 
     type=['csv'], 
     key='price_upload'
 )
@@ -1644,7 +1659,7 @@ if not price_df_filtered.empty:
             st.download_button(
                 label="📥 Download Section 5 Snapshots as PDF",
                 data=pdf_buffer_5,
-                file_name="CANADA.pdf",
+                file_name="SOFR.pdf",
                 mime="application/pdf",
             )
 
@@ -2567,6 +2582,14 @@ def plot_with_stats_table(df, label, analysis_dt, window):
     ax.legend(loc='upper left', bbox_to_anchor=(1, 1)); ax.grid(True, alpha=0.15)
     st.pyplot(fig)
 
+    # ---- STORE FOR COMBINED PDF (Section 10) ----
+    if "SECTION9_FIGURES" not in st.session_state:
+        st.session_state.SECTION9_FIGURES = []
+    
+    st.session_state.SECTION9_FIGURES.append(
+        (fig, f"Section 10 – {label}")
+    )
+
     # --- TABLE ---
     st.write(f"**{label} Precision Statistics**")
     
@@ -2794,8 +2817,12 @@ def compute_expression_quality(instrument, factor_sensitivities_df, Sigma_Raw_df
     # Factor purity: single-factor vs mixed exposure
     factor_purity = betas.abs().max() / betas.abs().sum()
 
-    # Avg absolute correlation vs entire universe
-    avg_abs_corr = Sigma_Raw_df.corr().abs().mean().get(instrument, np.nan)
+    # Avg absolute correlation vs entire universe — derived from covariance matrix
+    diag = np.sqrt(np.diag(Sigma_Raw_df.values))
+    diag_safe = np.where(diag > 1e-9, diag, 1.0)
+    corr_matrix = Sigma_Raw_df.values / np.outer(diag_safe, diag_safe)
+    corr_df = pd.DataFrame(corr_matrix, index=Sigma_Raw_df.index, columns=Sigma_Raw_df.columns)
+    avg_abs_corr = corr_df.abs().mean().get(instrument, np.nan)
 
     expression_quality = mispricing * factor_purity / (1 + avg_abs_corr)
 
@@ -2847,10 +2874,11 @@ def find_alternative_expressions(
             np.linalg.norm(T_betas) * np.linalg.norm(C_betas)
         )
 
-        # Pairwise correlation vs selected instrument
-        corr_vs_selected = Sigma_Raw_df.loc[T, C] / np.sqrt(
-            Sigma_Raw_df.loc[T, T] * Sigma_Raw_df.loc[C, C]
-        )
+        # Pairwise correlation vs selected instrument (from covariance matrix)
+        var_T_loc = Sigma_Raw_df.loc[T, T]
+        var_C_loc = Sigma_Raw_df.loc[C, C]
+        denom_corr = np.sqrt(var_T_loc * var_C_loc)
+        corr_vs_selected = Sigma_Raw_df.loc[T, C] / denom_corr if denom_corr > 1e-9 else 0.0
 
         relative_score = T_mis * abs(alignment) / (1 + abs(corr_vs_selected))
 
@@ -2998,58 +3026,64 @@ High = GOOD (same regional distortion)
 Units are **Rate %**, not dollars.
 """)
 
-selected_instr = st.selectbox(
+if 'instrument_universe_df' not in globals() or instrument_universe_df is None or instrument_universe_df.empty:
+    st.info("Section 12 requires Section 8 to run first (instrument universe not yet built).")
+else:
+ selected_instr = st.selectbox(
     "1️⃣ Select instrument where you see distortion",
     instrument_universe_df["Instrument"].values
-)
+ )
 
-quality = compute_expression_quality(
+ quality = compute_expression_quality(
     selected_instr, factor_sensitivities_df, Sigma_Raw_df, mispricing_series
-)
+ )
 
-st.subheader("A. Instrument quality")
-st.table(pd.DataFrame(quality, index=["Value"]).T)
+ st.subheader("A. Instrument quality")
+ st.table(pd.DataFrame(quality, index=["Value"]).T)
 
-alt_df = find_alternative_expressions(
+ alt_df = find_alternative_expressions(
     selected_instr,
     instrument_universe_df,
     factor_sensitivities_df,
     Sigma_Raw_df,
     mispricing_series
-)
+ )
 
-st.subheader("B. Alternative expressions")
-st.dataframe(alt_df, use_container_width=True)
+ st.subheader("B. Alternative expressions")
+ st.dataframe(alt_df, use_container_width=True)
 
-trade_instr = st.selectbox(
-    "2️⃣ Choose instrument to trade",
-    alt_df["Alternative Instrument"].values
-)
+if alt_df.empty:
+    st.info("No alternative expressions found for the selected instrument.")
+else:
+    trade_instr = st.selectbox(
+        "2️⃣ Choose instrument to trade",
+        alt_df["Alternative Instrument"].values
+    )
 
-combo = build_factor_isolated_combo(
-    selected_instr,
-    trade_instr,
-    factor_sensitivities_df,
-    Sigma_Raw_df,
-    mispricing_series
-)
+    combo = build_factor_isolated_combo(
+        selected_instr,
+        trade_instr,
+        factor_sensitivities_df,
+        Sigma_Raw_df,
+        mispricing_series
+    )
 
-st.subheader("C. Structured trade")
-st.table(pd.DataFrame(combo, index=["Value"]).T)
+    st.subheader("C. Structured trade")
+    st.table(pd.DataFrame(combo, index=["Value"]).T)
 
-holding_days = st.slider("Holding period (days)", 1, 20, 5)
+    holding_days = st.slider("Holding period (days)", 1, 20, 5)
 
-stats = backtest_pca_mispricing_capture(
-    selected_instr,
-    trade_instr,
-    combo["Hedge Ratio (k)"],
-    all_historical_derivatives_list,
-    holding_days
-)
+    stats = backtest_pca_mispricing_capture(
+        selected_instr,
+        trade_instr,
+        combo["Hedge Ratio (k)"],
+        all_historical_derivatives_list,
+        holding_days
+    )
 
-if stats:
-    st.subheader("D. PCA mispricing capture (NOT $ PnL)")
-    st.table(pd.DataFrame(stats, index=["Value"]).T)
+    if stats:
+        st.subheader("D. PCA mispricing capture (NOT $ PnL)")
+        st.table(pd.DataFrame(stats, index=["Value"]).T)
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------
 # Instrument Level Curves (Separate Views, Actual Levels)
@@ -3617,30 +3651,39 @@ def _build_combined_figure_order(section5_figs, section9_figs):
 
 # ---------- Export PDF ----------
 def _export_full_curve_pdf():
-    if len(st.session_state.SECTION5_FIGURES) == 0 and len(st.session_state.SECTION9_FIGURES) == 0:
+
+    sec5 = st.session_state.get("SECTION5_FIGURES", [])
+    sec10 = st.session_state.get("SECTION9_FIGURES", [])
+
+    if len(sec5) == 0 and len(sec10) == 0:
         return None
 
-    ordered_figs = _build_combined_figure_order(
-    st.session_state.SECTION5_FIGURES,
-    st.session_state.SECTION9_FIGURES
-)
+    ordered = _build_combined_figure_order(sec5, sec10)
+
     buffer = BytesIO()
     with PdfPages(buffer) as pdf:
-        for fig, title in ordered_figs:
+        for fig, title in ordered:
             try:
-                fig.suptitle(title, fontsize=14)
+                if title:
+                    fig.suptitle(title)
                 pdf.savefig(fig, bbox_inches="tight")
             except Exception:
-                continue
+                pass
 
     buffer.seek(0)
     return buffer
 
-
 # ---------- UI ----------
 st.markdown("---")
 st.header("Full Curve Diagnostics Export")
+st.markdown("### DEBUG FIGURE COUNTS")
 
+st.write("SEC5 stored:", len(st.session_state.get("SECTION5_FIGURES", [])))
+st.write("SEC10 stored:", len(st.session_state.get("SECTION9_FIGURES", [])))
+
+if st.session_state.get("SECTION9_FIGURES"):
+    st.write("First SEC10 title:",
+             st.session_state.SECTION9_FIGURES[0][1])
 st.write(
 """
 Downloads ONE combined PDF containing:
@@ -3652,8 +3695,13 @@ Graphs are paired derivative-wise:
 3M → 6M → 12M → ...
 """
 )
-st.session_state.SNAPSHOT_READY = True
-full_pdf = _export_full_curve_pdf()
+generate_pdf = st.button("Prepare Combined PDF")
+
+if generate_pdf:
+    st.session_state.SNAPSHOT_READY = True
+    full_pdf = _export_full_curve_pdf()
+else:
+    full_pdf = None
 
 if full_pdf is not None:
     st.download_button(
@@ -3665,10 +3713,3 @@ if full_pdf is not None:
     )
 else:
     st.info("Generate Section 5 and Section 10 charts first.")
-
-
-
-
-
-
-
